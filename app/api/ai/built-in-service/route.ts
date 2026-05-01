@@ -8,7 +8,7 @@ import { NextResponse } from "next/server";
 import { noStoreHeaders } from "@/lib/ai";
 import { getBuiltInAPIService } from "@/lib/built-in-api-service";
 import { getBuiltInServiceConfig } from "@/lib/built-in-api-service/config";
-import { getBuiltInRuntimeSettings } from "@/lib/built-in-api-service/db";
+import { getBuiltInRuntimeSettings, sanitizeServiceCatalog, getSubtaskPresets } from "@/lib/built-in-api-service/db";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -108,18 +108,10 @@ export async function GET(req: Request) {
 
     if (action === 'runtime-settings') {
       const runtimeSettings = await getBuiltInRuntimeSettings();
-      const catalog = runtimeSettings.serviceCatalog || {};
-      const sanitizedCatalog: Record<string, { baseUrl: string; model: string; isEnabled: boolean; updatedAt?: string }> = {};
-      for (const category of Object.keys(catalog)) {
-        const cfg = (catalog as Record<string, { baseUrl?: string; model?: string; isEnabled?: boolean; updatedAt?: string }>)[category];
-        if (!cfg) continue;
-        sanitizedCatalog[category] = {
-          baseUrl: cfg.baseUrl || '',
-          model: cfg.model || '',
-          isEnabled: cfg.isEnabled === true,
-          updatedAt: cfg.updatedAt,
-        };
-      }
+      // 新 schema: 每类返回 { displayName, description, defaultSubtaskId, subtasks: { ... 不含 apiKey ... } }
+      const sanitizedCatalog = sanitizeServiceCatalog(runtimeSettings.serviceCatalog, {
+        includeKeyMask: false,
+      });
       return NextResponse.json(
         {
           settings: {
@@ -127,6 +119,7 @@ export async function GET(req: Request) {
             updatePageUrl: runtimeSettings.updatePageUrl || "",
             downloadChannels: runtimeSettings.downloadChannels || [],
             serviceCatalog: sanitizedCatalog,
+            subtaskPresets: getSubtaskPresets(),
           },
         },
         { headers: noStoreHeaders() }
@@ -201,8 +194,6 @@ export async function GET(req: Request) {
               baseUrl: config.baseUrl,
               model: config.model,
               serviceGatewayUrl: runtimeSettings.serviceGatewayUrl || undefined,
-              iopaintUrl: runtimeSettings.iopaintUrls[0] || undefined,
-              iopaintUrls: runtimeSettings.iopaintUrls,
               updatePageUrl: runtimeSettings.updatePageUrl || undefined,
               downloadChannels: runtimeSettings.downloadChannels || [],
             },
