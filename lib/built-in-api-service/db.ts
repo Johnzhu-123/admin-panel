@@ -21,7 +21,13 @@ export const BUILT_IN_SERVICE_CATEGORIES = [
 
 export type BuiltInServiceCategory = (typeof BUILT_IN_SERVICE_CATEGORIES)[number];
 
-export interface BuiltInServiceCategoryConfig {
+/**
+ * 单一子任务配置（同一类下可有多个子任务，例如图像生成 vs 图像理解）
+ */
+export interface BuiltInServiceSubtaskConfig {
+  id: string;
+  displayName: string;
+  description?: string;
   baseUrl: string;
   apiKey: string;
   model: string;
@@ -29,49 +35,150 @@ export interface BuiltInServiceCategoryConfig {
   updatedAt?: string;
 }
 
-export type BuiltInServiceCatalog = Record<BuiltInServiceCategory, BuiltInServiceCategoryConfig>;
+/**
+ * 类别配置：包含若干子任务 + 默认子任务 ID
+ */
+export interface BuiltInServiceCategoryConfig {
+  displayName: string;
+  description?: string;
+  defaultSubtaskId: string;
+  subtasks: Record<string, BuiltInServiceSubtaskConfig>;
+}
 
-const DEFAULT_CATEGORY_CONFIG: BuiltInServiceCategoryConfig = {
-  baseUrl: '',
-  apiKey: '',
-  model: '',
-  isEnabled: false,
-};
+export type BuiltInServiceCatalog = Record<BuiltInServiceCategory, BuiltInServiceCategoryConfig>;
 
 const SERVICE_CATALOG_SETTING_KEY_PREFIX = 'service_catalog_';
 
-const SERVICE_CATEGORY_DEFAULT_MODEL: Record<BuiltInServiceCategory, string> = {
-  multimodal: 'gpt-4o-mini',
-  text: 'gpt-4o-mini',
-  image: 'gpt-image-1',
-  tts: 'tts-1',
-  video: 'sora-1',
+/**
+ * 5 大类的中文展示信息
+ */
+const CATEGORY_META: Record<BuiltInServiceCategory, { displayName: string; description: string }> = {
+  multimodal: { displayName: '多模态 AI', description: '同时处理图像/音频/文本的综合理解模型' },
+  text: { displayName: '文本 AI', description: '纯文本生成、改写、摘要、规划' },
+  image: { displayName: '图像 AI', description: '图像生成 / 图像理解 / 图像编辑' },
+  tts: { displayName: '配音 TTS', description: '文本转语音' },
+  video: { displayName: '视频 AI', description: '文生视频 / 图生视频' },
 };
+
+/**
+ * 子任务预设：用于初始化空数据库或 UI 提示用户可选项
+ */
+type SubtaskPreset = { id: string; displayName: string; description?: string; defaultModel: string };
+
+const SUBTASK_PRESETS: Record<BuiltInServiceCategory, SubtaskPreset[]> = {
+  multimodal: [
+    { id: 'default', displayName: '通用多模态', description: '默认多模态推理', defaultModel: 'gpt-4o' },
+    { id: 'vision', displayName: '视觉理解', description: '图像/视频帧分析', defaultModel: 'gpt-4o' },
+    { id: 'audio', displayName: '音频理解', description: '音频转写/分析', defaultModel: 'gpt-4o-audio-preview' },
+  ],
+  text: [
+    { id: 'default', displayName: '通用文本', description: '通用文本生成', defaultModel: 'gpt-4o-mini' },
+    { id: 'plan', displayName: '大纲规划', description: 'PPT / 视频大纲生成', defaultModel: 'gpt-4o' },
+    { id: 'summary', displayName: '摘要总结', description: '内容摘要 / 提炼要点', defaultModel: 'gpt-4o-mini' },
+  ],
+  image: [
+    { id: 'generation', displayName: '图像生成', description: '文生图 / 图生图', defaultModel: 'gpt-image-1' },
+    { id: 'understanding', displayName: '图像理解', description: '识别图像内容', defaultModel: 'gpt-4o' },
+    { id: 'edit', displayName: '图像编辑', description: '局部重绘 / 扩图', defaultModel: 'gpt-image-1' },
+  ],
+  tts: [
+    { id: 'default', displayName: '默认配音', description: '通用 TTS', defaultModel: 'tts-1' },
+  ],
+  video: [
+    { id: 'text2video', displayName: '文生视频', description: '由文本生成视频', defaultModel: 'sora-1' },
+    { id: 'image2video', displayName: '图生视频', description: '由图片生成视频', defaultModel: 'sora-1' },
+  ],
+};
+
+const PRESET_SUBTASK_IDS: Record<BuiltInServiceCategory, Set<string>> = BUILT_IN_SERVICE_CATEGORIES.reduce(
+  (acc, key) => {
+    acc[key] = new Set(SUBTASK_PRESETS[key].map((s) => s.id));
+    return acc;
+  },
+  {} as Record<BuiltInServiceCategory, Set<string>>
+);
+
+function makeDefaultSubtask(category: BuiltInServiceCategory, preset: SubtaskPreset): BuiltInServiceSubtaskConfig {
+  return {
+    id: preset.id,
+    displayName: preset.displayName,
+    description: preset.description,
+    baseUrl: '',
+    apiKey: '',
+    model: preset.defaultModel,
+    isEnabled: false,
+  };
+}
+
+function makeEmptyCategory(category: BuiltInServiceCategory): BuiltInServiceCategoryConfig {
+  const presets = SUBTASK_PRESETS[category];
+  const subtasks: Record<string, BuiltInServiceSubtaskConfig> = {};
+  for (const preset of presets) {
+    subtasks[preset.id] = makeDefaultSubtask(category, preset);
+  }
+  return {
+    displayName: CATEGORY_META[category].displayName,
+    description: CATEGORY_META[category].description,
+    defaultSubtaskId: presets[0].id,
+    subtasks,
+  };
+}
 
 function makeEmptyCatalog(): BuiltInServiceCatalog {
   return BUILT_IN_SERVICE_CATEGORIES.reduce((acc, key) => {
-    acc[key] = {
-      ...DEFAULT_CATEGORY_CONFIG,
-      model: SERVICE_CATEGORY_DEFAULT_MODEL[key],
-    };
+    acc[key] = makeEmptyCategory(key);
     return acc;
   }, {} as BuiltInServiceCatalog);
 }
 
-function normalizeCategoryInput(
+function sanitizeSubtaskId(raw: unknown, fallback = 'default'): string {
+  const trimmed = String(raw || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '');
+  return trimmed || fallback;
+}
+
+function normalizeSubtaskInput(
   category: BuiltInServiceCategory,
-  raw: unknown
-): BuiltInServiceCategoryConfig {
-  const fallbackModel = SERVICE_CATEGORY_DEFAULT_MODEL[category];
+  subtaskId: string,
+  raw: unknown,
+  base?: BuiltInServiceSubtaskConfig
+): BuiltInServiceSubtaskConfig {
+  const preset = SUBTASK_PRESETS[category].find((p) => p.id === subtaskId);
+  const fallbackModel = preset?.defaultModel || base?.model || '';
+  const fallbackName = preset?.displayName || base?.displayName || subtaskId;
+  const fallbackDesc = preset?.description ?? base?.description;
   if (!raw || typeof raw !== 'object') {
-    return { ...DEFAULT_CATEGORY_CONFIG, model: fallbackModel };
+    return {
+      id: subtaskId,
+      displayName: fallbackName,
+      description: fallbackDesc,
+      baseUrl: base?.baseUrl || '',
+      apiKey: base?.apiKey || '',
+      model: base?.model || fallbackModel,
+      isEnabled: base?.isEnabled || false,
+    };
   }
   const record = raw as Record<string, unknown>;
-  const baseUrl = String(record.baseUrl || '').trim().replace(/\/+$/, '');
-  const apiKey = typeof record.apiKey === 'string' ? record.apiKey : '';
-  const model = String(record.model || '').trim() || fallbackModel;
-  const isEnabled = record.isEnabled === true || record.isEnabled === 'true';
-  return { baseUrl, apiKey, model, isEnabled };
+  const baseUrl = String(record.baseUrl ?? base?.baseUrl ?? '').trim().replace(/\/+$/, '');
+  const apiKey =
+    typeof record.apiKey === 'string'
+      ? record.apiKey
+      : base?.apiKey || '';
+  const model = String(record.model ?? base?.model ?? fallbackModel ?? '').trim() || fallbackModel;
+  const isEnabled = record.isEnabled === undefined ? Boolean(base?.isEnabled) : Boolean(record.isEnabled);
+  const displayName = String(record.displayName ?? base?.displayName ?? fallbackName ?? subtaskId).trim() || fallbackName;
+  const description =
+    typeof record.description === 'string'
+      ? record.description
+      : base?.description ?? fallbackDesc;
+  return { id: subtaskId, displayName, description, baseUrl, apiKey, model, isEnabled };
+}
+
+export function getSubtaskPresets(): Record<BuiltInServiceCategory, SubtaskPreset[]> {
+  return SUBTASK_PRESETS;
+}
+
+export function getCategoryMeta(): Record<BuiltInServiceCategory, { displayName: string; description: string }> {
+  return CATEGORY_META;
 }
 
 let ensuringAuthorizedUsersTable: Promise<void> | null = null;
@@ -188,7 +295,6 @@ export async function initializeSystemSettingsTable(): Promise<void> {
 
 export type BuiltInRuntimeSettings = {
   serviceGatewayUrl: string;
-  iopaintUrls: string[];
   updatePageUrl: string;
   downloadChannels: Array<{
     id: string;
@@ -205,12 +311,6 @@ const normalizeChannelId = (value?: string) =>
     .toLowerCase()
     .replace(/[^a-z0-9_-]/g, '');
 const normalizeChannelName = (value?: string) => (value || '').trim().slice(0, 40);
-
-const parseIopaintUrls = (value?: string | null) =>
-  (value || '')
-    .split(/[\n,;]/)
-    .map((item) => normalizeUrl(item))
-    .filter((item) => /^https?:\/\//i.test(item));
 
 const parseDownloadChannels = (
   raw: unknown
@@ -285,13 +385,64 @@ async function loadServiceCatalog(): Promise<BuiltInServiceCatalog> {
       if (!raw) return;
       try {
         const parsed = JSON.parse(raw) as Record<string, unknown>;
-        catalog[category] = {
-          baseUrl: String(parsed.baseUrl || '').trim().replace(/\/+$/, ''),
-          apiKey: typeof parsed.apiKey === 'string' ? decryptSecret(parsed.apiKey) : '',
-          model: String(parsed.model || '').trim() || SERVICE_CATEGORY_DEFAULT_MODEL[category],
-          isEnabled: parsed.isEnabled === true,
-          updatedAt: typeof parsed.updatedAt === 'string' ? parsed.updatedAt : undefined,
-        };
+
+        // 检测格式：新格式有 subtasks 字段；旧格式直接有 baseUrl/apiKey/model
+        const hasSubtasks = parsed && typeof parsed === 'object' && parsed.subtasks && typeof parsed.subtasks === 'object';
+
+        if (hasSubtasks) {
+          // 新格式：完整读取
+          const subtasksRaw = parsed.subtasks as Record<string, unknown>;
+          const merged: Record<string, BuiltInServiceSubtaskConfig> = {};
+
+          // 先用预设作为兜底（确保所有预设 ID 都存在）
+          for (const preset of SUBTASK_PRESETS[category]) {
+            merged[preset.id] = makeDefaultSubtask(category, preset);
+          }
+
+          // 用 DB 数据覆盖
+          for (const [subtaskId, subtaskRaw] of Object.entries(subtasksRaw)) {
+            const safeId = sanitizeSubtaskId(subtaskId);
+            if (!safeId) continue;
+            const record = subtaskRaw as Record<string, unknown>;
+            const decryptedApiKey = typeof record?.apiKey === 'string' ? decryptSecret(record.apiKey) : '';
+            merged[safeId] = normalizeSubtaskInput(
+              category,
+              safeId,
+              { ...record, apiKey: decryptedApiKey },
+              merged[safeId]
+            );
+            if (typeof record?.updatedAt === 'string') {
+              merged[safeId].updatedAt = record.updatedAt;
+            }
+          }
+
+          const defaultSubtaskId = sanitizeSubtaskId(
+            parsed.defaultSubtaskId,
+            SUBTASK_PRESETS[category][0].id
+          );
+
+          catalog[category] = {
+            displayName: String(parsed.displayName || CATEGORY_META[category].displayName),
+            description:
+              typeof parsed.description === 'string'
+                ? parsed.description
+                : CATEGORY_META[category].description,
+            defaultSubtaskId: merged[defaultSubtaskId] ? defaultSubtaskId : SUBTASK_PRESETS[category][0].id,
+            subtasks: merged,
+          };
+        } else {
+          // 旧格式：迁移到新结构 default 子任务
+          const legacyApiKey = typeof parsed.apiKey === 'string' ? decryptSecret(parsed.apiKey) : '';
+          const legacy = normalizeSubtaskInput(
+            category,
+            SUBTASK_PRESETS[category][0].id,
+            { ...parsed, apiKey: legacyApiKey }
+          );
+          legacy.updatedAt = typeof parsed.updatedAt === 'string' ? parsed.updatedAt : undefined;
+          const empty = makeEmptyCategory(category);
+          empty.subtasks[legacy.id] = legacy;
+          catalog[category] = empty;
+        }
       } catch (error) {
         console.warn(`[serviceCatalog] 解析 ${category} 配置失败:`, error);
       }
@@ -306,11 +457,24 @@ async function persistServiceCatalog(catalog: BuiltInServiceCatalog): Promise<vo
   await Promise.all(
     BUILT_IN_SERVICE_CATEGORIES.map((category) => {
       const cfg = catalog[category];
+      const subtaskPayload: Record<string, unknown> = {};
+      for (const [subtaskId, subtask] of Object.entries(cfg.subtasks)) {
+        subtaskPayload[subtaskId] = {
+          id: subtask.id,
+          displayName: subtask.displayName,
+          description: subtask.description,
+          baseUrl: subtask.baseUrl,
+          apiKey: subtask.apiKey ? encryptSecret(subtask.apiKey) : '',
+          model: subtask.model,
+          isEnabled: subtask.isEnabled,
+          updatedAt: subtask.updatedAt || new Date().toISOString(),
+        };
+      }
       const payload = {
-        baseUrl: cfg.baseUrl,
-        apiKey: cfg.apiKey ? encryptSecret(cfg.apiKey) : '',
-        model: cfg.model,
-        isEnabled: cfg.isEnabled,
+        displayName: cfg.displayName,
+        description: cfg.description,
+        defaultSubtaskId: cfg.defaultSubtaskId,
+        subtasks: subtaskPayload,
         updatedAt: new Date().toISOString(),
       };
       return setSystemSetting(
@@ -326,19 +490,73 @@ export async function getServiceCatalog(): Promise<BuiltInServiceCatalog> {
   return loadServiceCatalog();
 }
 
-export async function setServiceCategoryConfig(
+/**
+ * 更新某个类别下指定子任务的配置（PATCH 语义）
+ */
+export async function setServiceSubtaskConfig(
   category: BuiltInServiceCategory,
-  patch: Partial<BuiltInServiceCategoryConfig>
-): Promise<BuiltInServiceCategoryConfig> {
+  subtaskId: string,
+  patch: Partial<Omit<BuiltInServiceSubtaskConfig, 'id'>>
+): Promise<BuiltInServiceSubtaskConfig> {
   await initializeSystemSettingsTable();
-  const current = await loadServiceCatalog();
-  const next = normalizeCategoryInput(category, { ...current[category], ...patch });
-  if (patch.apiKey === undefined) {
-    next.apiKey = current[category].apiKey;
+  const safeSubtaskId = sanitizeSubtaskId(subtaskId);
+  if (!safeSubtaskId) {
+    throw new Error(`非法的 subtaskId: ${subtaskId}`);
   }
-  current[category] = next;
+  const current = await loadServiceCatalog();
+  const categoryCfg = current[category];
+  const existing = categoryCfg.subtasks[safeSubtaskId];
+
+  // patch.apiKey 未传时保留原值；显式传 null/'' 则清空
+  let resolvedPatch: Record<string, unknown> = { ...patch };
+  if (patch.apiKey === undefined && existing) {
+    resolvedPatch.apiKey = existing.apiKey;
+  }
+
+  const next = normalizeSubtaskInput(category, safeSubtaskId, resolvedPatch, existing);
+  next.updatedAt = new Date().toISOString();
+  categoryCfg.subtasks[safeSubtaskId] = next;
+  current[category] = categoryCfg;
   await persistServiceCatalog(current);
   return next;
+}
+
+/**
+ * 删除非预设的自定义 subtask（预设 ID 拒绝删除）
+ */
+export async function deleteServiceSubtask(
+  category: BuiltInServiceCategory,
+  subtaskId: string
+): Promise<void> {
+  const safeId = sanitizeSubtaskId(subtaskId);
+  if (PRESET_SUBTASK_IDS[category].has(safeId)) {
+    throw new Error(`预设子任务 ${safeId} 不能删除`);
+  }
+  await initializeSystemSettingsTable();
+  const current = await loadServiceCatalog();
+  if (!current[category].subtasks[safeId]) return;
+  delete current[category].subtasks[safeId];
+  if (current[category].defaultSubtaskId === safeId) {
+    current[category].defaultSubtaskId = SUBTASK_PRESETS[category][0].id;
+  }
+  await persistServiceCatalog(current);
+}
+
+/**
+ * 设置某类别的默认子任务 ID
+ */
+export async function setCategoryDefaultSubtask(
+  category: BuiltInServiceCategory,
+  subtaskId: string
+): Promise<void> {
+  const safeId = sanitizeSubtaskId(subtaskId);
+  await initializeSystemSettingsTable();
+  const current = await loadServiceCatalog();
+  if (!current[category].subtasks[safeId]) {
+    throw new Error(`子任务 ${safeId} 不存在`);
+  }
+  current[category].defaultSubtaskId = safeId;
+  await persistServiceCatalog(current);
 }
 
 export function sanitizeServiceCatalog(
@@ -348,15 +566,44 @@ export function sanitizeServiceCatalog(
   const out = makeEmptyCatalog();
   for (const category of BUILT_IN_SERVICE_CATEGORIES) {
     const cfg = catalog[category];
+    const sanitizedSubtasks: Record<string, BuiltInServiceSubtaskConfig> = {};
+    for (const [subtaskId, subtask] of Object.entries(cfg.subtasks)) {
+      sanitizedSubtasks[subtaskId] = {
+        id: subtask.id,
+        displayName: subtask.displayName,
+        description: subtask.description,
+        baseUrl: subtask.baseUrl,
+        apiKey: options.includeKeyMask && subtask.apiKey ? maskSecret(subtask.apiKey) : '',
+        model: subtask.model,
+        isEnabled: subtask.isEnabled,
+        updatedAt: subtask.updatedAt,
+      };
+    }
     out[category] = {
-      baseUrl: cfg.baseUrl,
-      apiKey: options.includeKeyMask && cfg.apiKey ? maskSecret(cfg.apiKey) : '',
-      model: cfg.model,
-      isEnabled: cfg.isEnabled,
-      updatedAt: cfg.updatedAt,
+      displayName: cfg.displayName,
+      description: cfg.description,
+      defaultSubtaskId: cfg.defaultSubtaskId,
+      subtasks: sanitizedSubtasks,
     };
   }
   return out;
+}
+
+/**
+ * 获取 category + subtask 的完整服务端配置（含明文 apiKey）。
+ * 仅用于代理路由内部转发使用，禁止返回给客户端。
+ */
+export async function getInternalServiceConfig(
+  category: BuiltInServiceCategory,
+  subtaskId?: string
+): Promise<{ subtask: BuiltInServiceSubtaskConfig; categoryDefaultSubtaskId: string } | null> {
+  const catalog = await loadServiceCatalog();
+  const cfg = catalog[category];
+  if (!cfg) return null;
+  const safeId = sanitizeSubtaskId(subtaskId, cfg.defaultSubtaskId);
+  const subtask = cfg.subtasks[safeId] || cfg.subtasks[cfg.defaultSubtaskId];
+  if (!subtask) return null;
+  return { subtask, categoryDefaultSubtaskId: cfg.defaultSubtaskId };
 }
 
 export async function getBuiltInRuntimeSettings(): Promise<BuiltInRuntimeSettings> {
@@ -370,44 +617,23 @@ export async function getBuiltInRuntimeSettings(): Promise<BuiltInRuntimeSetting
       process.env.NEXT_PUBLIC_BUILT_IN_RELEASE_PAGE_URL ||
       ''
   );
-  const envIopaintRaw =
-    process.env.BUILT_IN_IOPAINT_URL ||
-    process.env.NEXT_PUBLIC_BUILT_IN_IOPAINT_URL ||
-    '';
   const envDownloadChannelsRaw =
     process.env.BUILT_IN_DOWNLOAD_CHANNELS ||
     process.env.NEXT_PUBLIC_BUILT_IN_DOWNLOAD_CHANNELS ||
     '';
-  const envIopaintUrls = parseIopaintUrls(envIopaintRaw);
   const envDownloadChannels = parseDownloadChannels(envDownloadChannelsRaw);
 
   try {
     await initializeSystemSettingsTable();
-    const [gatewayValue, iopaintValue, updatePageValue, downloadChannelsValue, serviceCatalog] = await Promise.all([
+    const [gatewayValue, updatePageValue, downloadChannelsValue, serviceCatalog] = await Promise.all([
       getSystemSetting('service_gateway_url'),
-      getSystemSetting('iopaint_urls'),
       getSystemSetting('update_page_url'),
       getSystemSetting('download_channels'),
       loadServiceCatalog(),
     ]);
 
-    let iopaintUrls = envIopaintUrls;
     let updatePageUrl = envUpdatePageUrl;
     let downloadChannels = envDownloadChannels;
-    if (iopaintValue) {
-      try {
-        const parsed = JSON.parse(iopaintValue);
-        if (Array.isArray(parsed)) {
-          iopaintUrls = parsed
-            .map((item) => normalizeUrl(String(item || '')))
-            .filter((item) => /^https?:\/\//i.test(item));
-        } else {
-          iopaintUrls = parseIopaintUrls(iopaintValue);
-        }
-      } catch {
-        iopaintUrls = parseIopaintUrls(iopaintValue);
-      }
-    }
     if (updatePageValue) {
       const parsed = normalizeUrl(updatePageValue);
       if (/^https?:\/\//i.test(parsed)) {
@@ -422,7 +648,6 @@ export async function getBuiltInRuntimeSettings(): Promise<BuiltInRuntimeSetting
 
     return {
       serviceGatewayUrl: normalizeUrl(gatewayValue || envGateway),
-      iopaintUrls,
       updatePageUrl,
       downloadChannels,
       serviceCatalog,
@@ -430,7 +655,6 @@ export async function getBuiltInRuntimeSettings(): Promise<BuiltInRuntimeSetting
   } catch {
     return {
       serviceGatewayUrl: envGateway,
-      iopaintUrls: envIopaintUrls,
       updatePageUrl: envUpdatePageUrl,
       downloadChannels: envDownloadChannels,
       serviceCatalog: makeEmptyCatalog(),
@@ -448,22 +672,41 @@ export async function saveBuiltInRuntimeSettings(input: Partial<BuiltInRuntimeSe
     for (const category of BUILT_IN_SERVICE_CATEGORIES) {
       const incoming = (input.serviceCatalog as Partial<BuiltInServiceCatalog>)[category];
       if (incoming === undefined) continue;
-      const next = normalizeCategoryInput(category, { ...current.serviceCatalog[category], ...incoming });
-      if ((incoming as Partial<BuiltInServiceCategoryConfig>).apiKey === undefined) {
-        next.apiKey = current.serviceCatalog[category].apiKey;
+      const baseCfg = current.serviceCatalog[category];
+      const nextCategory: BuiltInServiceCategoryConfig = {
+        displayName: typeof incoming.displayName === 'string' ? incoming.displayName : baseCfg.displayName,
+        description:
+          typeof incoming.description === 'string' ? incoming.description : baseCfg.description,
+        defaultSubtaskId: incoming.defaultSubtaskId
+          ? sanitizeSubtaskId(incoming.defaultSubtaskId, baseCfg.defaultSubtaskId)
+          : baseCfg.defaultSubtaskId,
+        subtasks: { ...baseCfg.subtasks },
+      };
+      if (incoming.subtasks && typeof incoming.subtasks === 'object') {
+        for (const [subtaskId, subtaskRaw] of Object.entries(incoming.subtasks)) {
+          const safeId = sanitizeSubtaskId(subtaskId);
+          if (!safeId) continue;
+          const existing = baseCfg.subtasks[safeId];
+          let resolvedRaw: Record<string, unknown> = { ...(subtaskRaw as unknown as Record<string, unknown>) };
+          if (
+            (subtaskRaw as unknown as Record<string, unknown>)?.apiKey === undefined &&
+            existing
+          ) {
+            resolvedRaw.apiKey = existing.apiKey;
+          }
+          nextCategory.subtasks[safeId] = normalizeSubtaskInput(category, safeId, resolvedRaw, existing);
+          nextCategory.subtasks[safeId].updatedAt = new Date().toISOString();
+        }
       }
-      mergedCatalog[category] = next;
+      if (!nextCategory.subtasks[nextCategory.defaultSubtaskId]) {
+        nextCategory.defaultSubtaskId = SUBTASK_PRESETS[category][0].id;
+      }
+      mergedCatalog[category] = nextCategory;
     }
   }
 
   const merged: BuiltInRuntimeSettings = {
     serviceGatewayUrl: normalizeUrl(input.serviceGatewayUrl || current.serviceGatewayUrl),
-    iopaintUrls:
-      Array.isArray(input.iopaintUrls)
-        ? input.iopaintUrls
-            .map((item) => normalizeUrl(item))
-            .filter((item) => /^https?:\/\//i.test(item))
-        : current.iopaintUrls,
     updatePageUrl:
       typeof input.updatePageUrl === 'string'
         ? (() => {
@@ -480,7 +723,6 @@ export async function saveBuiltInRuntimeSettings(input: Partial<BuiltInRuntimeSe
 
   await Promise.all([
     setSystemSetting('service_gateway_url', merged.serviceGatewayUrl),
-    setSystemSetting('iopaint_urls', JSON.stringify(merged.iopaintUrls)),
     setSystemSetting('update_page_url', merged.updatePageUrl),
     setSystemSetting('download_channels', JSON.stringify(merged.downloadChannels)),
     persistServiceCatalog(merged.serviceCatalog),

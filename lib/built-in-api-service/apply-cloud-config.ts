@@ -1,14 +1,14 @@
 /**
- * 内置 AI 服务配置注入器
+ * 内置 AI 服务配置注入器（subtask 版）
  *
- * 用途：admin-panel 端 / md2pptWin 服务端 在收到 useBuiltInService=true 的请求时，
- * 从云端 catalog 加载对应类别的 baseUrl/apiKey/model，覆盖 body 中相应字段。
+ * 用途：md2pptWin 服务端 AI 路由收到 useBuiltInService=true 的请求时，
+ * 从云端 catalog 加载对应类别 + subtask 的 baseUrl/apiKey/model，覆盖 body 字段。
  *
  * 仅服务端使用（依赖 @vercel/postgres）。
  */
 
 import {
-  getServiceCatalog,
+  getInternalServiceConfig,
   type BuiltInServiceCategory,
 } from "./db";
 
@@ -16,6 +16,7 @@ export interface BuiltInResolvedConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
+  subtaskId: string;
 }
 
 const RESOLVED_BASE_URL_KEYS = [
@@ -26,21 +27,24 @@ const RESOLVED_BASE_URL_KEYS = [
 ];
 
 export async function resolveBuiltInCategoryConfig(
-  category: BuiltInServiceCategory
+  category: BuiltInServiceCategory,
+  subtaskId?: string
 ): Promise<BuiltInResolvedConfig | null> {
   try {
-    const catalog = await getServiceCatalog();
-    const cfg = catalog[category];
-    if (!cfg || !cfg.isEnabled) return null;
-    if (!cfg.baseUrl || !cfg.apiKey) return null;
+    const entry = await getInternalServiceConfig(category, subtaskId);
+    if (!entry) return null;
+    const { subtask } = entry;
+    if (!subtask.isEnabled) return null;
+    if (!subtask.baseUrl || !subtask.apiKey) return null;
     return {
-      baseUrl: cfg.baseUrl,
-      apiKey: cfg.apiKey,
-      model: cfg.model || "",
+      baseUrl: subtask.baseUrl,
+      apiKey: subtask.apiKey,
+      model: subtask.model || "",
+      subtaskId: subtask.id,
     };
   } catch (error) {
     console.error(
-      `[apply-cloud-config] 加载 ${category} catalog 失败:`,
+      `[apply-cloud-config] 加载 ${category}/${subtaskId || "default"} 失败:`,
       error instanceof Error ? error.message : error
     );
     return null;
@@ -88,16 +92,20 @@ export function applyBuiltInConfigToBody<T extends Record<string, unknown>>(
 
 /**
  * 一站式：检查 useBuiltInService → 加载 catalog → 注入到 body
+ * 可通过 body.builtInSubtaskId 显式选择子任务（缺省走该 category 的 default）
  */
 export async function injectBuiltInCategoryConfig<T extends Record<string, unknown>>(
   body: T,
   category: BuiltInServiceCategory,
-  options: { force?: boolean } = {}
+  options: { force?: boolean; subtaskId?: string } = {}
 ): Promise<{ body: T; applied: boolean; config: BuiltInResolvedConfig | null }> {
   if (body?.useBuiltInService !== true) {
     return { body, applied: false, config: null };
   }
-  const config = await resolveBuiltInCategoryConfig(category);
+  const subtaskHint =
+    options.subtaskId ||
+    (typeof body?.builtInSubtaskId === "string" ? (body.builtInSubtaskId as string) : undefined);
+  const config = await resolveBuiltInCategoryConfig(category, subtaskHint);
   if (!config) {
     return { body, applied: false, config: null };
   }

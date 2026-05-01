@@ -124,8 +124,6 @@ export async function GET(req: Request) {
         {
           settings: {
             serviceGatewayUrl: runtimeSettings.serviceGatewayUrl,
-            iopaintUrls: runtimeSettings.iopaintUrls,
-            iopaintUrl: runtimeSettings.iopaintUrls[0] || "",
             updatePageUrl: runtimeSettings.updatePageUrl || "",
             downloadChannels: runtimeSettings.downloadChannels || [],
             serviceCatalog: sanitizedCatalog,

@@ -5,10 +5,14 @@ import {
   getBuiltInRuntimeSettings,
   saveBuiltInRuntimeSettings,
   sanitizeServiceCatalog,
-  setServiceCategoryConfig,
+  setServiceSubtaskConfig,
+  deleteServiceSubtask,
+  setCategoryDefaultSubtask,
+  getSubtaskPresets,
   BUILT_IN_SERVICE_CATEGORIES,
   type BuiltInServiceCategory,
   type BuiltInServiceCatalog,
+  type BuiltInServiceSubtaskConfig,
 } from "@/lib/built-in-api-service/db";
 import { isEncryptionConfigured } from "@/lib/built-in-api-service/encryption";
 
@@ -22,19 +26,6 @@ const normalizeChannelId = (value?: string) =>
     .toLowerCase()
     .replace(/[^a-z0-9_-]/g, "");
 const normalizeChannelName = (value?: string) => (value || "").trim().slice(0, 40);
-
-const parseUrls = (raw: unknown) => {
-  if (Array.isArray(raw)) {
-    return raw
-      .map((item) => normalizeUrl(String(item || "")))
-      .filter((item) => /^https?:\/\//i.test(item));
-  }
-  const text = typeof raw === "string" ? raw : "";
-  return text
-    .split(/[\n,;]/)
-    .map((item) => normalizeUrl(item))
-    .filter((item) => /^https?:\/\//i.test(item));
-};
 
 const parseDownloadChannels = (raw: unknown) => {
   if (!Array.isArray(raw)) return [] as Array<{ id: string; name: string; url: string }>;
@@ -59,33 +50,33 @@ const isCategory = (value: unknown): value is BuiltInServiceCategory =>
   typeof value === "string" &&
   (BUILT_IN_SERVICE_CATEGORIES as readonly string[]).includes(value);
 
-const sanitizeCatalogInput = (raw: unknown): Partial<BuiltInServiceCatalog> | undefined => {
-  if (!raw || typeof raw !== "object") return undefined;
-  const result: Partial<BuiltInServiceCatalog> = {};
-  for (const category of BUILT_IN_SERVICE_CATEGORIES) {
-    const incoming = (raw as Record<string, unknown>)[category];
-    if (!incoming || typeof incoming !== "object") continue;
-    const record = incoming as Record<string, unknown>;
-    const baseUrl = normalizeUrl(String(record.baseUrl || ""));
-    if (baseUrl && !/^https?:\/\//i.test(baseUrl)) continue;
-    const apiKey = typeof record.apiKey === "string" ? record.apiKey : undefined;
-    const model = typeof record.model === "string" ? record.model.trim() : undefined;
-    const isEnabled =
-      typeof record.isEnabled === "boolean" ? record.isEnabled : undefined;
-    const next: Record<string, unknown> = {};
-    if (baseUrl !== undefined) next.baseUrl = baseUrl;
-    if (apiKey !== undefined && apiKey !== "") next.apiKey = apiKey;
-    if (model !== undefined) next.model = model;
-    if (isEnabled !== undefined) next.isEnabled = isEnabled;
-    result[category] = next as unknown as BuiltInServiceCatalog[BuiltInServiceCategory];
+/**
+ * 解析单个 subtask patch；保留只传指定字段的能力，避免覆盖未提供的字段。
+ */
+const sanitizeSubtaskPatch = (
+  raw: unknown
+): Partial<Omit<BuiltInServiceSubtaskConfig, "id">> | null => {
+  if (!raw || typeof raw !== "object") return null;
+  const record = raw as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  if (typeof record.displayName === "string") out.displayName = record.displayName.trim();
+  if (typeof record.description === "string") out.description = record.description;
+  if (typeof record.baseUrl === "string") {
+    const baseUrl = normalizeUrl(record.baseUrl);
+    if (baseUrl && !/^https?:\/\//i.test(baseUrl)) return null;
+    out.baseUrl = baseUrl;
   }
-  return Object.keys(result).length ? result : undefined;
+  if (typeof record.apiKey === "string") out.apiKey = record.apiKey;
+  if (typeof record.model === "string") out.model = record.model.trim();
+  if (typeof record.isEnabled === "boolean") out.isEnabled = record.isEnabled;
+  return out as Partial<Omit<BuiltInServiceSubtaskConfig, "id">>;
 };
 
 function buildResponseSettings(settings: Awaited<ReturnType<typeof getBuiltInRuntimeSettings>>) {
   return {
     ...settings,
     serviceCatalog: sanitizeServiceCatalog(settings.serviceCatalog, { includeKeyMask: true }),
+    subtaskPresets: getSubtaskPresets(),
   };
 }
 
@@ -116,38 +107,11 @@ export async function POST(req: Request) {
     const body = await req.json();
     const action = typeof body?.action === "string" ? body.action : "replace";
 
-    if (action === "append-iopaint-urls" || action === "remove-iopaint-urls") {
-      const current = await getBuiltInRuntimeSettings();
-      const targetUrls = parseUrls(body?.iopaintUrls);
-
-      if (!targetUrls.length) {
-        return NextResponse.json(
-          { error: "iopaintUrls is empty" },
-          { status: 400, headers: noStoreHeaders() }
-        );
-      }
-
-      let nextUrls: string[] = current.iopaintUrls || [];
-      if (action === "append-iopaint-urls") {
-        nextUrls = Array.from(new Set([...nextUrls, ...targetUrls]));
-      } else {
-        const removeSet = new Set(targetUrls);
-        nextUrls = nextUrls.filter((item) => !removeSet.has(normalizeUrl(item)));
-      }
-
-      const settings = await saveBuiltInRuntimeSettings({
-        serviceGatewayUrl: current.serviceGatewayUrl,
-        iopaintUrls: nextUrls,
-        updatePageUrl: current.updatePageUrl,
-        downloadChannels: current.downloadChannels,
-      });
-      return NextResponse.json(
-        { settings: buildResponseSettings(settings) },
-        { headers: noStoreHeaders() }
-      );
-    }
-
-    if (action === "update-service-category") {
+    /**
+     * 更新某 category 下的某个 subtask
+     * body: { action, category, subtaskId, patch }
+     */
+    if (action === "update-service-subtask") {
       const category = body?.category;
       if (!isCategory(category)) {
         return NextResponse.json(
@@ -155,15 +119,21 @@ export async function POST(req: Request) {
           { status: 400, headers: noStoreHeaders() }
         );
       }
-      const patch = body?.patch;
-      const sanitized = sanitizeCatalogInput({ [category]: patch })?.[category];
-      if (!sanitized) {
+      const subtaskId = String(body?.subtaskId || "").trim();
+      if (!subtaskId) {
+        return NextResponse.json(
+          { error: "subtaskId is required" },
+          { status: 400, headers: noStoreHeaders() }
+        );
+      }
+      const patch = sanitizeSubtaskPatch(body?.patch);
+      if (!patch || Object.keys(patch).length === 0) {
         return NextResponse.json(
           { error: "patch is empty or invalid" },
           { status: 400, headers: noStoreHeaders() }
         );
       }
-      await setServiceCategoryConfig(category, sanitized);
+      await setServiceSubtaskConfig(category, subtaskId, patch);
       const settings = await getBuiltInRuntimeSettings();
       return NextResponse.json(
         { settings: buildResponseSettings(settings) },
@@ -171,11 +141,67 @@ export async function POST(req: Request) {
       );
     }
 
+    /**
+     * 删除自定义 subtask（预设 ID 拒绝）
+     * body: { action, category, subtaskId }
+     */
+    if (action === "delete-service-subtask") {
+      const category = body?.category;
+      if (!isCategory(category)) {
+        return NextResponse.json(
+          { error: `category must be one of ${BUILT_IN_SERVICE_CATEGORIES.join("|")}` },
+          { status: 400, headers: noStoreHeaders() }
+        );
+      }
+      const subtaskId = String(body?.subtaskId || "").trim();
+      if (!subtaskId) {
+        return NextResponse.json(
+          { error: "subtaskId is required" },
+          { status: 400, headers: noStoreHeaders() }
+        );
+      }
+      await deleteServiceSubtask(category, subtaskId);
+      const settings = await getBuiltInRuntimeSettings();
+      return NextResponse.json(
+        { settings: buildResponseSettings(settings) },
+        { headers: noStoreHeaders() }
+      );
+    }
+
+    /**
+     * 设置某 category 默认 subtask
+     * body: { action, category, subtaskId }
+     */
+    if (action === "set-default-subtask") {
+      const category = body?.category;
+      if (!isCategory(category)) {
+        return NextResponse.json(
+          { error: `category must be one of ${BUILT_IN_SERVICE_CATEGORIES.join("|")}` },
+          { status: 400, headers: noStoreHeaders() }
+        );
+      }
+      const subtaskId = String(body?.subtaskId || "").trim();
+      if (!subtaskId) {
+        return NextResponse.json(
+          { error: "subtaskId is required" },
+          { status: 400, headers: noStoreHeaders() }
+        );
+      }
+      await setCategoryDefaultSubtask(category, subtaskId);
+      const settings = await getBuiltInRuntimeSettings();
+      return NextResponse.json(
+        { settings: buildResponseSettings(settings) },
+        { headers: noStoreHeaders() }
+      );
+    }
+
+    /**
+     * 全量替换运行时设置（serviceGatewayUrl + updatePageUrl + downloadChannels）。
+     * 不支持通过此接口批量更新 catalog（catalog 必须用 update-service-subtask）
+     */
     const serviceGatewayUrl = normalizeUrl(body?.serviceGatewayUrl || "");
-    const iopaintUrls = parseUrls(body?.iopaintUrls);
     const updatePageUrl = normalizeUrl(body?.updatePageUrl || "");
     const downloadChannels = parseDownloadChannels(body?.downloadChannels);
-    const serviceCatalogPatch = sanitizeCatalogInput(body?.serviceCatalog);
 
     if (serviceGatewayUrl && !/^https?:\/\//i.test(serviceGatewayUrl)) {
       return NextResponse.json(
@@ -192,10 +218,8 @@ export async function POST(req: Request) {
 
     const settings = await saveBuiltInRuntimeSettings({
       serviceGatewayUrl,
-      iopaintUrls,
       updatePageUrl,
       downloadChannels,
-      serviceCatalog: serviceCatalogPatch as BuiltInServiceCatalog | undefined,
     });
 
     return NextResponse.json(

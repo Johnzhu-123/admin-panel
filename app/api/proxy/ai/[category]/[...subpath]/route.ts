@@ -2,18 +2,20 @@
  * AI 代理路由（catch-all）
  *
  * 客户端调用规则：
- *   POST /api/proxy/ai/text/chat/completions          → 上游 ${baseUrl}/chat/completions
- *   POST /api/proxy/ai/image/images/generations       → 上游 ${baseUrl}/images/generations
- *   POST /api/proxy/ai/tts/audio/speech               → 上游 ${baseUrl}/audio/speech
- *   POST /api/proxy/ai/multimodal/chat/completions    → 上游 ${baseUrl}/chat/completions
- *   POST /api/proxy/ai/video/video/generations        → 上游 ${baseUrl}/video/generations
+ *   POST /api/proxy/ai/text/chat/completions?subtask=plan
+ *   POST /api/proxy/ai/image/images/generations?subtask=generation
+ *   POST /api/proxy/ai/image/chat/completions?subtask=understanding   ← 同类不同 subtask 用不同 model/baseUrl
+ *   POST /api/proxy/ai/tts/audio/speech                                ← 不传 subtask 走该 category 的 default
+ *   POST /api/proxy/ai/multimodal/chat/completions
+ *   POST /api/proxy/ai/video/video/generations?subtask=text2video
  *
  * 行为：
  * 1. Clerk 验证用户身份（currentUser）
  * 2. 在 authorized_users 表查授权状态 + can_use_built_in_services
- * 3. 注入服务端配置的 baseUrl + apiKey
- * 4. 转发请求（支持流式）
- * 5. 异步记录 api_usage_records
+ * 3. 根据 ?subtask=xxx（缺省取 category.defaultSubtaskId）解析 subtask 配置
+ * 4. 注入服务端配置的 baseUrl + apiKey
+ * 5. 转发请求（支持流式）
+ * 6. 异步记录 api_usage_records，service_id = built-in-{category}-{subtaskId}
  *
  * 注意：apiKey 永不出服务端。
  */
@@ -24,7 +26,7 @@ import { sql } from "@vercel/postgres";
 import { randomUUID } from "crypto";
 import { noStoreHeaders } from "@/lib/ai";
 import {
-  getServiceCatalog,
+  getInternalServiceConfig,
   BUILT_IN_SERVICE_CATEGORIES,
   type BuiltInServiceCategory,
 } from "@/lib/built-in-api-service/db";
@@ -168,22 +170,25 @@ async function handleProxy(
       return json(429, { error: "今日配额已用尽" });
     }
 
-    const catalog = await getServiceCatalog();
-    const cfg = catalog[category];
-    if (!cfg || !cfg.isEnabled) {
-      return json(503, { error: `${category} 服务未启用` });
+    const catalogEntry = await getInternalServiceConfig(category, req.nextUrl.searchParams.get("subtask") || undefined);
+    if (!catalogEntry) {
+      return json(503, { error: `${category} 服务未配置` });
     }
-    if (!cfg.baseUrl || !cfg.apiKey) {
-      return json(503, { error: `${category} 服务未配置（baseUrl/apiKey 缺失）` });
+    const { subtask } = catalogEntry;
+    if (!subtask.isEnabled) {
+      return json(503, { error: `${category}/${subtask.id} 子任务未启用` });
+    }
+    if (!subtask.baseUrl || !subtask.apiKey) {
+      return json(503, { error: `${category}/${subtask.id} 服务未配置（baseUrl/apiKey 缺失）` });
     }
 
-    const upstreamUrl = buildUpstreamUrl(cfg.baseUrl, subpath);
+    const upstreamUrl = buildUpstreamUrl(subtask.baseUrl, subpath);
     const incomingHeaders = new Headers(req.headers);
     incomingHeaders.delete("authorization");
     incomingHeaders.delete("cookie");
     incomingHeaders.delete("host");
     incomingHeaders.delete("content-length");
-    incomingHeaders.set("Authorization", `Bearer ${cfg.apiKey}`);
+    incomingHeaders.set("Authorization", `Bearer ${subtask.apiKey}`);
 
     const init: RequestInit = {
       method: req.method,
@@ -201,7 +206,7 @@ async function handleProxy(
     void recordUsage({
       requestId,
       userId: authorization.userId,
-      serviceId: `built-in-${category}`,
+      serviceId: `built-in-${category}-${subtask.id}`,
       success: upstreamResp.ok,
       responseTime,
       error: upstreamResp.ok ? undefined : `HTTP ${upstreamResp.status}`,
@@ -212,7 +217,8 @@ async function handleProxy(
     respHeaders.delete("transfer-encoding");
     respHeaders.set("x-builtin-request-id", requestId);
     respHeaders.set("x-builtin-category", category);
-    respHeaders.set("x-builtin-model-default", cfg.model || "");
+    respHeaders.set("x-builtin-subtask", subtask.id);
+    respHeaders.set("x-builtin-model-default", subtask.model || "");
 
     return new Response(upstreamResp.body, {
       status: upstreamResp.status,
