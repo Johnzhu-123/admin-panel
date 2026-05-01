@@ -1,0 +1,72 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+external/OCRPDF-TO-PPT
+external/gemini-business2api
+dist
+dist-ssr
+.next
+out
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# clerk configuration (can include secrets)
+/.clerk/
+
+# Temporary test and debug files
+test-*.js
+test-*.cjs
+test-*.ts
+test-*.md
+debug-*.js
+debug-*.ts
+verify-*.js
+validate-*.js
+validate-*.cjs
+check-*.js
+simple-*.js
+demo-*.js
+demo-*.cjs
+fix-*.js
+
+# Temporary documentation
+*_SUMMARY.md
+*_FIX.md
+*_FIXES.md
+*_GUIDE.md
+*_COMPLETE.md
+*_REPORT.md
+*_IMPLEMENTATION.md
+troubleshoot-*.md
+*-fix-guide.md
+*-setup-guide.md
+*-troubleshooting.md
+*-integration-guide.md
+*-usage-guide.md
+
+# Temporary scripts
+add-*.js
+admin-*.cjs
+deployment-*.js
+
+# Keep important files
+!.env.example
+!.env.vercel.template
+tsconfig.tsbuildinfo
