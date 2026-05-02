@@ -11,8 +11,7 @@ import {
   noStoreHeaders,
   normalizeOpenAiBaseUrl,
 } from "@/lib/ai";
-import { getBuiltInAPIService } from "@/lib/built-in-api-service";
-import { getBuiltInServiceConfig } from "@/lib/built-in-api-service/config";
+import { resolveBuiltInWithCatalog, rewriteUpstreamError } from "@/lib/built-in-api-service/catalog-resolver";
 import { recordFailureLog } from "@/lib/diagnostics";
 import type { InlineImage } from "@/lib/ai";
 
@@ -27,45 +26,8 @@ const toInlinePart = (img: InlineImage) => ({
   inlineData: { mimeType: img.mimeType, data: img.data },
 });
 
-const resolveBuiltInTextConfig = async (userId: string) => {
-  try {
-    console.log("[DEBUG resolveBuiltInTextConfig] Starting for userId:", userId);
-    
-    const builtInService = getBuiltInAPIService();
-    await builtInService.initialize();
-    console.log("[DEBUG resolveBuiltInTextConfig] Service initialized");
-
-    const isAuthorized = await builtInService.checkUserAuthorization(userId);
-    console.log("[DEBUG resolveBuiltInTextConfig] User authorized:", isAuthorized);
-    if (!isAuthorized) return null;
-
-    const services = await builtInService.getAvailableServices(userId);
-    console.log("[DEBUG resolveBuiltInTextConfig] Available services:", services.map(s => ({
-      id: s.id,
-      isBuiltIn: s.isBuiltIn,
-      isAvailable: s.isAvailable
-    })));
-    
-    const builtInOption = services.find(
-      (service) => service.isBuiltIn && service.isAvailable
-    );
-    console.log("[DEBUG resolveBuiltInTextConfig] Built-in option found:", !!builtInOption);
-    if (!builtInOption) return null;
-
-    const config = getBuiltInServiceConfig(builtInOption.id);
-    console.log("[DEBUG resolveBuiltInTextConfig] Config retrieved:", {
-      hasConfig: !!config,
-      apiKey: config?.apiKey ? `***${config.apiKey.slice(-4)}` : "NONE",
-      baseUrl: config?.baseUrl,
-      model: config?.model
-    });
-    
-    return config;
-  } catch (error) {
-    console.error("[DEBUG resolveBuiltInTextConfig] Error:", error);
-    return null;
-  }
-};
+const resolveBuiltInTextConfig = (userId: string) =>
+  resolveBuiltInWithCatalog(userId, "text");
 
 export async function POST(req: Request) {
   try {
@@ -217,7 +179,7 @@ export async function POST(req: Request) {
         responseBody: detail,
       });
       return NextResponse.json(
-        { error: detail || "OpenAI-compatible request failed." },
+        { error: rewriteUpstreamError(res.status, detail || "OpenAI-compatible request failed.", "text") },
         { status: res.status, headers: noStoreHeaders() }
       );
     }

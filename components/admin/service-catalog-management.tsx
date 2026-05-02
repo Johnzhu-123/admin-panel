@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -353,26 +353,21 @@ export function ServiceCatalogManagement() {
 
   return (
     <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <KeyRound className="h-5 w-5" />
-          AI 服务清单（按子任务管理）
-        </CardTitle>
-        <CardDescription>
-          按 5 大类（多模态/文本/图像/TTS/视频）维护 BaseURL、API Key、Model；同一类下可有多个子任务
-          （例如图像生成 vs 图像理解）。授权用户调用 <code className="text-xs">/api/proxy/ai/*</code>{" "}
-          时由服务端注入对应子任务的密钥，前端永不接触明文 Key。
-        </CardDescription>
-        <div className="mt-2 flex items-center gap-2 text-xs">
+      <CardHeader className="space-y-2 pb-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <CardTitle className="flex items-center gap-2 text-base">
+            <KeyRound className="h-5 w-5" />
+            AI 服务清单
+          </CardTitle>
           {encryptionConfigured ? (
-            <span className="inline-flex items-center gap-1 text-green-600">
+            <span className="inline-flex items-center gap-1 text-xs text-green-600">
               <ShieldCheck className="h-4 w-4" />
-              加密已启用（BUILT_IN_ENCRYPTION_KEY 已配置）
+              加密已启用
             </span>
           ) : (
-            <span className="inline-flex items-center gap-1 text-orange-600">
+            <span className="inline-flex items-center gap-1 text-xs text-orange-600">
               <ShieldAlert className="h-4 w-4" />
-              未配置 BUILT_IN_ENCRYPTION_KEY，API Key 将以明文落库（仅用于测试环境）
+              未配置加密密钥（API Key 明文落库）
             </span>
           )}
         </div>
@@ -392,17 +387,13 @@ export function ServiceCatalogManagement() {
         <Card className="border-dashed">
           <CardHeader className="pb-2">
             <CardTitle className="flex items-center gap-2 text-sm">
-              <KeyRound className="h-4 w-4" /> 通用凭据 · 一键应用到全部子任务
+              <KeyRound className="h-4 w-4" /> 通用凭据 · 一键写入全部子任务
             </CardTitle>
-            <CardDescription className="text-xs">
-              如果你选择的 API 同时支持多模态/文本/图像/TTS/视频，BaseURL 与 API Key 通常通用。
-              在这里填写一次，点&ldquo;一键应用&rdquo;即可写入下方 5 类的所有子任务；之后只需在每个分类里挑选默认模型。
-            </CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
             <div className="grid gap-3 md:grid-cols-2">
               <div className="space-y-1">
-                <Label className="text-xs">通用 BaseURL</Label>
+                <Label className="text-xs">BaseURL</Label>
                 <Input
                   value={bulkBaseUrl}
                   onChange={(e) => setBulkBaseUrl(e.target.value)}
@@ -410,7 +401,7 @@ export function ServiceCatalogManagement() {
                 />
               </div>
               <div className="space-y-1">
-                <Label className="text-xs">通用 API Key</Label>
+                <Label className="text-xs">API Key</Label>
                 <Input
                   type="password"
                   value={bulkApiKey}
@@ -419,7 +410,7 @@ export function ServiceCatalogManagement() {
                 />
               </div>
             </div>
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-2">
               <label className="flex items-center gap-2 text-xs text-muted-foreground">
                 <input
                   type="checkbox"
@@ -434,13 +425,9 @@ export function ServiceCatalogManagement() {
                 ) : (
                   <KeyRound className="mr-1 h-3 w-3" />
                 )}
-                一键应用到全部子任务
+                一键应用
               </Button>
             </div>
-            <p className="text-xs text-muted-foreground">
-              提示：仅填写其一也可（例如只更新 API Key 不动 BaseURL）。空字段不会覆盖原值。
-              下方每个分类卡片仍可单独覆盖个性化的 BaseURL / Key / Model。
-            </p>
           </CardContent>
         </Card>
 
@@ -462,17 +449,10 @@ export function ServiceCatalogManagement() {
             const subtasks = Object.values(cfg.subtasks).sort((a, b) => a.id.localeCompare(b.id));
             const presetIds = new Set((presets[meta.key] || []).map((p) => p.id));
             return (
-              <TabsContent key={meta.key} value={meta.key} className="space-y-4">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="text-sm font-medium">{cfg.displayName}</p>
-                    <p className="text-xs text-muted-foreground">{cfg.description}</p>
-                    <p className="mt-1 text-xs text-muted-foreground">
-                      默认子任务：<code className="font-mono">{cfg.defaultSubtaskId}</code>
-                    </p>
-                  </div>
+              <TabsContent key={meta.key} value={meta.key} className="space-y-3">
+                <div className="flex items-center justify-end">
                   <Button size="sm" variant="outline" onClick={() => addCustomSubtask(meta.key)}>
-                    <Plus className="mr-1 h-3 w-3" /> 新增自定义子任务
+                    <Plus className="mr-1 h-3 w-3" /> 新增子任务
                   </Button>
                 </div>
 
@@ -483,24 +463,19 @@ export function ServiceCatalogManagement() {
                   return (
                     <Card key={subtask.id} className="border">
                       <CardHeader className="pb-2">
-                        <div className="flex items-start justify-between">
-                          <div className="flex-1">
-                            <div className="flex items-center gap-2">
-                              <CardTitle className="text-sm">{subtask.displayName}</CardTitle>
-                              <code className="text-xs text-muted-foreground">{subtask.id}</code>
-                              {isDefault && (
-                                <span className="inline-flex items-center gap-1 rounded bg-yellow-500/15 px-1.5 py-0.5 text-xs text-yellow-700">
-                                  <Star className="h-3 w-3" /> 默认
-                                </span>
-                              )}
-                              {isPreset && (
-                                <span className="rounded bg-blue-500/15 px-1.5 py-0.5 text-xs text-blue-700">
-                                  预设
-                                </span>
-                              )}
-                            </div>
-                            {!!subtask.description && (
-                              <p className="mt-0.5 text-xs text-muted-foreground">{subtask.description}</p>
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <CardTitle className="text-sm">{subtask.displayName}</CardTitle>
+                            <code className="text-xs text-muted-foreground">{subtask.id}</code>
+                            {isDefault && (
+                              <span className="inline-flex items-center gap-1 rounded bg-yellow-500/15 px-1.5 py-0.5 text-xs text-yellow-700">
+                                <Star className="h-3 w-3" /> 默认
+                              </span>
+                            )}
+                            {isPreset && (
+                              <span className="rounded bg-blue-500/15 px-1.5 py-0.5 text-xs text-blue-700">
+                                预设
+                              </span>
                             )}
                           </div>
                           <div className="flex items-center gap-1">
@@ -533,6 +508,16 @@ export function ServiceCatalogManagement() {
                       <CardContent className="space-y-3 pt-0">
                         <div className="grid gap-3 md:grid-cols-2">
                           <div className="space-y-1">
+                            <Label className="text-xs">Model</Label>
+                            <Input
+                              value={subtask.model}
+                              onChange={(e) =>
+                                updateSubtaskField(meta.key, subtask.id, "model", e.target.value)
+                              }
+                              placeholder="gpt-4o / gpt-image-1 / sora-1 ..."
+                            />
+                          </div>
+                          <div className="space-y-1">
                             <Label className="text-xs">展示名</Label>
                             <Input
                               value={subtask.displayName}
@@ -540,16 +525,6 @@ export function ServiceCatalogManagement() {
                                 updateSubtaskField(meta.key, subtask.id, "displayName", e.target.value)
                               }
                               placeholder="子任务展示名"
-                            />
-                          </div>
-                          <div className="space-y-1">
-                            <Label className="text-xs">默认 Model</Label>
-                            <Input
-                              value={subtask.model}
-                              onChange={(e) =>
-                                updateSubtaskField(meta.key, subtask.id, "model", e.target.value)
-                              }
-                              placeholder="gpt-4o / gpt-image-1 / sora-1 ..."
                             />
                           </div>
                         </div>
@@ -564,7 +539,7 @@ export function ServiceCatalogManagement() {
                           />
                         </div>
                         <div className="space-y-1">
-                          <Label className="text-xs">API Key（保存后只显示掩码）</Label>
+                          <Label className="text-xs">API Key</Label>
                           <Input
                             type="password"
                             value={subtask.apiKey}
@@ -583,7 +558,7 @@ export function ServiceCatalogManagement() {
                                 updateSubtaskField(meta.key, subtask.id, "isEnabled", e.target.checked)
                               }
                             />
-                            启用此子任务（关闭后调用此 subtask 的请求返回 503）
+                            启用
                           </label>
                           <Button
                             size="sm"
@@ -594,11 +569,6 @@ export function ServiceCatalogManagement() {
                             保存
                           </Button>
                         </div>
-                        {!!subtask.updatedAt && (
-                          <p className="text-xs text-muted-foreground">
-                            上次更新：{new Date(subtask.updatedAt).toLocaleString("zh-CN")}
-                          </p>
-                        )}
                       </CardContent>
                     </Card>
                   );

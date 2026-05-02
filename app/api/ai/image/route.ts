@@ -24,8 +24,7 @@ import {
   resolveOpenAiEndpoint,
 } from "@/lib/ai";
 import { recordFailureLog } from "@/lib/diagnostics";
-import { getBuiltInAPIService } from "@/lib/built-in-api-service";
-import { getBuiltInServiceConfig } from "@/lib/built-in-api-service/config";
+import { resolveBuiltInWithCatalog, rewriteUpstreamError } from "@/lib/built-in-api-service/catalog-resolver";
 import {
   generateImageWithCompatibility,
   handleCompatibilityError,
@@ -125,25 +124,8 @@ const shouldUseGeminiPreviewModel = (model: string) =>
 const shouldUseGeminiAlpha = (model: string) =>
   /preview|exp|experimental|alpha/i.test(model);
 
-const resolveBuiltInImageConfig = async (userId: string) => {
-  try {
-    const builtInService = getBuiltInAPIService();
-    await builtInService.initialize();
-
-    const isAuthorized = await builtInService.checkUserAuthorization(userId);
-    if (!isAuthorized) return null;
-
-    const services = await builtInService.getAvailableServices(userId);
-    const builtInOption = services.find(
-      (service) => service.isBuiltIn && service.isAvailable
-    );
-    if (!builtInOption) return null;
-
-    return getBuiltInServiceConfig(builtInOption.id);
-  } catch {
-    return null;
-  }
-};
+const resolveBuiltInImageConfig = (userId: string) =>
+  resolveBuiltInWithCatalog(userId, "image");
 
 const describeGeminiStyle = async (
   ai: GoogleGenAI,

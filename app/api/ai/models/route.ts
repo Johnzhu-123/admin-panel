@@ -9,8 +9,7 @@ import {
   noStoreHeaders,
 } from "@/lib/ai";
 import { recordFailureLog } from "@/lib/diagnostics";
-import { getBuiltInAPIService } from "@/lib/built-in-api-service";
-import { getBuiltInServiceConfig } from "@/lib/built-in-api-service/config";
+import { resolveBuiltInWithCatalog, rewriteUpstreamError } from "@/lib/built-in-api-service/catalog-resolver";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -278,25 +277,8 @@ const parseErrorMessage = (data: any) => {
   return "";
 };
 
-const resolveBuiltInModelConfig = async (userId: string) => {
-  try {
-    const builtInService = getBuiltInAPIService();
-    await builtInService.initialize();
-
-    const isAuthorized = await builtInService.checkUserAuthorization(userId);
-    if (!isAuthorized) return null;
-
-    const services = await builtInService.getAvailableServices(userId);
-    const builtInOption = services.find(
-      (service) => service.isBuiltIn && service.isAvailable
-    );
-    if (!builtInOption) return null;
-
-    return getBuiltInServiceConfig(builtInOption.id);
-  } catch {
-    return null;
-  }
-};
+const resolveBuiltInModelConfig = (userId: string) =>
+  resolveBuiltInWithCatalog(userId, "text");
 
 export async function POST(req: Request) {
   try {
@@ -373,16 +355,17 @@ export async function POST(req: Request) {
 
     if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        const message =
+        const rawMessage =
           parseErrorMessage(data) ||
           (await res.text().catch(() => "")) ||
           "Failed to fetch OpenAI-compatible models.";
+        const message = rewriteUpstreamError(res.status, rawMessage, "text");
       recordFailureLog({
         provider,
         operation: "models",
         url: `${baseUrl}/models`,
         status: res.status,
-        responseBody: data || message,
+        responseBody: data || rawMessage,
       });
       if (res.status === 401 || res.status === 403 || res.status === 404) {
         return NextResponse.json(
