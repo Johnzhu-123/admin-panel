@@ -52,6 +52,19 @@ const isCategory = (value: unknown): value is BuiltInServiceCategory =>
   (BUILT_IN_SERVICE_CATEGORIES as readonly string[]).includes(value);
 
 /**
+ * 判断字符串是否疑似已被 maskSecret 处理过的 API Key。
+ * maskSecret 规则：head4 + "*"*max(8, len-8) + tail4，所以正常输出包含 ≥4 个连续 `*`；
+ * 同时把"全是星号"的短串也视为 mask（≤8 长度时 mask 全是 `*`）。
+ * 真实 API Key 不允许包含 `*` 字符。
+ */
+const isMaskedApiKey = (value: unknown): boolean => {
+  if (typeof value !== "string" || !value) return false;
+  if (/\*{4,}/.test(value)) return true;
+  if (/^\*+$/.test(value)) return true;
+  return false;
+};
+
+/**
  * 解析单个 subtask patch；保留只传指定字段的能力，避免覆盖未提供的字段。
  */
 const sanitizeSubtaskPatch = (
@@ -67,7 +80,13 @@ const sanitizeSubtaskPatch = (
     if (baseUrl && !/^https?:\/\//i.test(baseUrl)) return null;
     out.baseUrl = baseUrl;
   }
-  if (typeof record.apiKey === "string") out.apiKey = record.apiKey;
+  if (typeof record.apiKey === "string") {
+    // 防御：拒绝把 mask 字符串（如 "abcd********wxyz"）当作真实 key 写入数据库；
+    // 客户端若发回 mask（用户没改 apiKey 字段），应静默跳过保留原有真实值。
+    if (!isMaskedApiKey(record.apiKey)) {
+      out.apiKey = record.apiKey;
+    }
+  }
   if (typeof record.model === "string") out.model = record.model.trim();
   if (typeof record.isEnabled === "boolean") out.isEnabled = record.isEnabled;
   return out as Partial<Omit<BuiltInServiceSubtaskConfig, "id">>;
@@ -230,7 +249,7 @@ export async function POST(req: Request) {
       const explicitBaseUrl =
         typeof body?.baseUrl === "string" ? normalizeUrl(body.baseUrl) : "";
       const explicitApiKey = typeof body?.apiKey === "string" ? body.apiKey : "";
-      const apiKeyIsMasked = explicitApiKey.startsWith("****");
+      const apiKeyIsMasked = isMaskedApiKey(explicitApiKey);
 
       let baseUrl = "";
       let apiKey = "";
@@ -482,6 +501,12 @@ export async function POST(req: Request) {
         );
       }
       const rawApiKey = typeof body?.apiKey === "string" ? body.apiKey : undefined;
+      if (rawApiKey !== undefined && isMaskedApiKey(rawApiKey)) {
+        return NextResponse.json(
+          { error: "apiKey 看起来是掩码字符串（含连续 *），请填写真实 Key 或留空" },
+          { status: 400, headers: noStoreHeaders() }
+        );
+      }
       const rawIsEnabled =
         typeof body?.isEnabled === "boolean" ? body.isEnabled : undefined;
 

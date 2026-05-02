@@ -80,6 +80,17 @@ const CATEGORY_META: Array<{
 
 const BASE_URL_PLACEHOLDER = "https://api.seeyjys.eu.org/v1";
 
+/**
+ * 判断字符串是否为后端 maskSecret 的输出（含连续 4+ 星号或全是星号）。
+ * 与服务端 isMaskedApiKey 保持一致——真实 API Key 不会包含 `*` 字符。
+ */
+function isMaskedApiKey(value: string | undefined | null): boolean {
+  if (!value) return false;
+  if (/\*{4,}/.test(value)) return true;
+  if (/^\*+$/.test(value)) return true;
+  return false;
+}
+
 function makeEmptySubtask(id: string, displayName?: string): SubtaskConfig {
   return {
     id,
@@ -177,8 +188,9 @@ export function ServiceCatalogManagement() {
       model: subtask.model,
       isEnabled: subtask.isEnabled,
     };
-    // 只有 apiKey 不为空字符串且不是掩码时才发送（避免误清空）
-    if (subtask.apiKey && !subtask.apiKey.startsWith("****")) {
+    // 只有 apiKey 有值且不是掩码（如 "abcd********wxyz"）时才发送，
+    // 避免把 mask 字符串当作真实 Key 写回数据库导致后续上游 401。
+    if (subtask.apiKey && !isMaskedApiKey(subtask.apiKey)) {
       patch.apiKey = subtask.apiKey;
     }
     return patch;
@@ -738,7 +750,7 @@ export function ServiceCatalogManagement() {
                               onChange={(e) =>
                                 updateSubtaskField(meta.key, subtask.id, "apiKey", e.target.value)
                               }
-                              placeholder={subtask.apiKey?.startsWith("****") ? subtask.apiKey : "sk-..."}
+                              placeholder={isMaskedApiKey(subtask.apiKey) ? subtask.apiKey : "sk-..."}
                               className="bg-slate-900/70 border-slate-600 text-slate-100 placeholder:text-slate-500 pr-9"
                             />
                             <button
@@ -760,7 +772,7 @@ export function ServiceCatalogManagement() {
                               )}
                             </button>
                           </div>
-                          {subtask.apiKey?.startsWith("****") && visibleApiKeys[subtaskKey] && (
+                          {isMaskedApiKey(subtask.apiKey) && visibleApiKeys[subtaskKey] && (
                             <p className="text-[11px] text-slate-500">
                               出于安全考虑，已存储的 Key 仅显示掩码尾部；如需完整值请重新填写后保存。
                             </p>
