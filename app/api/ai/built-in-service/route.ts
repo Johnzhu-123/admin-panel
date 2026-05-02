@@ -231,9 +231,9 @@ export async function GET(req: Request) {
             config: {
               id: config.id,
               name: config.name,
-              provider: config.provider,
-              baseUrl: config.baseUrl,
-              model: config.model,
+              // ⚠️ 不再返回顶层 provider/baseUrl/model（已废弃）：
+              // 真值由 categories[*].subtasks[defaultSubtaskId].{baseUrl,model} 提供，
+              // 早期 SERVICE_CONFIGS 里硬编码的 gemini/zeabur 网关只会引发误解。
               serviceGatewayUrl: runtimeSettings.serviceGatewayUrl || undefined,
               updatePageUrl: runtimeSettings.updatePageUrl || undefined,
               downloadChannels: runtimeSettings.downloadChannels || [],
