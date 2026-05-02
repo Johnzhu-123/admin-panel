@@ -9,11 +9,13 @@ import {
   deleteServiceSubtask,
   setCategoryDefaultSubtask,
   getSubtaskPresets,
+  getInternalServiceConfig,
   BUILT_IN_SERVICE_CATEGORIES,
   type BuiltInServiceCategory,
   type BuiltInServiceSubtaskConfig,
 } from "@/lib/built-in-api-service/db";
 import { isEncryptionConfigured } from "@/lib/built-in-api-service/encryption";
+import { makeUpstreamTimeout } from "@/lib/built-in-api-service/catalog-resolver";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -192,6 +194,180 @@ export async function POST(req: Request) {
         { settings: buildResponseSettings(settings) },
         { headers: noStoreHeaders() }
       );
+    }
+
+    /**
+     * 探测一个 subtask 的连通性并拉取上游模型列表。
+     *
+     * body: {
+     *   action: "probe-subtask",
+     *   category: BuiltInServiceCategory,
+     *   subtaskId: string,
+     *   baseUrl?: string,    // 未传时用 catalog 已存的
+     *   apiKey?: string,     // 未传或以 "****" 开头时用 catalog 已存的真值
+     * }
+     *
+     * 返回: { ok, status, models: string[], error?: string, baseUrl, source }
+     *
+     * 用途：管理员在 UI 里测试连通性 + 自动填充 model datalist。
+     */
+    if (action === "probe-subtask") {
+      const category = body?.category;
+      if (!isCategory(category)) {
+        return NextResponse.json(
+          { error: `category must be one of ${BUILT_IN_SERVICE_CATEGORIES.join("|")}` },
+          { status: 400, headers: noStoreHeaders() }
+        );
+      }
+      const subtaskId = String(body?.subtaskId || "").trim();
+      if (!subtaskId) {
+        return NextResponse.json(
+          { error: "subtaskId is required" },
+          { status: 400, headers: noStoreHeaders() }
+        );
+      }
+
+      const explicitBaseUrl =
+        typeof body?.baseUrl === "string" ? normalizeUrl(body.baseUrl) : "";
+      const explicitApiKey = typeof body?.apiKey === "string" ? body.apiKey : "";
+      const apiKeyIsMasked = explicitApiKey.startsWith("****");
+
+      let baseUrl = "";
+      let apiKey = "";
+      let source: "input" | "stored" | "mixed" = "input";
+      const stored = await getInternalServiceConfig(category, subtaskId);
+      if (explicitBaseUrl) {
+        baseUrl = explicitBaseUrl;
+      } else if (stored?.subtask?.baseUrl) {
+        baseUrl = stored.subtask.baseUrl;
+        source = "stored";
+      }
+      if (explicitApiKey && !apiKeyIsMasked) {
+        apiKey = explicitApiKey;
+      } else if (stored?.subtask?.apiKey) {
+        apiKey = stored.subtask.apiKey;
+        source = source === "stored" ? "stored" : "mixed";
+      }
+
+      if (!baseUrl) {
+        return NextResponse.json(
+          { ok: false, error: "BaseURL 为空（既未提供也未在 catalog 找到）" },
+          { status: 400, headers: noStoreHeaders() }
+        );
+      }
+      if (!/^https?:\/\//i.test(baseUrl)) {
+        return NextResponse.json(
+          { ok: false, error: "BaseURL 必须以 http:// 或 https:// 开头" },
+          { status: 400, headers: noStoreHeaders() }
+        );
+      }
+      if (!apiKey) {
+        return NextResponse.json(
+          { ok: false, error: "API Key 为空（既未提供也未在 catalog 找到）" },
+          { status: 400, headers: noStoreHeaders() }
+        );
+      }
+
+      const modelsUrl = /\/v\d+(?:\/|$)/i.test(baseUrl)
+        ? `${baseUrl.replace(/\/+$/, "")}/models`
+        : `${baseUrl.replace(/\/+$/, "")}/v1/models`;
+
+      const upstream = makeUpstreamTimeout(15000);
+      try {
+        const res = await fetch(modelsUrl, {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            Accept: "application/json",
+          },
+          signal: upstream.signal,
+        });
+        upstream.cancel();
+
+        const text = await res.text().catch(() => "");
+        let parsed: unknown = null;
+        try {
+          parsed = text ? JSON.parse(text) : null;
+        } catch {
+          parsed = null;
+        }
+
+        if (!res.ok) {
+          const data = parsed as { error?: { message?: string } | string; message?: string } | null;
+          const rawMessage =
+            (typeof data?.error === "string" && data.error) ||
+            (typeof data?.error === "object" && data.error?.message) ||
+            (typeof data?.message === "string" && data.message) ||
+            text.slice(0, 200) ||
+            `HTTP ${res.status}`;
+          return NextResponse.json(
+            {
+              ok: false,
+              status: res.status,
+              error: `上游返回 HTTP ${res.status}：${rawMessage}`,
+              baseUrl,
+              source,
+              modelsUrl,
+            },
+            { headers: noStoreHeaders() }
+          );
+        }
+
+        const data = parsed as { data?: unknown[]; models?: unknown[] } | null;
+        const items: unknown[] = Array.isArray(data?.data)
+          ? data!.data
+          : Array.isArray(data?.models)
+            ? data!.models
+            : [];
+        const models = Array.from(
+          new Set(
+            items
+              .map((item: unknown) => {
+                if (typeof item === "string") return item.trim();
+                if (item && typeof item === "object") {
+                  const rec = item as Record<string, unknown>;
+                  return (
+                    (typeof rec.id === "string" && rec.id.trim()) ||
+                    (typeof rec.name === "string" && rec.name.trim()) ||
+                    (typeof rec.model === "string" && rec.model.trim()) ||
+                    ""
+                  );
+                }
+                return "";
+              })
+              .filter(Boolean) as string[]
+          )
+        ).sort();
+
+        return NextResponse.json(
+          {
+            ok: true,
+            status: res.status,
+            models,
+            baseUrl,
+            source,
+            modelsUrl,
+          },
+          { headers: noStoreHeaders() }
+        );
+      } catch (fetchError: unknown) {
+        upstream.cancel();
+        const isAbort =
+          fetchError instanceof Error && fetchError.name === "AbortError";
+        return NextResponse.json(
+          {
+            ok: false,
+            status: isAbort ? 504 : 0,
+            error: isAbort
+              ? `上游 15 秒内无响应（${baseUrl}）。请检查 BaseURL 是否仍可达。`
+              : `上游不可达：${fetchError instanceof Error ? fetchError.message : String(fetchError)}`,
+            baseUrl,
+            source,
+            modelsUrl,
+          },
+          { status: 504, headers: noStoreHeaders() }
+        );
+      }
     }
 
     /**
