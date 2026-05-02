@@ -300,6 +300,96 @@ export async function POST(req: Request) {
             (typeof data?.message === "string" && data.message) ||
             text.slice(0, 200) ||
             `HTTP ${res.status}`;
+
+          // Fallback：当 /v1/models 被上游单独限权（常见 401/403/404）时，
+          // 改用 POST /v1/chat/completions 做最小请求来验证 API Key 是否有效。
+          // 思路：上游若收到 auth 错误一律返回 401/403；模型不存在/参数错误则
+          // 返回 400/404/422 等——这些都意味着 key 已被识别为合法。
+          const shouldFallback = [401, 403, 404].includes(res.status);
+          if (shouldFallback) {
+            const chatUrl = /\/v\d+(?:\/|$)/i.test(baseUrl)
+              ? `${baseUrl.replace(/\/+$/, "")}/chat/completions`
+              : `${baseUrl.replace(/\/+$/, "")}/v1/chat/completions`;
+            const chatUpstream = makeUpstreamTimeout(15000);
+            try {
+              const chatRes = await fetch(chatUrl, {
+                method: "POST",
+                headers: {
+                  Authorization: `Bearer ${apiKey}`,
+                  "Content-Type": "application/json",
+                  Accept: "application/json",
+                },
+                body: JSON.stringify({
+                  model: "__probe__",
+                  messages: [{ role: "user", content: "ping" }],
+                  max_tokens: 1,
+                  stream: false,
+                }),
+                signal: chatUpstream.signal,
+              });
+              chatUpstream.cancel();
+              const chatText = await chatRes.text().catch(() => "");
+
+              if (![401, 403].includes(chatRes.status)) {
+                // auth 通过，但取不到模型列表，提示用户手填 model
+                return NextResponse.json(
+                  {
+                    ok: true,
+                    status: res.status,
+                    models: [],
+                    baseUrl,
+                    source,
+                    modelsUrl,
+                    authVerifiedVia: "chat",
+                    notice: `上游 /models 端点拒绝该 Key（HTTP ${res.status}：${rawMessage}）；已通过 POST /chat/completions 验证 Key 可用，请手动填写 Model 名称。`,
+                  },
+                  { headers: noStoreHeaders() }
+                );
+              }
+
+              // chat 也是 401/403：把原 models 的错误返还
+              let chatParsed: unknown = null;
+              try {
+                chatParsed = chatText ? JSON.parse(chatText) : null;
+              } catch {
+                chatParsed = null;
+              }
+              const chatData = chatParsed as { error?: { message?: string } | string; message?: string } | null;
+              const chatMsg =
+                (typeof chatData?.error === "string" && chatData.error) ||
+                (typeof chatData?.error === "object" && chatData.error?.message) ||
+                (typeof chatData?.message === "string" && chatData.message) ||
+                chatText.slice(0, 200) ||
+                `HTTP ${chatRes.status}`;
+              return NextResponse.json(
+                {
+                  ok: false,
+                  status: res.status,
+                  error: `上游返回 HTTP ${res.status}：${rawMessage}（chat 兜底也失败：HTTP ${chatRes.status}：${chatMsg}）`,
+                  baseUrl,
+                  source,
+                  modelsUrl,
+                  fallbackTried: "chat",
+                },
+                { headers: noStoreHeaders() }
+              );
+            } catch (chatErr: unknown) {
+              chatUpstream.cancel();
+              return NextResponse.json(
+                {
+                  ok: false,
+                  status: res.status,
+                  error: `上游返回 HTTP ${res.status}：${rawMessage}（chat 兜底请求异常：${chatErr instanceof Error ? chatErr.message : String(chatErr)}）`,
+                  baseUrl,
+                  source,
+                  modelsUrl,
+                  fallbackTried: "chat",
+                },
+                { headers: noStoreHeaders() }
+              );
+            }
+          }
+
           return NextResponse.json(
             {
               ok: false,

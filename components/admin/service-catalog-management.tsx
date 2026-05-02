@@ -24,6 +24,8 @@ import {
   Plug,
   CircleCheck,
   CircleX,
+  Eye,
+  EyeOff,
 } from "lucide-react";
 
 type CategoryKey = "multimodal" | "text" | "image" | "tts" | "video";
@@ -60,6 +62,8 @@ type ProbeResult = {
   models: string[];
   error?: string;
   status?: number;
+  authVerifiedVia?: "models" | "chat";
+  notice?: string;
   at: number;
 };
 
@@ -102,6 +106,8 @@ export function ServiceCatalogManagement() {
   const [error, setError] = useState("");
   const [bulkBaseUrl, setBulkBaseUrl] = useState("");
   const [bulkApiKey, setBulkApiKey] = useState("");
+  const [bulkApiKeyVisible, setBulkApiKeyVisible] = useState(false);
+  const [visibleApiKeys, setVisibleApiKeys] = useState<Record<string, boolean>>({});
   const [bulkEnable, setBulkEnable] = useState(true);
   const [bulkApplying, setBulkApplying] = useState(false);
   const [success, setSuccess] = useState("");
@@ -280,6 +286,8 @@ export function ServiceCatalogManagement() {
         models: Array.isArray(data?.models) ? data.models : [],
         error: data?.error,
         status: data?.status,
+        authVerifiedVia: data?.authVerifiedVia,
+        notice: data?.notice,
         at: Date.now(),
       };
       setProbeResults((prev) => ({ ...prev, [key]: result }));
@@ -511,13 +519,24 @@ export function ServiceCatalogManagement() {
             </div>
             <div className="space-y-1.5">
               <Label className="text-xs text-slate-400">API Key</Label>
-              <Input
-                type="password"
-                value={bulkApiKey}
-                onChange={(e) => setBulkApiKey(e.target.value)}
-                placeholder="sk-..."
-                className="bg-slate-900/70 border-slate-600 text-slate-100 placeholder:text-slate-500"
-              />
+              <div className="relative">
+                <Input
+                  type={bulkApiKeyVisible ? "text" : "password"}
+                  value={bulkApiKey}
+                  onChange={(e) => setBulkApiKey(e.target.value)}
+                  placeholder="sk-..."
+                  className="bg-slate-900/70 border-slate-600 text-slate-100 placeholder:text-slate-500 pr-9"
+                />
+                <button
+                  type="button"
+                  onClick={() => setBulkApiKeyVisible((v) => !v)}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200"
+                  title={bulkApiKeyVisible ? "隐藏" : "显示"}
+                  aria-label={bulkApiKeyVisible ? "隐藏 API Key" : "显示 API Key"}
+                >
+                  {bulkApiKeyVisible ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                </button>
+              </div>
             </div>
           </div>
           <div className="flex items-center justify-between gap-2 pt-1">
@@ -712,22 +731,49 @@ export function ServiceCatalogManagement() {
                         </div>
                         <div className="space-y-1.5">
                           <Label className="text-xs text-slate-400">API Key</Label>
-                          <Input
-                            type="password"
-                            value={subtask.apiKey}
-                            onChange={(e) =>
-                              updateSubtaskField(meta.key, subtask.id, "apiKey", e.target.value)
-                            }
-                            placeholder={subtask.apiKey?.startsWith("****") ? subtask.apiKey : "sk-..."}
-                            className="bg-slate-900/70 border-slate-600 text-slate-100 placeholder:text-slate-500"
-                          />
+                          <div className="relative">
+                            <Input
+                              type={visibleApiKeys[subtaskKey] ? "text" : "password"}
+                              value={subtask.apiKey}
+                              onChange={(e) =>
+                                updateSubtaskField(meta.key, subtask.id, "apiKey", e.target.value)
+                              }
+                              placeholder={subtask.apiKey?.startsWith("****") ? subtask.apiKey : "sk-..."}
+                              className="bg-slate-900/70 border-slate-600 text-slate-100 placeholder:text-slate-500 pr-9"
+                            />
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setVisibleApiKeys((prev) => ({
+                                  ...prev,
+                                  [subtaskKey]: !prev[subtaskKey],
+                                }))
+                              }
+                              className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200"
+                              title={visibleApiKeys[subtaskKey] ? "隐藏" : "显示"}
+                              aria-label={visibleApiKeys[subtaskKey] ? "隐藏 API Key" : "显示 API Key"}
+                            >
+                              {visibleApiKeys[subtaskKey] ? (
+                                <EyeOff className="h-4 w-4" />
+                              ) : (
+                                <Eye className="h-4 w-4" />
+                              )}
+                            </button>
+                          </div>
+                          {subtask.apiKey?.startsWith("****") && visibleApiKeys[subtaskKey] && (
+                            <p className="text-[11px] text-slate-500">
+                              出于安全考虑，已存储的 Key 仅显示掩码尾部；如需完整值请重新填写后保存。
+                            </p>
+                          )}
                         </div>
 
                         {probeResult && (
                           <div
                             className={`rounded-md border p-2.5 text-xs ${
                               probeResult.ok
-                                ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+                                ? probeResult.authVerifiedVia === "chat"
+                                  ? "border-amber-500/40 bg-amber-500/10 text-amber-300"
+                                  : "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
                                 : "border-red-500/40 bg-red-500/10 text-red-300"
                             }`}
                           >
@@ -735,7 +781,10 @@ export function ServiceCatalogManagement() {
                               <div className="flex items-start gap-2">
                                 <CircleCheck className="h-4 w-4 mt-0.5 shrink-0" />
                                 <span>
-                                  连接成功 · 拉到 {probeResult.models.length} 个模型，已写入下拉列表（点击 Model 输入框查看）
+                                  {probeResult.authVerifiedVia === "chat"
+                                    ? probeResult.notice ||
+                                      "上游 /models 端点拒绝该 Key，但 chat/completions 已验证 Key 可用，请手动填写 Model。"
+                                    : `连接成功 · 拉到 ${probeResult.models.length} 个模型，已写入下拉列表（点击 Model 输入框查看）`}
                                 </span>
                               </div>
                             ) : (
