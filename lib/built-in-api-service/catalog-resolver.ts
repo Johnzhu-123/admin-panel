@@ -8,9 +8,14 @@
  *
  * 本文件提供统一封装：先按指定 category 从 catalog 取真实 baseUrl + apiKey，
  * 缺失时再 fallback 到 env config，确保 UI 里的修改对所有路由生效。
+ *
+ * 性能要点：原先依赖 service-manager 的 getAvailableServices 链路（涉及 5+ 次 DB 往返
+ * 与 isServiceAvailable validation），实测在 Render 免费 Postgres 上单次解析 4-8 秒，
+ * 桌面端 20 秒 timeout 内做不完 5 个分类。新实现压缩到 2 次 DB 调用：
+ *   1. checkUserAuthorization(userId)  — authorized_users 单行查询
+ *   2. getInternalServiceConfig(category, subtaskId) — 单次 catalog 加载
  */
 import { BuiltInServiceConfig } from "./types";
-import { getBuiltInServiceConfig } from "./config";
 import { getBuiltInAPIService } from "./index";
 import {
   getInternalServiceConfig,
@@ -23,15 +28,26 @@ export type ResolvedBuiltInConfig = BuiltInServiceConfig & {
   subtaskId?: string;
 };
 
+const ZERO_QUOTA = {
+  dailyRequests: 0,
+  monthlyRequests: 0,
+  concurrentRequests: 0,
+} as const;
+
+const ZERO_RATE = {
+  requestsPerMinute: 0,
+  requestsPerHour: 0,
+  burstLimit: 0,
+} as const;
+
 /**
  * 解析授权用户对应分类的内置服务凭据。
  *
  * 流程：
  * 1. 鉴权（authorized_users + can_use_built_in_services）
- * 2. 取 env BuiltInServiceConfig 作为兜底（model 名称等）
- * 3. 用 catalog 数据覆盖 baseUrl/apiKey/model（catalog 优先）
+ * 2. 直接从 catalog 取 baseUrl/apiKey/model（catalog 优先）
  *
- * @returns 失败时返回 null（未授权 / 无可用服务 / 双方都没配 baseUrl+apiKey）
+ * @returns 失败时返回 null（未授权 / catalog 未配 baseUrl+apiKey）
  */
 export async function resolveBuiltInWithCatalog(
   userId: string,
@@ -46,70 +62,30 @@ export async function resolveBuiltInWithCatalog(
     const isAuthorized = await builtInService.checkUserAuthorization(userId);
     if (!isAuthorized) return null;
 
-    const services = await builtInService.getAvailableServices(userId);
-    const builtInOption = services.find(
-      (service) => service.isBuiltIn && service.isAvailable
-    );
-    if (!builtInOption) return null;
+    const catalogEntry = await getInternalServiceConfig(category, subtaskId);
+    const subtask = catalogEntry?.subtask;
+    if (!subtask) return null;
 
-    const envConfig = getBuiltInServiceConfig(builtInOption.id);
+    const baseUrl = (subtask.baseUrl || "").trim();
+    const apiKey = (subtask.apiKey || "").trim();
+    if (!baseUrl || !apiKey) return null;
 
-    let catalogBaseUrl = "";
-    let catalogApiKey = "";
-    let catalogModel = "";
-    let resolvedSubtaskId: string | undefined = undefined;
-    try {
-      const catalogEntry = await getInternalServiceConfig(category, subtaskId);
-      if (catalogEntry?.subtask) {
-        catalogBaseUrl = (catalogEntry.subtask.baseUrl || "").trim();
-        catalogApiKey = (catalogEntry.subtask.apiKey || "").trim();
-        catalogModel = (catalogEntry.subtask.model || "").trim();
-        resolvedSubtaskId = catalogEntry.subtask.id;
-      }
-    } catch {
-      // catalog 不可用时静默 fallback 到 env config
-    }
-
-    if (catalogBaseUrl && catalogApiKey) {
-      return {
-        ...(envConfig || ({} as BuiltInServiceConfig)),
-        id: envConfig?.id || builtInOption.id,
-        name: envConfig?.name || builtInOption.name,
-        provider: envConfig?.provider || "openai",
-        isEnabled: envConfig?.isEnabled ?? true,
-        quotaLimits:
-          envConfig?.quotaLimits || {
-            dailyRequests: 0,
-            monthlyRequests: 0,
-            concurrentRequests: 0,
-          },
-        rateLimits:
-          envConfig?.rateLimits || {
-            requestsPerMinute: 0,
-            requestsPerHour: 0,
-            burstLimit: 0,
-          },
-        createdAt: envConfig?.createdAt || new Date(),
-        updatedAt: new Date(),
-        baseUrl: catalogBaseUrl,
-        apiKey: catalogApiKey,
-        model: catalogModel || envConfig?.model || "",
-        source: "catalog",
-        category,
-        subtaskId: resolvedSubtaskId,
-      };
-    }
-
-    if (envConfig?.baseUrl && envConfig?.apiKey) {
-      return {
-        ...envConfig,
-        source: "env",
-        category,
-        subtaskId: resolvedSubtaskId,
-      };
-    }
-
-    return null;
+    return {
+      id: `built-in-${category}-${subtask.id}`,
+      name: process.env.BUILT_IN_SERVICE_NAME || "内置服务",
+      provider: "openai",
+      isEnabled: subtask.isEnabled !== false,
+      apiKey,
+      baseUrl,
+      model: (subtask.model || "").trim(),
+      quotaLimits: { ...ZERO_QUOTA },
+      rateLimits: { ...ZERO_RATE },
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      source: "catalog",
+      category,
+      subtaskId: subtask.id,
+    };
   } catch {
     return null;
   }
@@ -139,3 +115,20 @@ export function rewriteUpstreamError(
   }
   return trimmed || `内置服务请求失败（${category} 分类，HTTP ${status}）`;
 }
+
+/**
+ * 创建一个绑定 timeout 的 AbortSignal，避免 admin-panel 在等不响应的上游时被桌面端先超时。
+ * 默认 15 秒比桌面端 /api/ai/models 的 60s 短，先在服务端拿到清晰错误再返回。
+ */
+export function makeUpstreamTimeout(ms = 15000): {
+  signal: AbortSignal;
+  cancel: () => void;
+} {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  return {
+    signal: controller.signal,
+    cancel: () => clearTimeout(timer),
+  };
+}
+

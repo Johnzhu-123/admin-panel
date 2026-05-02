@@ -9,7 +9,11 @@ import {
   noStoreHeaders,
 } from "@/lib/ai";
 import { recordFailureLog } from "@/lib/diagnostics";
-import { resolveBuiltInWithCatalog, rewriteUpstreamError } from "@/lib/built-in-api-service/catalog-resolver";
+import {
+  resolveBuiltInWithCatalog,
+  rewriteUpstreamError,
+  makeUpstreamTimeout,
+} from "@/lib/built-in-api-service/catalog-resolver";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -348,10 +352,34 @@ export async function POST(req: Request) {
       builtInConfig?.baseUrl || body.openAiBaseUrl
     );
     const openAiAuthHeader = normalizeOpenAiAuthHeader(body.openAiAuthHeader);
-    const res = await fetch(`${baseUrl}/models`, {
-      method: "GET",
-      headers: buildOpenAiHeaders(apiKey, false, openAiAuthHeader),
-    });
+    const upstreamTimeout = makeUpstreamTimeout(15000);
+    let res: Response;
+    try {
+      res = await fetch(`${baseUrl}/models`, {
+        method: "GET",
+        headers: buildOpenAiHeaders(apiKey, false, openAiAuthHeader),
+        signal: upstreamTimeout.signal,
+      });
+    } catch (fetchError: any) {
+      upstreamTimeout.cancel();
+      const isAbort = fetchError?.name === "AbortError";
+      recordFailureLog({
+        provider,
+        operation: "models",
+        url: `${baseUrl}/models`,
+        status: isAbort ? 504 : 0,
+        responseBody: isAbort ? "upstream-timeout-15s" : String(fetchError),
+      });
+      return NextResponse.json(
+        {
+          error: isAbort
+            ? `内置服务上游 15 秒内无响应（baseUrl=${baseUrl}）。请在管理面板更换上游或检查网络。`
+            : `内置服务上游不可达：${fetchError?.message || fetchError}`,
+        },
+        { status: 504, headers: noStoreHeaders() }
+      );
+    }
+    upstreamTimeout.cancel();
 
     if (!res.ok) {
         const data = await res.json().catch(() => ({}));
