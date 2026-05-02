@@ -610,7 +610,7 @@ export async function getBuiltInRuntimeSettings(): Promise<BuiltInRuntimeSetting
   const envGateway = normalizeUrl(
     process.env.BUILT_IN_SERVICE_SERVER_URL ||
       process.env.NEXT_PUBLIC_BUILT_IN_SERVICE_SERVER_URL ||
-      'https://ppt2admin.zeabur.app'
+      'https://ppt2admin.onrender.com'
   );
   const envUpdatePageUrl = normalizeUrl(
     process.env.BUILT_IN_RELEASE_PAGE_URL ||

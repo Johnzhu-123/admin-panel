@@ -185,6 +185,47 @@ export async function GET(req: Request) {
         }
 
         const runtimeSettings = await getBuiltInRuntimeSettings();
+        const sanitizedCatalogForConfig = sanitizeServiceCatalog(
+          runtimeSettings.serviceCatalog,
+          { includeKeyMask: false }
+        );
+        const categories: Record<
+          string,
+          {
+            displayName: string;
+            defaultSubtaskId: string;
+            baseUrl: string;
+            model: string;
+            isEnabled: boolean;
+            subtasks: Array<{
+              id: string;
+              displayName: string;
+              baseUrl: string;
+              model: string;
+              isEnabled: boolean;
+            }>;
+          }
+        > = {};
+        for (const [category, cfg] of Object.entries(sanitizedCatalogForConfig)) {
+          const defaultSubtaskId = cfg.defaultSubtaskId;
+          const defaultSubtask =
+            cfg.subtasks[defaultSubtaskId] ||
+            Object.values(cfg.subtasks)[0];
+          categories[category] = {
+            displayName: cfg.displayName,
+            defaultSubtaskId,
+            baseUrl: defaultSubtask?.baseUrl || '',
+            model: defaultSubtask?.model || '',
+            isEnabled: defaultSubtask?.isEnabled ?? false,
+            subtasks: Object.values(cfg.subtasks).map((subtask) => ({
+              id: subtask.id,
+              displayName: subtask.displayName,
+              baseUrl: subtask.baseUrl,
+              model: subtask.model,
+              isEnabled: subtask.isEnabled,
+            })),
+          };
+        }
         return NextResponse.json(
           {
             config: {
@@ -196,6 +237,7 @@ export async function GET(req: Request) {
               serviceGatewayUrl: runtimeSettings.serviceGatewayUrl || undefined,
               updatePageUrl: runtimeSettings.updatePageUrl || undefined,
               downloadChannels: runtimeSettings.downloadChannels || [],
+              categories,
             },
           },
           { headers: noStoreHeaders() }

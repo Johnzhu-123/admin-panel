@@ -83,6 +83,10 @@ export function ServiceCatalogManagement() {
   const [loading, setLoading] = useState(true);
   const [savingKey, setSavingKey] = useState<string | null>(null);
   const [error, setError] = useState("");
+  const [bulkBaseUrl, setBulkBaseUrl] = useState("");
+  const [bulkApiKey, setBulkApiKey] = useState("");
+  const [bulkEnable, setBulkEnable] = useState(true);
+  const [bulkApplying, setBulkApplying] = useState(false);
   const [success, setSuccess] = useState("");
 
   const fetchSettings = async () => {
@@ -182,6 +186,46 @@ export function ServiceCatalogManagement() {
       setError(e instanceof Error ? e.message : "保存失败");
     } finally {
       setSavingKey(null);
+    }
+  };
+
+  const applyBulkCredentials = async () => {
+    const trimmedBase = bulkBaseUrl.trim();
+    const trimmedKey = bulkApiKey;
+    if (!trimmedBase && !trimmedKey) {
+      setError("请至少填写 BaseURL 或 API Key 之一");
+      return;
+    }
+    if (trimmedBase && !/^https?:\/\//i.test(trimmedBase)) {
+      setError("BaseURL 必须以 http:// 或 https:// 开头");
+      return;
+    }
+    setBulkApplying(true);
+    setError("");
+    setSuccess("");
+    try {
+      const payload: Record<string, unknown> = { action: "bulk-apply-credentials" };
+      if (trimmedBase) payload.baseUrl = trimmedBase;
+      if (trimmedKey) payload.apiKey = trimmedKey;
+      payload.isEnabled = bulkEnable;
+      const resp = await fetch("/api/admin/system-settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify(payload),
+      });
+      if (!resp.ok) {
+        const body = await resp.json().catch(() => ({}));
+        throw new Error(body?.error || `HTTP ${resp.status}`);
+      }
+      const data = await resp.json().catch(() => ({}));
+      setSuccess(`已应用到 ${data?.applied ?? "所有"} 个子任务`);
+      setBulkApiKey("");
+      await fetchSettings();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "一键应用失败");
+    } finally {
+      setBulkApplying(false);
     }
   };
 
@@ -344,6 +388,61 @@ export function ServiceCatalogManagement() {
             {success}
           </div>
         )}
+
+        <Card className="border-dashed">
+          <CardHeader className="pb-2">
+            <CardTitle className="flex items-center gap-2 text-sm">
+              <KeyRound className="h-4 w-4" /> 通用凭据 · 一键应用到全部子任务
+            </CardTitle>
+            <CardDescription className="text-xs">
+              如果你选择的 API 同时支持多模态/文本/图像/TTS/视频，BaseURL 与 API Key 通常通用。
+              在这里填写一次，点&ldquo;一键应用&rdquo;即可写入下方 5 类的所有子任务；之后只需在每个分类里挑选默认模型。
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="grid gap-3 md:grid-cols-2">
+              <div className="space-y-1">
+                <Label className="text-xs">通用 BaseURL</Label>
+                <Input
+                  value={bulkBaseUrl}
+                  onChange={(e) => setBulkBaseUrl(e.target.value)}
+                  placeholder={BASE_URL_PLACEHOLDER}
+                />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs">通用 API Key</Label>
+                <Input
+                  type="password"
+                  value={bulkApiKey}
+                  onChange={(e) => setBulkApiKey(e.target.value)}
+                  placeholder="sk-..."
+                />
+              </div>
+            </div>
+            <div className="flex items-center justify-between">
+              <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                <input
+                  type="checkbox"
+                  checked={bulkEnable}
+                  onChange={(e) => setBulkEnable(e.target.checked)}
+                />
+                同时启用所有子任务
+              </label>
+              <Button size="sm" onClick={applyBulkCredentials} disabled={bulkApplying}>
+                {bulkApplying ? (
+                  <RefreshCw className="mr-1 h-3 w-3 animate-spin" />
+                ) : (
+                  <KeyRound className="mr-1 h-3 w-3" />
+                )}
+                一键应用到全部子任务
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              提示：仅填写其一也可（例如只更新 API Key 不动 BaseURL）。空字段不会覆盖原值。
+              下方每个分类卡片仍可单独覆盖个性化的 BaseURL / Key / Model。
+            </p>
+          </CardContent>
+        </Card>
 
         <Tabs defaultValue="multimodal" className="w-full">
           <TabsList className="mb-4 grid w-full grid-cols-5">

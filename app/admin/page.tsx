@@ -455,29 +455,6 @@ export default function AdminDashboard() {
                       <div className="space-y-4">
                         <div className="p-6 bg-slate-700/30 border border-slate-600 rounded-lg space-y-4">
                           <div className="flex items-center gap-3">
-                            <div className="p-2 bg-blue-500/20 rounded-lg">
-                              <Settings className="h-5 w-5 text-blue-400" />
-                            </div>
-                            <h3 className="font-semibold text-white">服务根地址</h3>
-                          </div>
-                          <input
-                            className="w-full bg-slate-900/70 border border-slate-600 rounded-md px-3 py-2 text-slate-100"
-                            value={systemSettings.serviceGatewayUrl}
-                            onChange={(event) =>
-                              setSystemSettings((prev) => ({
-                                ...prev,
-                                serviceGatewayUrl: event.target.value,
-                              }))
-                            }
-                            placeholder="https://ppt2admin.onrender.com"
-                          />
-                          <p className="text-xs text-slate-400">
-                            桌面端会默认使用此地址作为内置 API 网关，用户侧无需手动填写。
-                          </p>
-                        </div>
-
-                        <div className="p-6 bg-slate-700/30 border border-slate-600 rounded-lg space-y-4">
-                          <div className="flex items-center gap-3">
                             <div className="p-2 bg-indigo-500/20 rounded-lg">
                               <Server className="h-5 w-5 text-indigo-400" />
                             </div>

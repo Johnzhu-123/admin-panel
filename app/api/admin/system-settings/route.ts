@@ -11,7 +11,6 @@ import {
   getSubtaskPresets,
   BUILT_IN_SERVICE_CATEGORIES,
   type BuiltInServiceCategory,
-  type BuiltInServiceCatalog,
   type BuiltInServiceSubtaskConfig,
 } from "@/lib/built-in-api-service/db";
 import { isEncryptionConfigured } from "@/lib/built-in-api-service/encryption";
@@ -191,6 +190,77 @@ export async function POST(req: Request) {
       const settings = await getBuiltInRuntimeSettings();
       return NextResponse.json(
         { settings: buildResponseSettings(settings) },
+        { headers: noStoreHeaders() }
+      );
+    }
+
+    /**
+     * 一键应用通用凭据：把同一份 baseUrl + apiKey 写入指定 categories 下的所有 subtask。
+     * body: {
+     *   action: "bulk-apply-credentials",
+     *   baseUrl?: string,
+     *   apiKey?: string,
+     *   isEnabled?: boolean,
+     *   categories?: BuiltInServiceCategory[],   // 默认所有 5 类
+     *   subtaskIds?: Record<category, string[]>, // 可选，只写入指定 subtask；缺省=全部
+     * }
+     * 任一字段未提供则不覆盖；空字符串视为"清空"。
+     */
+    if (action === "bulk-apply-credentials") {
+      const rawBaseUrl =
+        typeof body?.baseUrl === "string" ? normalizeUrl(body.baseUrl) : undefined;
+      if (typeof body?.baseUrl === "string" && rawBaseUrl && !/^https?:\/\//i.test(rawBaseUrl)) {
+        return NextResponse.json(
+          { error: "baseUrl must start with http:// or https://" },
+          { status: 400, headers: noStoreHeaders() }
+        );
+      }
+      const rawApiKey = typeof body?.apiKey === "string" ? body.apiKey : undefined;
+      const rawIsEnabled =
+        typeof body?.isEnabled === "boolean" ? body.isEnabled : undefined;
+
+      const categoriesInput = Array.isArray(body?.categories)
+        ? (body.categories as unknown[]).filter(isCategory)
+        : [];
+      const targetCategories: BuiltInServiceCategory[] = categoriesInput.length
+        ? (categoriesInput as BuiltInServiceCategory[])
+        : ([...BUILT_IN_SERVICE_CATEGORIES] as BuiltInServiceCategory[]);
+
+      const subtaskIdsMap =
+        body?.subtaskIds && typeof body.subtaskIds === "object"
+          ? (body.subtaskIds as Record<string, unknown>)
+          : null;
+
+      const currentSettings = await getBuiltInRuntimeSettings();
+      const catalog = currentSettings.serviceCatalog;
+      let applied = 0;
+
+      for (const category of targetCategories) {
+        const cfg = catalog[category];
+        if (!cfg) continue;
+        const allSubtaskIds = Object.keys(cfg.subtasks);
+        const filterIds = subtaskIdsMap
+          ? Array.isArray(subtaskIdsMap[category])
+            ? (subtaskIdsMap[category] as unknown[]).map(String)
+            : null
+          : null;
+        const targetIds = filterIds
+          ? allSubtaskIds.filter((id) => filterIds.includes(id))
+          : allSubtaskIds;
+        for (const subtaskId of targetIds) {
+          const patch: Partial<Omit<BuiltInServiceSubtaskConfig, "id">> = {};
+          if (rawBaseUrl !== undefined) patch.baseUrl = rawBaseUrl;
+          if (rawApiKey !== undefined) patch.apiKey = rawApiKey;
+          if (rawIsEnabled !== undefined) patch.isEnabled = rawIsEnabled;
+          if (Object.keys(patch).length === 0) continue;
+          await setServiceSubtaskConfig(category, subtaskId, patch);
+          applied += 1;
+        }
+      }
+
+      const settings = await getBuiltInRuntimeSettings();
+      return NextResponse.json(
+        { settings: buildResponseSettings(settings), applied },
         { headers: noStoreHeaders() }
       );
     }
