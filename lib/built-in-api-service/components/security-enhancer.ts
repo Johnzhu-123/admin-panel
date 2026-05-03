@@ -121,19 +121,33 @@ export class SecurityEnhancer {
     sanitizedPrompt?: string;
   }> {
     try {
-      // 1. Check if user is blocked
-      if (this.blockedUsers.has(request.userId)) {
-        const threat = this.createThreat('unauthorized_access', 'high', request.userId, {
-          reason: 'User is blocked',
-          userId: request.userId
-        }, true, 'Request blocked - user is blacklisted');
+      // 🔧 FIX (2026-05 #7 真正的破图根因 — 终于挖到底):
+      //
+      // 之前 7 次"破图缩略图 / 当前页生成失败"的修复全部白做，因为请求从未到达
+      // 过我修过的代码。这里的 SecurityEnhancer 是一颗定时炸弹：
+      //
+      //   1) detectSuspiciousPatterns 用一组面向匿名公网攻击者的正则去扫每一条
+      //      用户 prompt（SQL 关键字 CREATE/UPDATE、HTML on*=、管道符 | 等）；
+      //   2) 一条 PPT 设计 prompt 天然包含 "Create a slide..."、Markdown 表格的
+      //      |、JSON 模板里的 ${var}、分隔线 ===== —— 命中 3 个就触发 high 级威胁；
+      //   3) 触发后调 temporarilyBlockUser → 把 userId 塞进进程内的 blockedUsers
+      //      Set，副作用是后续每次请求都立刻在 step 1（下面这段 if）被拒绝；
+      //   4) blockedUsers 是 in-memory Set，理论上 setTimeout 1 小时后清掉，但
+      //      Render 节点频繁冷启动重置 setTimeout，且每次重新触发又把人加回来；
+      //   5) /api/ai/image:1280 的 catch 把这个 PERMISSION_DENIED 错误静默吞了
+      //      (已在第 6 次修复修掉)，导致用户只能看到笼统的"当前页生成失败"。
+      //
+      // 修复策略（最小切口、保留合理防护）：
+      //   - 关掉 blockedUsers 拦截（Set 永不命中）+ 关掉 temporarilyBlockUser；
+      //   - 关掉 detectSuspiciousPatterns（面向公网的反 SQL/XSS 正则，对授权
+      //     用户的 PPT prompt 是纯误伤）；
+      //   - 保留 rate limiting / 输入长度校验 / sanitization（这些是合理的）。
+      //
+      // 系统只服务 4 位 admin 显式授权的可信用户（AuthVerifier 已挡过非授权
+      // 用户），不需要再做基于内容的反爬攻击防护。
 
-        return {
-          isValid: false,
-          reason: 'User is blocked due to security violations',
-          threat
-        };
-      }
+      // 1. Check if user is blocked — DISABLED: 见上方注释
+      // if (this.blockedUsers.has(request.userId)) { ... }
 
       // 2. Check IP blocking
       if (request.metadata?.ipAddress && this.blockedIPs.has(request.metadata.ipAddress)) {
@@ -178,15 +192,14 @@ export class SecurityEnhancer {
           };
         }
 
-        // 5. Suspicious pattern detection
-        const patternResult = this.detectSuspiciousPatterns(sanitizationResult.sanitizedPrompt, request.userId);
-        if (!patternResult.isValid) {
-          return {
-            isValid: false,
-            reason: patternResult.reason,
-            threat: patternResult.threat
-          };
-        }
+        // 5. Suspicious pattern detection — DISABLED (2026-05 #7)
+        //   面向公网攻击者的反 SQL/XSS 正则会对 PPT 设计 prompt 大面积误伤
+        //   （Create a slide / Markdown 表格 | / 模板 ${var} / 分隔线 =====）。
+        //   触发后 temporarilyBlockUser 把用户塞进 in-memory blockedUsers Set，
+        //   后续请求全部撞 step 1 拒绝，必须重启服务才能恢复 —— 这是前 7 次"破图
+        //   缩略图 / 当前页生成失败"修复全部失效的真正根因。
+        // const patternResult = this.detectSuspiciousPatterns(sanitizationResult.sanitizedPrompt, request.userId);
+        // if (!patternResult.isValid) { return { isValid: false, reason: patternResult.reason, threat: patternResult.threat }; }
 
         // 6. Anomaly detection
         if (this.config.enableAnomalyDetection) {
