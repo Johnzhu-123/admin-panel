@@ -641,13 +641,36 @@ async function getAllUsersWithStats(service: any) {
     const dbUsage = allUsageStats.find(stat => stat.userId === user.userId);
 
     // Get memory-based stats as fallback
-    const stats = service.getUsageStatistics(user.userId);
+    const memoryStats = service.getUsageStatistics(user.userId);
 
     // Calculate remaining quota
     const dailyLimit = user.permissions?.quotaLimits?.dailyRequests || 500;
     const monthlyLimit = user.permissions?.quotaLimits?.monthlyRequests || 15000;
     const dailyUsed = dbUsage?.dailyUsage || 0;
     const monthlyUsed = dbUsage?.monthlyUsage || 0;
+
+    // 🔧 FIX (single-user stats render as 0 in admin panel):
+    // 旧实现把 service.getUsageStatistics(userId)（内存）当作 stats 主源，
+    // serverless 容器复用 / 实例重启后内存归零，导致用户管理页面所有用户显示 0。
+    // 数据库的 api_usage_records 表持久化了每次请求 (user_id, success, response_time)，
+    // getAllUsersUsageStats 现在已返回 totalRequests/successful/failed/averageResponseTime/lastUsed
+    // 直接读 DB 聚合即可。memory 仅作为 dailyStats / recentRequests 等辅助字段的兜底。
+    const dbHasUsage = !!dbUsage && (dbUsage.totalRequests > 0 || dbUsage.lastUsed);
+    const stats = dbHasUsage
+      ? {
+          totalRequests: dbUsage!.totalRequests,
+          successfulRequests: dbUsage!.successfulRequests,
+          failedRequests: dbUsage!.failedRequests,
+          averageResponseTime: dbUsage!.averageResponseTime,
+          lastUsed: dbUsage!.lastUsed,
+        }
+      : memoryStats || {
+          totalRequests: dailyUsed + monthlyUsed,
+          successfulRequests: 0,
+          failedRequests: 0,
+          averageResponseTime: 0,
+          lastUsed: null,
+        };
 
     return {
       ...user,
@@ -657,13 +680,7 @@ async function getAllUsersWithStats(service: any) {
         dailyRemaining: Math.max(0, dailyLimit - dailyUsed),
         monthlyRemaining: Math.max(0, monthlyLimit - monthlyUsed)
       },
-      stats: stats || {
-        totalRequests: dailyUsed + monthlyUsed,
-        successfulRequests: 0,
-        failedRequests: 0,
-        averageResponseTime: 0,
-        lastUsed: null
-      }
+      stats,
     };
   });
 }

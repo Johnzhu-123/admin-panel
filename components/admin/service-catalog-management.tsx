@@ -121,6 +121,9 @@ export function ServiceCatalogManagement() {
   const [visibleApiKeys, setVisibleApiKeys] = useState<Record<string, boolean>>({});
   const [bulkEnable, setBulkEnable] = useState(true);
   const [bulkApplying, setBulkApplying] = useState(false);
+  // 🔧 NEW: 一键应用后用 bulk 凭据探测一次模型列表，
+  // 把结果广播给所有子任务的 datalist，省去逐个"测试连接 + 拉模型"。
+  const [bulkProbeModels, setBulkProbeModels] = useState<string[]>([]);
   const [success, setSuccess] = useState("");
 
   const fetchSettings = async () => {
@@ -220,7 +223,21 @@ export function ServiceCatalogManagement() {
         throw new Error(body?.error || `HTTP ${resp.status}`);
       }
       setSuccess(`已保存：${category} / ${subtask.displayName}`);
-      await fetchSettings();
+      // 🔧 FIX (草稿丢失): 旧实现保存单个子任务后调用 fetchSettings()
+      // 重新拉取整个 catalog → state 替换 → 用户在同分类其他子任务上未保存的
+      // baseUrl / apiKey / model 草稿全部被覆盖。改为仅本地标记 updatedAt，
+      // 保留所有其他子任务的输入状态。Server 端这次保存的字段已落库，
+      // 下次刷新页面（或 bulk-apply / saveCategoryAll / 删除等真正需要全量
+      // 同步的操作）会自然拿到最新数据。
+      setCatalog((prev) => {
+        if (!prev) return prev;
+        const next = structuredClone(prev) as Catalog;
+        const target = next[category]?.subtasks?.[subtaskId];
+        if (target) {
+          target.updatedAt = new Date().toISOString();
+        }
+        return next;
+      });
     } catch (e) {
       setError(e instanceof Error ? e.message : "保存失败");
     } finally {
@@ -349,9 +366,42 @@ export function ServiceCatalogManagement() {
         throw new Error(body?.error || `HTTP ${resp.status}`);
       }
       const data = await resp.json().catch(() => ({}));
-      setSuccess(`已应用到 ${data?.applied ?? "所有"} 个子任务`);
+      const appliedCount = data?.applied ?? "所有";
       setBulkApiKey("");
       await fetchSettings();
+
+      // 🔧 NEW: 一键应用后用 bulk 凭据探测一次模型列表，
+      // 把结果共享给所有子任务的 datalist，免得逐个点"测试连接 + 拉模型"。
+      // 后端 probe-subtask 只看 baseUrl/apiKey；category/subtaskId 仅做校验占位。
+      // 由于 apiKey 已写入 catalog，这里 apiKey 可省略让后端 fallback 用 stored 真值。
+      let probeNotice = "";
+      try {
+        const probeResp = await fetch("/api/admin/system-settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({
+            action: "probe-subtask",
+            category: "multimodal",
+            subtaskId: "default",
+            baseUrl: trimmedBase || undefined,
+            // 不传 apiKey，由后端 fallback 用 stored 真值（避免本地已被清空导致 mask 化）
+          }),
+        });
+        const probeData = await probeResp.json().catch(() => ({}));
+        if (probeData?.ok && Array.isArray(probeData?.models) && probeData.models.length) {
+          setBulkProbeModels(probeData.models);
+          probeNotice = `；已自动获取 ${probeData.models.length} 个模型，可在各子任务 model 下拉中选取`;
+        } else if (probeData?.error) {
+          probeNotice = `；模型列表自动获取失败：${probeData.error}`;
+        }
+      } catch (probeErr) {
+        probeNotice = `；模型列表自动获取失败：${
+          probeErr instanceof Error ? probeErr.message : "网络错误"
+        }`;
+      }
+
+      setSuccess(`已应用到 ${appliedCount} 个子任务${probeNotice}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : "一键应用失败");
     } finally {
@@ -638,7 +688,13 @@ export function ServiceCatalogManagement() {
                   const probing = probingKey === subtaskKey;
                   const probeResult = probeResults[subtaskKey];
                   const datalistId = DATALIST_ID(meta.key, subtask.id);
-                  const datalistOptions = probeResult?.ok ? probeResult.models : [];
+                  // 🔧 NEW: 子任务自己的 probe 结果优先；若没有则 fallback 到
+                  // 一键应用后探测的 bulkProbeModels（共享列表），避免逐个拉模型。
+                  const subtaskProbeModels = probeResult?.ok ? probeResult.models : [];
+                  const datalistOptions =
+                    subtaskProbeModels.length > 0
+                      ? subtaskProbeModels
+                      : bulkProbeModels;
                   return (
                     <Card
                       key={subtask.id}

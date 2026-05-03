@@ -1212,10 +1212,22 @@ export async function getUserUsageStats(userId: string): Promise<{
  * Get all users usage statistics (for admin dashboard)
  * 🔧 FIX: 支持双向ID匹配 - 同时匹配 user_id 和 email 字段
  */
+/**
+ * Get all users usage statistics (for admin dashboard)
+ * 🔧 FIX: 支持双向ID匹配 - 同时匹配 user_id 和 email 字段
+ * 🔧 NEW: 返回完整聚合（总请求数/成功数/失败数/平均响应时间/最近使用时间），
+ *       让 admin-panel 用户管理面板可以直接渲染单用户统计，而不必依赖
+ *       内存里的 service.getUsageStatistics()（serverless / 重启后归零）。
+ */
 export async function getAllUsersUsageStats(): Promise<Array<{
   userId: string;
   dailyUsage: number;
   monthlyUsage: number;
+  totalRequests: number;
+  successfulRequests: number;
+  failedRequests: number;
+  averageResponseTime: number;
+  lastUsed: string | null;
 }>> {
   try {
     await ensureAuthorizedUsersTable();
@@ -1226,7 +1238,12 @@ export async function getAllUsersUsageStats(): Promise<Array<{
         u.user_id,
         u.email,
         COUNT(CASE WHEN r.created_at >= CURRENT_DATE THEN 1 END) as daily_usage,
-        COUNT(CASE WHEN r.created_at >= DATE_TRUNC('month', CURRENT_DATE) THEN 1 END) as monthly_usage
+        COUNT(CASE WHEN r.created_at >= DATE_TRUNC('month', CURRENT_DATE) THEN 1 END) as monthly_usage,
+        COUNT(r.request_id) as total_requests,
+        COUNT(CASE WHEN r.success = true THEN 1 END) as successful_requests,
+        COUNT(CASE WHEN r.success = false THEN 1 END) as failed_requests,
+        COALESCE(AVG(NULLIF(r.response_time, 0))::int, 0) as average_response_time,
+        MAX(r.created_at) as last_used
       FROM authorized_users u
       LEFT JOIN api_usage_records r ON (
         LOWER(u.user_id) = LOWER(r.user_id) OR
@@ -1240,6 +1257,15 @@ export async function getAllUsersUsageStats(): Promise<Array<{
       userId: row.user_id,
       dailyUsage: parseInt(row.daily_usage || '0'),
       monthlyUsage: parseInt(row.monthly_usage || '0'),
+      totalRequests: parseInt(row.total_requests || '0'),
+      successfulRequests: parseInt(row.successful_requests || '0'),
+      failedRequests: parseInt(row.failed_requests || '0'),
+      averageResponseTime: parseInt(row.average_response_time || '0'),
+      lastUsed: row.last_used
+        ? (row.last_used instanceof Date
+            ? row.last_used.toISOString()
+            : String(row.last_used))
+        : null,
     }));
   } catch (error) {
     console.error('Failed to get all users usage stats:', error);
