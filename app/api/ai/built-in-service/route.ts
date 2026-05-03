@@ -7,7 +7,6 @@
 import { NextResponse } from "next/server";
 import { noStoreHeaders } from "@/lib/ai";
 import { getBuiltInAPIService } from "@/lib/built-in-api-service";
-import { getBuiltInServiceConfig } from "@/lib/built-in-api-service/config";
 import { getBuiltInRuntimeSettings, sanitizeServiceCatalog, getSubtaskPresets } from "@/lib/built-in-api-service/db";
 
 export const runtime = "nodejs";
@@ -179,11 +178,6 @@ export async function GET(req: Request) {
           return NextResponse.json({ config: null }, { headers: noStoreHeaders() });
         }
 
-        const config = getBuiltInServiceConfig(builtInOption.id);
-        if (!config) {
-          return NextResponse.json({ config: null }, { headers: noStoreHeaders() });
-        }
-
         const runtimeSettings = await getBuiltInRuntimeSettings();
         const sanitizedCatalogForConfig = sanitizeServiceCatalog(
           runtimeSettings.serviceCatalog,
@@ -229,8 +223,8 @@ export async function GET(req: Request) {
         return NextResponse.json(
           {
             config: {
-              id: config.id,
-              name: config.name,
+              id: builtInOption.id,
+              name: builtInOption.name,
               // ⚠️ 不再返回顶层 provider/baseUrl/model（已废弃）：
               // 真值由 categories[*].subtasks[defaultSubtaskId].{baseUrl,model} 提供，
               // 早期 SERVICE_CONFIGS 里硬编码的 gemini/zeabur 网关只会引发误解。

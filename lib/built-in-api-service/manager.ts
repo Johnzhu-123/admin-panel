@@ -137,6 +137,14 @@ export class BuiltInAPIService {
   }
 
   /**
+   * Get catalog-aware built-in service configuration
+   */
+  async getBuiltInServiceConfig(serviceId: string) {
+    await this.ensureInitialized();
+    return this.configManager.getBuiltInServiceConfig(serviceId);
+  }
+
+  /**
    * Switch user to built-in service
    */
   async switchToBuiltInService(userId: string, serviceId: string): Promise<SwitchResult> {

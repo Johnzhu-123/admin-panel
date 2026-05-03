@@ -13,8 +13,6 @@ import {
 import { BuiltInServiceConfigManager, ConfigurationStorage } from '../interfaces';
 import {
   getBuiltInServiceConfig,
-  isServiceConfigured,
-  getAvailableBuiltInServices,
   BUILT_IN_SERVICES,
   VALIDATION_RULES,
   CACHE_TTL,
@@ -42,17 +40,7 @@ export class BuiltInServiceConfigManagerImpl implements BuiltInServiceConfigMana
         return { ...cached.config };
       }
 
-      // 1. 旧路径：环境变量
-      const envConfig = getBuiltInServiceConfig(serviceId);
-      if (envConfig) {
-        this.configCache.set(serviceId, {
-          config: { ...envConfig },
-          timestamp: Date.now()
-        });
-        return { ...envConfig };
-      }
-
-      // 2. 新路径：catalog（管理面板 UI 配置）合成 config
+      // 1. 新路径：catalog（管理面板 UI 配置）优先
       try {
         const { getServiceCatalog } = await import('../db');
         const catalog = await getServiceCatalog();
@@ -107,6 +95,16 @@ export class BuiltInServiceConfigManagerImpl implements BuiltInServiceConfigMana
           `[getBuiltInServiceConfig] catalog 查询失败:`,
           catalogErr instanceof Error ? catalogErr.message : catalogErr
         );
+      }
+
+      // 2. 旧路径：环境变量 fallback
+      const envConfig = getBuiltInServiceConfig(serviceId);
+      if (envConfig) {
+        this.configCache.set(serviceId, {
+          config: { ...envConfig },
+          timestamp: Date.now()
+        });
+        return { ...envConfig };
       }
 
       return null;
@@ -182,28 +180,36 @@ export class BuiltInServiceConfigManagerImpl implements BuiltInServiceConfigMana
     try {
       // Try to load from storage first
       const storedConfigs = await this.configStorage.loadServiceConfigs();
-      
-      // Merge with default configurations
-      const availableServices = getAvailableBuiltInServices();
-      const mergedConfigs: BuiltInServiceConfig[] = [];
+      const mergedById = new Map<string, BuiltInServiceConfig>();
 
-      // Add stored configurations
+      // Keep any non-default stored service configs, but allow default built-in IDs
+      // to be overwritten by the current async resolver below.
       for (const stored of storedConfigs) {
-        mergedConfigs.push(stored);
+        mergedById.set(stored.id, stored);
       }
 
-      // Add default configurations that aren't already stored
-      for (const available of availableServices) {
-        if (!mergedConfigs.find(c => c.id === available.id)) {
-          mergedConfigs.push(available);
+      // Resolve default service IDs through the async resolver. This keeps service
+      // enumeration catalog-aware when Render env API keys are intentionally absent,
+      // and prevents stale file configs from hiding catalog updates.
+      for (const serviceId of Object.keys(BUILT_IN_SERVICES)) {
+        const resolved = await this.getBuiltInServiceConfig(serviceId);
+        if (resolved) {
+          mergedById.set(serviceId, resolved);
         }
       }
 
-      return mergedConfigs;
+      return Array.from(mergedById.values());
     } catch (error) {
       console.error('Error getting all built-in services:', error);
-      // Fallback to default configurations
-      return getAvailableBuiltInServices();
+      // Fallback to async default service resolution so catalog-only setups still work.
+      const fallbackConfigs: BuiltInServiceConfig[] = [];
+      for (const serviceId of Object.keys(BUILT_IN_SERVICES)) {
+        const resolved = await this.getBuiltInServiceConfig(serviceId);
+        if (resolved) {
+          fallbackConfigs.push(resolved);
+        }
+      }
+      return fallbackConfigs;
     }
   }
 
@@ -347,76 +353,16 @@ export class BuiltInServiceConfigManagerImpl implements BuiltInServiceConfigMana
         return cached.available;
       }
 
-      // 1. 旧路径：环境变量
-      const isEnvConfigured = isServiceConfigured(serviceId);
-      if (isEnvConfigured) {
-        const config = await this.getBuiltInServiceConfig(serviceId);
-        if (config && config.isEnabled) {
-          const validation = await this.validateServiceConfig(config);
-          const available = validation.isValid;
-          this.availabilityCache.set(serviceId, { available, timestamp: Date.now() });
-          return available;
-        }
+      const config = await this.getBuiltInServiceConfig(serviceId);
+      if (!config || !config.isEnabled) {
+        this.availabilityCache.set(serviceId, { available: false, timestamp: Date.now() });
+        return false;
       }
 
-      // 2. 新路径：catalog 数据库（管理面板 UI 配置）
-      try {
-        const { getServiceCatalog } = await import('../db');
-        const catalog = await getServiceCatalog();
-        // 🔍 强制诊断：把 catalog 各 category 的状态打到日志里，便于排查
-        const diagSummary: Record<string, any> = {};
-        for (const [catName, category] of Object.entries(catalog)) {
-          if (!category || !category.subtasks) {
-            diagSummary[catName] = 'EMPTY_CATEGORY';
-            continue;
-          }
-          const subtaskDiag: Record<string, any> = {};
-          for (const [subId, subtask] of Object.entries(category.subtasks)) {
-            subtaskDiag[subId] = {
-              hasBaseUrl: !!(subtask.baseUrl || '').trim(),
-              hasApiKey: !!(subtask.apiKey || '').trim(),
-              apiKeyLen: (subtask.apiKey || '').length,
-              enabled: subtask.isEnabled !== false,
-              model: subtask.model || '',
-            };
-          }
-          diagSummary[catName] = {
-            defaultSubtaskId: category.defaultSubtaskId,
-            subtasks: subtaskDiag,
-          };
-        }
-        console.log(
-          `[isServiceAvailable] catalog 诊断 serviceId=${serviceId}:`,
-          JSON.stringify(diagSummary, null, 0)
-        );
-
-        for (const category of Object.values(catalog)) {
-          if (!category || !category.subtasks) continue;
-          for (const subtask of Object.values(category.subtasks)) {
-            const baseUrl = (subtask.baseUrl || '').trim();
-            const apiKey = (subtask.apiKey || '').trim();
-            const enabled = subtask.isEnabled !== false;
-            if (enabled && baseUrl && apiKey) {
-              console.log(
-                `[isServiceAvailable] catalog 命中可用子任务: subtaskId=${subtask.id} baseUrl=${baseUrl.substring(0, 60)}... apiKeyLen=${apiKey.length}`
-              );
-              this.availabilityCache.set(serviceId, { available: true, timestamp: Date.now() });
-              return true;
-            }
-          }
-        }
-        console.warn(
-          `[isServiceAvailable] catalog 内没有任何子任务同时配齐 baseUrl+apiKey 且 enabled，service ${serviceId} 视为不可用`
-        );
-      } catch (catalogErr) {
-        console.warn(
-          `[isServiceAvailable] catalog 查询失败，仅 env 路径有效:`,
-          catalogErr instanceof Error ? catalogErr.message : catalogErr
-        );
-      }
-
-      this.availabilityCache.set(serviceId, { available: false, timestamp: Date.now() });
-      return false;
+      const validation = await this.validateServiceConfig(config);
+      const available = validation.isValid;
+      this.availabilityCache.set(serviceId, { available, timestamp: Date.now() });
+      return available;
     } catch (error) {
       console.error(`Error checking service availability for ${serviceId}:`, error);
       return false;

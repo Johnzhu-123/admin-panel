@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { noStoreHeaders } from "@/lib/ai";
 import { requireAdminSession } from "@/app/api/admin/_auth";
+import { getBuiltInAPIService } from "@/lib/built-in-api-service";
 import {
   getBuiltInRuntimeSettings,
   saveBuiltInRuntimeSettings,
@@ -100,6 +101,20 @@ function buildResponseSettings(settings: Awaited<ReturnType<typeof getBuiltInRun
   };
 }
 
+async function clearBuiltInServiceCaches(reason: string) {
+  try {
+    const builtInService = getBuiltInAPIService();
+    await builtInService.initialize();
+    builtInService.clearCaches();
+    console.log(`[system-settings] Cleared built-in service caches after ${reason}`);
+  } catch (error) {
+    console.warn(
+      `[system-settings] Failed to clear built-in service caches after ${reason}:`,
+      error instanceof Error ? error.message : error
+    );
+  }
+}
+
 export async function GET() {
   const unauthorized = await requireAdminSession();
   if (unauthorized) return unauthorized;
@@ -154,6 +169,7 @@ export async function POST(req: Request) {
         );
       }
       await setServiceSubtaskConfig(category, subtaskId, patch);
+      await clearBuiltInServiceCaches("update-service-subtask");
       const settings = await getBuiltInRuntimeSettings();
       return NextResponse.json(
         { settings: buildResponseSettings(settings) },
@@ -181,6 +197,7 @@ export async function POST(req: Request) {
         );
       }
       await deleteServiceSubtask(category, subtaskId);
+      await clearBuiltInServiceCaches("delete-service-subtask");
       const settings = await getBuiltInRuntimeSettings();
       return NextResponse.json(
         { settings: buildResponseSettings(settings) },
@@ -208,6 +225,7 @@ export async function POST(req: Request) {
         );
       }
       await setCategoryDefaultSubtask(category, subtaskId);
+      await clearBuiltInServiceCaches("set-default-subtask");
       const settings = await getBuiltInRuntimeSettings();
       return NextResponse.json(
         { settings: buildResponseSettings(settings) },
@@ -549,6 +567,7 @@ export async function POST(req: Request) {
         }
       }
 
+      await clearBuiltInServiceCaches("bulk-apply-credentials");
       const settings = await getBuiltInRuntimeSettings();
       return NextResponse.json(
         { settings: buildResponseSettings(settings), applied },
@@ -583,6 +602,7 @@ export async function POST(req: Request) {
       downloadChannels,
     });
 
+    await clearBuiltInServiceCaches("save-runtime-settings");
     return NextResponse.json(
       { settings: buildResponseSettings(settings) },
       { headers: noStoreHeaders() }
