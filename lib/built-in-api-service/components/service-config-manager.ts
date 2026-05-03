@@ -363,6 +363,33 @@ export class BuiltInServiceConfigManagerImpl implements BuiltInServiceConfigMana
       try {
         const { getServiceCatalog } = await import('../db');
         const catalog = await getServiceCatalog();
+        // 🔍 强制诊断：把 catalog 各 category 的状态打到日志里，便于排查
+        const diagSummary: Record<string, any> = {};
+        for (const [catName, category] of Object.entries(catalog)) {
+          if (!category || !category.subtasks) {
+            diagSummary[catName] = 'EMPTY_CATEGORY';
+            continue;
+          }
+          const subtaskDiag: Record<string, any> = {};
+          for (const [subId, subtask] of Object.entries(category.subtasks)) {
+            subtaskDiag[subId] = {
+              hasBaseUrl: !!(subtask.baseUrl || '').trim(),
+              hasApiKey: !!(subtask.apiKey || '').trim(),
+              apiKeyLen: (subtask.apiKey || '').length,
+              enabled: subtask.isEnabled !== false,
+              model: subtask.model || '',
+            };
+          }
+          diagSummary[catName] = {
+            defaultSubtaskId: category.defaultSubtaskId,
+            subtasks: subtaskDiag,
+          };
+        }
+        console.log(
+          `[isServiceAvailable] catalog 诊断 serviceId=${serviceId}:`,
+          JSON.stringify(diagSummary, null, 0)
+        );
+
         for (const category of Object.values(catalog)) {
           if (!category || !category.subtasks) continue;
           for (const subtask of Object.values(category.subtasks)) {
@@ -370,11 +397,17 @@ export class BuiltInServiceConfigManagerImpl implements BuiltInServiceConfigMana
             const apiKey = (subtask.apiKey || '').trim();
             const enabled = subtask.isEnabled !== false;
             if (enabled && baseUrl && apiKey) {
+              console.log(
+                `[isServiceAvailable] catalog 命中可用子任务: subtaskId=${subtask.id} baseUrl=${baseUrl.substring(0, 60)}... apiKeyLen=${apiKey.length}`
+              );
               this.availabilityCache.set(serviceId, { available: true, timestamp: Date.now() });
               return true;
             }
           }
         }
+        console.warn(
+          `[isServiceAvailable] catalog 内没有任何子任务同时配齐 baseUrl+apiKey 且 enabled，service ${serviceId} 视为不可用`
+        );
       } catch (catalogErr) {
         console.warn(
           `[isServiceAvailable] catalog 查询失败，仅 env 路径有效:`,
