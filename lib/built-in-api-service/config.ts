@@ -184,6 +184,15 @@ export const SECURITY_SETTINGS = {
 
 /**
  * Get built-in service configuration with API key from environment
+ *
+ * 🔧 FIX (2026-05 #10): apiKey 读取改为 fallback 链。
+ *   背景：用户上游 api.seeyjys.eu.org/v1 是 OpenAI 兼容模式（不是 Gemini 原生 API），
+ *   服务 ID `gemini-built-in` 只是历史命名遗留。此前代码硬绑定
+ *   provider==='gemini' → 必读 GEMINI_BUILT_IN_API_KEY，用户删掉该变量改用 OpenAI
+ *   兼容模式后整个服务变 unavailable。
+ *
+ *   修复策略：每个 provider 都按"专属变量 → 通用变量 BUILT_IN_API_KEY → 跨家族
+ *   fallback"的优先级读，任一存在即视为已配置，避免下游名字不重要的死配。
  */
 export function getBuiltInServiceConfig(serviceId: string): BuiltInServiceConfig | null {
   const baseConfig = BUILT_IN_SERVICES[serviceId];
@@ -191,22 +200,40 @@ export function getBuiltInServiceConfig(serviceId: string): BuiltInServiceConfig
     return null;
   }
 
-  // Get API key from environment
+  // 通用兜底变量：不绑定具体厂商名，便于运维只配一个 key
+  const genericKey = process.env.BUILT_IN_API_KEY || '';
+
+  // Get API key from environment with fallback chain
   let apiKey = '';
   switch (baseConfig.provider) {
     case 'gemini':
-      apiKey = process.env[ENV_KEYS.GEMINI_BUILT_IN_API_KEY] || '';
+      apiKey =
+        process.env[ENV_KEYS.GEMINI_BUILT_IN_API_KEY] ||
+        process.env[ENV_KEYS.OPENAI_BUILT_IN_API_KEY] || // OpenAI 兼容上游 fallback
+        genericKey ||
+        '';
       break;
     case 'openai':
-      apiKey = process.env[ENV_KEYS.OPENAI_BUILT_IN_API_KEY] || '';
+      apiKey =
+        process.env[ENV_KEYS.OPENAI_BUILT_IN_API_KEY] ||
+        process.env[ENV_KEYS.GEMINI_BUILT_IN_API_KEY] ||
+        genericKey ||
+        '';
       break;
     case 'claude':
-      apiKey = process.env[ENV_KEYS.CLAUDE_BUILT_IN_API_KEY] || '';
+      apiKey =
+        process.env[ENV_KEYS.CLAUDE_BUILT_IN_API_KEY] ||
+        genericKey ||
+        '';
       break;
   }
 
   if (!apiKey) {
-    console.warn(`No API key found for built-in service: ${serviceId}`);
+    console.warn(
+      `No API key found for built-in service: ${serviceId} ` +
+      `(tried ${baseConfig.provider.toUpperCase()}_BUILT_IN_API_KEY, ` +
+      `OPENAI_BUILT_IN_API_KEY, GEMINI_BUILT_IN_API_KEY, BUILT_IN_API_KEY — all empty)`
+    );
     return null;
   }
 

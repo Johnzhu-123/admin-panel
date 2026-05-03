@@ -765,22 +765,41 @@ export class ConfigurationStorageImpl implements ConfigurationStorage {
     // Try service-specific environment variable first
     const serviceSpecificKey = `${serviceId.toUpperCase().replace(/-/g, '_')}_API_KEY`;
     let apiKey = process.env[serviceSpecificKey];
-    
+
     if (apiKey) {
       return apiKey;
     }
 
-    // Fall back to provider-specific environment variables
+    // 🔧 FIX (2026-05 #10): 增加跨厂商 fallback。用户上游可能是 OpenAI 兼容模式，
+    // 即便 serviceId 历史名为 `gemini-built-in`，实际只有 OPENAI_BUILT_IN_API_KEY
+    // 或通用 BUILT_IN_API_KEY 配置。
+    const genericKey = process.env.BUILT_IN_API_KEY || '';
+
+    // Fall back to provider-specific environment variables, with cross-provider fallback
     switch (provider.toLowerCase()) {
       case 'gemini':
-        return process.env[ENV_KEYS.GEMINI_BUILT_IN_API_KEY] || '';
+        return (
+          process.env[ENV_KEYS.GEMINI_BUILT_IN_API_KEY] ||
+          process.env[ENV_KEYS.OPENAI_BUILT_IN_API_KEY] ||
+          genericKey ||
+          ''
+        );
       case 'openai':
-        return process.env[ENV_KEYS.OPENAI_BUILT_IN_API_KEY] || '';
+        return (
+          process.env[ENV_KEYS.OPENAI_BUILT_IN_API_KEY] ||
+          process.env[ENV_KEYS.GEMINI_BUILT_IN_API_KEY] ||
+          genericKey ||
+          ''
+        );
       case 'claude':
-        return process.env[ENV_KEYS.CLAUDE_BUILT_IN_API_KEY] || '';
+        return (
+          process.env[ENV_KEYS.CLAUDE_BUILT_IN_API_KEY] ||
+          genericKey ||
+          ''
+        );
       default:
-        console.warn(`Unknown provider: ${provider}, no API key available`);
-        return '';
+        console.warn(`Unknown provider: ${provider}, falling back to BUILT_IN_API_KEY`);
+        return genericKey;
     }
   }
 
