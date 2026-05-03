@@ -268,6 +268,9 @@ export async function initializeDatabase(): Promise<void> {
     // Initialize runtime settings table
     await initializeSystemSettingsTable();
 
+    // 🔧 NEW: Initialize per-user built-in config table (Render cold-start safe)
+    await initializeUserConfigsTable();
+
     console.log('✅ Database tables initialized successfully');
   } catch (error) {
     console.error('❌ Failed to initialize database:', error);
@@ -290,6 +293,65 @@ export async function initializeSystemSettingsTable(): Promise<void> {
   } catch (error) {
     console.error('Failed to initialize built_in_system_settings table:', error);
     throw error;
+  }
+}
+
+/**
+ * 🔧 NEW: 用户的 built-in 切换偏好持久化（解决 Render free tier 冷启动后丢失的问题）
+ *
+ * 历史背景：
+ *   ConfigurationStorageImpl.saveUserConfig 检测到 serverless 环境后直接 skip，
+ *   userConfig 仅保存在进程内存里。Render free tier 在 ~15 分钟无请求后冷重启，
+ *   重启后用户的「我已切换到内置」状态丢失，下次桌面端查询 `?action=status`
+ *   会拿到 `isUsingBuiltIn=false`，UI 看起来「重置回原状」。
+ *
+ * 这个表用 user_id 主键存 UserServiceConfig 的 JSON，正好绕过 ephemeral filesystem。
+ */
+export async function initializeUserConfigsTable(): Promise<void> {
+  try {
+    await sql`
+      CREATE TABLE IF NOT EXISTS built_in_user_configs (
+        user_id VARCHAR(255) PRIMARY KEY,
+        config_json TEXT NOT NULL,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `;
+  } catch (error) {
+    console.error('Failed to initialize built_in_user_configs table:', error);
+    throw error;
+  }
+}
+
+export async function loadUserConfigFromDatabase(userId: string): Promise<string | null> {
+  try {
+    const { rows } = await sql`
+      SELECT config_json FROM built_in_user_configs
+      WHERE user_id = ${userId}
+      LIMIT 1
+    `;
+    return rows[0]?.config_json ?? null;
+  } catch (error) {
+    console.error(`Failed to load user config for ${userId}:`, error);
+    return null;
+  }
+}
+
+export async function saveUserConfigToDatabase(userId: string, configJson: string): Promise<void> {
+  await sql`
+    INSERT INTO built_in_user_configs (user_id, config_json, updated_at)
+    VALUES (${userId}, ${configJson}, CURRENT_TIMESTAMP)
+    ON CONFLICT (user_id)
+    DO UPDATE SET
+      config_json = EXCLUDED.config_json,
+      updated_at = CURRENT_TIMESTAMP
+  `;
+}
+
+export async function deleteUserConfigFromDatabase(userId: string): Promise<void> {
+  try {
+    await sql`DELETE FROM built_in_user_configs WHERE user_id = ${userId}`;
+  } catch (error) {
+    console.error(`Failed to delete user config for ${userId}:`, error);
   }
 }
 

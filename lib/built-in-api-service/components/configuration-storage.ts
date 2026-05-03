@@ -21,6 +21,9 @@ import {
   saveUserToDatabase,
   deleteUserFromDatabase,
   initializeDatabase,
+  loadUserConfigFromDatabase,
+  saveUserConfigToDatabase,
+  deleteUserConfigFromDatabase,
 } from '../db';
 
 const isEphemeralRuntime = () =>
@@ -346,11 +349,38 @@ export class ConfigurationStorageImpl implements ConfigurationStorage {
 
   /**
    * Load user configuration from storage
+   *
+   * 🔧 FIX (Render free tier 冷启动后用户「切换到内置」状态丢失):
+   *   serverless 分支不再返回 null 走文件系统 — 会走 Postgres 表 built_in_user_configs。
+   *   非 serverless（Electron 桌面 / 本地开发）保留原有文件系统行为，避免引入对 Postgres 的强依赖。
    */
   async loadUserConfig(userId: string): Promise<UserServiceConfig | null> {
     try {
+      // Serverless：从 Postgres 读，绕过 ephemeral filesystem
+      if (isEphemeralRuntime()) {
+        try {
+          const dbAvailable = await this.checkDatabaseAvailability();
+          if (dbAvailable) {
+            const configJson = await loadUserConfigFromDatabase(userId);
+            if (!configJson) return null;
+            const parsed = JSON.parse(configJson);
+            return {
+              ...parsed,
+              createdAt: new Date(parsed.createdAt),
+              updatedAt: new Date(parsed.updatedAt),
+            };
+          }
+        } catch (dbError) {
+          console.warn(
+            `[ConfigStorage] Postgres loadUserConfig failed for ${userId}, falling back to null:`,
+            dbError instanceof Error ? dbError.message : dbError
+          );
+        }
+        return null;
+      }
+
       const filePath = join(this.workspaceRoot, CONFIG_PATHS.USER_CONFIGS, `${userId}.json`);
-      
+
       // Check if file exists
       try {
         await fs.access(filePath);
@@ -375,35 +405,47 @@ export class ConfigurationStorageImpl implements ConfigurationStorage {
 
   /**
    * Save user configuration to storage
-   * In serverless environments, user configs are not persisted to file system
+   *
+   * 🔧 FIX: serverless 分支真存进 Postgres，不再丢；非 serverless 仍走文件系统。
    */
   async saveUserConfig(userId: string, config: UserServiceConfig): Promise<void> {
     try {
-      // Check if we're in a serverless environment
-      const isServerless = isEphemeralRuntime();
-      
-      if (isServerless) {
-        console.log(`[ConfigStorage] Serverless environment - skipping user config file save for ${userId}`);
-        // In serverless, user configs are ephemeral and stored in memory only
-        // This is acceptable as user service preferences are not critical for core functionality
-        return;
-      }
-
-      const configDir = join(this.workspaceRoot, CONFIG_PATHS.USER_CONFIGS);
-      const filePath = join(configDir, `${userId}.json`);
-      
-      // Ensure directory exists
-      await this.ensureDirectoryExists(configDir);
-
-      // Prepare data for serialization
       const dataToSave = {
         ...config,
         createdAt: config.createdAt.toISOString(),
         updatedAt: config.updatedAt.toISOString(),
       };
+      const jsonData = JSON.stringify(dataToSave);
 
-      const jsonData = JSON.stringify(dataToSave, null, 2);
-      await fs.writeFile(filePath, jsonData, 'utf-8');
+      if (isEphemeralRuntime()) {
+        try {
+          const dbAvailable = await this.checkDatabaseAvailability();
+          if (dbAvailable) {
+            await saveUserConfigToDatabase(userId, jsonData);
+            console.log(`[ConfigStorage] Saved user config for ${userId} to Postgres (serverless)`);
+            return;
+          }
+          console.warn(
+            `[ConfigStorage] Postgres unavailable in serverless env — user config for ${userId} stays memory-only this session`
+          );
+        } catch (dbError) {
+          console.error(
+            `[ConfigStorage] Failed to persist user config for ${userId} to Postgres:`,
+            dbError instanceof Error ? dbError.message : dbError
+          );
+        }
+        // Postgres 不可用时退回内存仅本次会话有效（保留原有行为）
+        return;
+      }
+
+      const configDir = join(this.workspaceRoot, CONFIG_PATHS.USER_CONFIGS);
+      const filePath = join(configDir, `${userId}.json`);
+
+      // Ensure directory exists
+      await this.ensureDirectoryExists(configDir);
+
+      const prettyJson = JSON.stringify(dataToSave, null, 2);
+      await fs.writeFile(filePath, prettyJson, 'utf-8');
 
       console.log(`Saved user configuration for ${userId}`);
     } catch (error) {
