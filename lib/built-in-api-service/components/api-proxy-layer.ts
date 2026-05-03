@@ -16,11 +16,12 @@ import {
   BuiltInServiceConfigManager, 
   UserAuthorizationVerifier 
 } from '../interfaces';
-import { 
+import {
   generateImageWithCompatibility,
   handleCompatibilityError,
   initializeCompatibilitySystem
 } from '../../api-compatibility/integration';
+import { coerceImageValueToBase64 } from '../../image-generation/shared-utils';
 import { recordFailureLog } from '../../diagnostics';
 import { TIMEOUTS, RETRY_CONFIG, SECURITY_SETTINGS } from '../config';
 import { getPerformanceMonitor } from './performance-monitor';
@@ -523,8 +524,22 @@ export class APIProxyLayerImpl implements APIProxyLayer {
       // Transform response to expected format
       if (response.images && response.images.length > 0) {
         const image = response.images[0];
+        // 🔧 FIX (2026-05 #5 反复修复的"破坏缩略图 / 当前页生成失败"根因):
+        // gpt-image-2 等兼容服务即使指定 response_format=b64_json，也经常返回
+        // `{ url: "https://..." }`（远程短时签名链接）。旧实现 `image.b64_json || image.url`
+        // 把这个 URL 当作 imageBase64 字段透传给前端，前端把 https:// 当 <img src=...>
+        // 加载远程链接，因签名过期 / CORS / 防盗链失败 → "破坏缩略图"；或上游字段
+        // 提取异常返回空 → "当前页生成失败"。
+        // 修复：统一在服务端 fetch URL 转 base64，前端永远拿稳定内联数据。
+        const rawValue = image.b64_json || image.url || "";
+        const imageBase64 = await coerceImageValueToBase64(rawValue);
+        if (!imageBase64) {
+          throw new Error(
+            'Failed to extract image data from upstream (b64_json/url both unusable)'
+          );
+        }
         return {
-          imageBase64: image.b64_json || image.url,
+          imageBase64,
           revised_prompt: image.revised_prompt,
           metadata: {
             serviceId: request.serviceId,

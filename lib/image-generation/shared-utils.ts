@@ -360,3 +360,88 @@ export const isContentPolicyError = (error: string): boolean => {
     ];
     return policyErrors.some(err => combined.includes(err));
 };
+
+// ==================== Image Value Coercion (URL → Base64) ====================
+
+/**
+ * 把上游图像生成接口可能返回的多种"图片值"统一规整为纯 base64 字符串。
+ *
+ * 触发背景（用户报告的"破坏缩略图 / 当前页生成失败"症状根因）:
+ *   gpt-image-2 等兼容服务即使请求 response_format=b64_json 也常常返回
+ *   `{ data: [{ url: "https://..." }] }`。旧逻辑 `image.b64_json || image.url`
+ *   把远程 URL 当作 imageBase64 字段透传给客户端，客户端 normalizer 识别到
+ *   https:// 直接当 <img src=...>，但远程 URL：
+ *     - 短时签名过期（OpenAI / Azure 默认 1h，再加上代理转发的延迟）
+ *     - CORS / 防盗链拒绝桌面端 Electron renderer 加载
+ *     - 临时存储清理 / 网络抖动
+ *   任何一个失败都会触发 onError → "破坏缩略图"，或字段提取空 → "当前页生成失败"。
+ *
+ * 修复策略：统一在服务端把任何形式（base64 / data URL / http(s) URL / markdown
+ * 嵌入）的图片值下载并转码为纯 base64，前端永远拿稳定的内联数据，不再依赖
+ * 远程链接的生命周期。
+ *
+ * 入参可能形态：
+ *   - 纯 base64：直接返回（去除空白）
+ *   - data:image/...;base64,xxx：抽取 base64 部分
+ *   - https://... 或 http://...：fetch 后转 base64
+ *   - markdown ![](...)：抽取 URL 后递归
+ *   - 空 / 失败：返回 ""
+ */
+export const coerceImageValueToBase64 = async (
+    value: string | null | undefined,
+    timeoutMs = 30000
+): Promise<string> => {
+    const raw = (value || "").trim();
+    if (!raw) return "";
+
+    // markdown image: ![](xxx)
+    const md = raw.match(/!\[[^\]]*]\(([^)]+)\)/i);
+    const extracted = (md?.[1] || raw).trim().replace(/^['"]|['"]$/g, "");
+    if (!extracted) return "";
+
+    // data URL → 抽 base64 部分
+    if (/^data:image\//i.test(extracted)) {
+        const comma = extracted.indexOf(",");
+        if (comma >= 0) {
+            const b64 = extracted.slice(comma + 1).replace(/[\s\n\r]/g, "");
+            return b64;
+        }
+        return "";
+    }
+
+    // http(s) URL → 下载并 base64 化
+    if (/^https?:\/\//i.test(extracted)) {
+        try {
+            const res = await queuedFetch(
+                extracted,
+                { signal: AbortSignal.timeout(timeoutMs) },
+                "low"
+            );
+            if (!res.ok) {
+                console.warn(
+                    `[coerceImageValueToBase64] fetch ${extracted} -> HTTP ${res.status}`
+                );
+                return "";
+            }
+            const buf = Buffer.from(await res.arrayBuffer());
+            return buf.toString("base64");
+        } catch (err) {
+            console.warn(
+                `[coerceImageValueToBase64] fetch failed:`,
+                err instanceof Error ? err.message : err
+            );
+            return "";
+        }
+    }
+
+    // blob://、asset:// 等不可在服务端解析的协议 → 放弃
+    if (/^[a-z]+:\/\//i.test(extracted)) {
+        console.warn(
+            `[coerceImageValueToBase64] unsupported scheme: ${extracted.substring(0, 80)}`
+        );
+        return "";
+    }
+
+    // 其他都按已经是纯 base64 字符串处理（清掉换行/空白）
+    return extracted.replace(/[\s\n\r]/g, "");
+};

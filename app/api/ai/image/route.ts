@@ -24,6 +24,7 @@ import {
   resolveOpenAiEndpoint,
 } from "@/lib/ai";
 import { recordFailureLog } from "@/lib/diagnostics";
+import { coerceImageValueToBase64 } from "@/lib/image-generation/shared-utils";
 import { resolveBuiltInWithCatalog, rewriteUpstreamError } from "@/lib/built-in-api-service/catalog-resolver";
 import {
   generateImageWithCompatibility,
@@ -1493,7 +1494,13 @@ Important: The mask indicates where to make changes. All other areas should rema
         // Convert response to expected format
         if (response.images && response.images.length > 0) {
           const image = response.images[0];
-          const imageBase64 = image.b64_json || image.url;
+          // 🔧 FIX (2026-05 #5 反复修复的"破坏缩略图 / 当前页生成失败"根因):
+          // 同 api-proxy-layer.ts:527 — gpt-image-2 等服务即使要 b64_json
+          // 也常返回 { url: "https://..." } 远程短时签名链接。旧实现把这个 URL
+          // 当 imageBase64 透传给前端，前端 <img> 加载远程链接因签名过期 / CORS /
+          // 防盗链失败 → "破坏缩略图"。统一在服务端 fetch 转 base64。
+          const rawValue = image.b64_json || image.url || "";
+          const imageBase64 = await coerceImageValueToBase64(rawValue);
 
           if (imageBase64) {
             // 🔧 FIX: 记录用量（OpenAI compatibility system路径）

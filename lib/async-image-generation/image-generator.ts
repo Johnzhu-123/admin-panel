@@ -22,6 +22,7 @@ import {
   handleCompatibilityError,
 } from "@/lib/api-compatibility/integration";
 import { queuedFetch } from "@/lib/request-queue-manager";
+import { coerceImageValueToBase64 } from "@/lib/image-generation/shared-utils";
 
 // Import shared utilities to eliminate code duplication
 import {
@@ -294,19 +295,12 @@ async function generateWithOpenAI(params: GenerationParams): Promise<string> {
 
     if (response.images && response.images.length > 0) {
       const image = response.images[0];
-      const imageBase64 = image.b64_json || image.url;
-
+      // 🔧 FIX (统一: 与 route.ts / api-proxy-layer.ts 一致):
+      // 把 b64_json / data URL / http URL / markdown 全部规整为纯 base64，
+      // 让上层异步任务永远拿稳定数据，不依赖远程链接生命周期。
+      const rawValue = image.b64_json || image.url || "";
+      const imageBase64 = await coerceImageValueToBase64(rawValue);
       if (imageBase64) {
-        // If it's a URL, fetch and convert to base64
-        if (typeof imageBase64 === "string" && imageBase64.startsWith("http")) {
-          const res = await queuedFetch(imageBase64, {
-            signal: AbortSignal.timeout(30000)
-          }, 'low');
-          if (res.ok) {
-            const buf = Buffer.from(await res.arrayBuffer());
-            return buf.toString("base64");
-          }
-        }
         return imageBase64;
       }
     }
