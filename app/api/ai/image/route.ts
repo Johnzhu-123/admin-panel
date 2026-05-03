@@ -1273,12 +1273,58 @@ Important: The mask indicates where to make changes. All other areas should rema
                 { headers: noStoreHeaders() }
               );
             } else {
+              // 🔧 FIX (2026-05 #6): builtInResponse 缺 imageBase64 字段也算失败，
+              //   不能再继续走 fallback 路径，否则诊断会被下面的 catch 静默吞掉。
+              console.error(
+                "[built-in-image] proxyImageGeneration 返回缺 imageBase64:",
+                JSON.stringify(builtInResponse || {})
+              );
+              return NextResponse.json(
+                {
+                  error: "内置服务上游响应缺 imageBase64 字段（可能上游模型不可用 / 配额用尽）。",
+                  diagnostic: builtInResponse,
+                  source: "built-in-service"
+                },
+                { status: 502, headers: noStoreHeaders() }
+              );
             }
           } else {
           }
         }
       } catch (error) {
-        // Continue with existing logic as fallback
+        // 🔧 FIX (2026-05 #6 关键根因): 之前这里 `// Continue with existing logic
+        // as fallback` 会静默吞掉所有内置服务的错误（包括 magic-byte 校验失败、
+        // 上游 502/HTML 错误页等），导致前 5 次修复加的诊断信息从来没出现在 Render
+        // 日志和前端错误卡里 —— 用户每次只能看到笼统的"当前页生成失败"。
+        //
+        // 修正策略：
+        //   1) 永远 console.error 原始错误（包括 stack），便于 Render 日志排查；
+        //   2) 当用户明确开了 useBuiltInService 且没自带 apiKey 时，直接把错误返回前端，
+        //      不再 fallback —— 因为后续 fallback 路径需要用户的 apiKey，没有就只会
+        //      落到 "Missing apiKey or prompt" 的笼统报错；
+        //   3) 当用户自带 apiKey（混合模式）时，仍允许 fallback 到旧路径，但仍要把
+        //      原错误打到日志里。
+        const errMsg =
+          error instanceof Error ? error.message : String(error);
+        const errStack = error instanceof Error ? error.stack : undefined;
+        console.error(
+          "[built-in-image] proxyImageGeneration 抛出，原始诊断:",
+          errMsg,
+          errStack ? `\nstack: ${errStack}` : ""
+        );
+
+        const userHasOwnApiKey = !!(body.apiKey && String(body.apiKey).trim());
+        if (!userHasOwnApiKey) {
+          // 用户明确选了内置服务，没自备 key，fallback 也救不了 —— 直接把错误透传
+          return NextResponse.json(
+            {
+              error: errMsg || "内置服务调用失败",
+              source: "built-in-service"
+            },
+            { status: 502, headers: noStoreHeaders() }
+          );
+        }
+        // 否则继续 fallback 到既有路径（用用户自带 apiKey）
       }
     }
 
