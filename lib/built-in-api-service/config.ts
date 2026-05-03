@@ -61,8 +61,11 @@ export const BUILT_IN_SERVICES: Record<string, Omit<BuiltInServiceConfig, 'apiKe
     id: 'gemini-built-in',
     name: builtInServiceName,
     provider: 'gemini',
-    // 使用实际的API URL作为默认值
-    baseUrl: process.env.GEMINI_BUILT_IN_BASE_URL || 'https://seeyjys.zeabur.app/v1',
+    // 🔧 FIX (2026-05 #9): seeyjys.zeabur.app 是已弃用的旧地址，整个服务早就
+    // 迁移到 api.seeyjys.eu.org（部署在 Render）。旧 Zeabur 节点要么不响应、
+    // 要么超时 → 30s AbortController 强制中断 → "操作被超时中断"。
+    // 优先读 GEMINI_BUILT_IN_BASE_URL 环境变量，无则用新地址兜底。
+    baseUrl: process.env.GEMINI_BUILT_IN_BASE_URL || 'https://api.seeyjys.eu.org/v1',
     model: builtInServiceModel,
     isEnabled: builtInServiceEnabled,
     quotaLimits: {
@@ -109,14 +112,20 @@ export const CACHE_TTL = {
 
 // Request timeout values (in milliseconds)
 export const TIMEOUTS = {
-  API_REQUEST: 30000,       // 30 seconds
+  // 🔧 FIX (2026-05 #8 真根因): gpt-image-2 在 2048x1152 这种大尺寸经过 Zeabur
+  // 代理到上游模型，单次生成普遍要 60-120 秒。30 秒会被 AbortController 强制
+  // 中断 → "operation was aborted due to timeout" → 重试 3 次仍超时 → 502。
+  // 把外层 wrapper 拉到 180s，给上游充分的生成时间。
+  API_REQUEST: 180000,      // 3 minutes (was 30s — too short for image gen)
   HEALTH_CHECK: 10000,      // 10 seconds
   CONFIG_LOAD: 5000         // 5 seconds
 } as const;
 
 // Error retry configuration
 export const RETRY_CONFIG = {
-  MAX_RETRIES: 3,
+  // 🔧 FIX (2026-05 #8): 3 次重试 × 180s/次 = 9 分钟，UX 灾难。图像生成失败
+  // 大概率不是瞬时抖动而是上游容量/限流，重试 1 次足矣。
+  MAX_RETRIES: 1,
   INITIAL_DELAY: 1000,      // 1 second
   MAX_DELAY: 10000,         // 10 seconds
   BACKOFF_FACTOR: 2

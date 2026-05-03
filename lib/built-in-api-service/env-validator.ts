@@ -42,7 +42,7 @@ export function validateEnvironmentVariables(): EnvValidationResult {
   const optional: Record<string, { description: string; defaultValue: string }> = {
     'GEMINI_BUILT_IN_BASE_URL': {
       description: 'API基础URL',
-      defaultValue: 'https://seeyjys.zeabur.app/v1'
+      defaultValue: 'https://api.seeyjys.eu.org/v1'
     },
     'BUILT_IN_SERVICE_NAME': {
       description: '服务名称',

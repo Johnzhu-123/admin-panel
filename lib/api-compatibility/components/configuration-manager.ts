@@ -23,11 +23,11 @@ const PROVIDER_TEMPLATES: Record<string, Partial<ProviderConfig>> = {
       'Content-Type': 'application/json',
     },
     retryConfig: {
-      maxRetries: 3,
+      maxRetries: 1,  // 🔧 FIX (2026-05 #8): 多次重试对超时型故障无意义
       backoffMs: 1000,
       retryableErrors: ['rate_limit', 'network_error', 'timeout'],
     },
-    timeoutMs: 30000,
+    timeoutMs: 180000,  // 🔧 FIX (2026-05 #8): 30s → 180s，给图像生成足够时间
     rateLimits: {
       requestsPerMinute: 60,
       requestsPerHour: 1000,
