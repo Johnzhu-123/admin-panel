@@ -29,6 +29,10 @@ export class BuiltInServiceConfigManagerImpl implements BuiltInServiceConfigMana
 
   /**
    * Get built-in service configuration
+   *
+   * 🔧 FIX (2026-05 #11): catalog fallback。env 缺失时从管理面板 UI 配置（catalog）
+   *   合成一个可用的 BuiltInServiceConfig，避免下游 proxyImageGeneration 看到 null
+   *   后报 "Service not found"。优先 image 类，其他类按 multimodal/text 顺序兜底。
    */
   async getBuiltInServiceConfig(serviceId: string): Promise<BuiltInServiceConfig | null> {
     try {
@@ -38,18 +42,71 @@ export class BuiltInServiceConfigManagerImpl implements BuiltInServiceConfigMana
         return { ...cached.config };
       }
 
-      // Get configuration from environment and defaults
-      const config = getBuiltInServiceConfig(serviceId);
-      
-      if (config) {
-        // Cache the result
+      // 1. 旧路径：环境变量
+      const envConfig = getBuiltInServiceConfig(serviceId);
+      if (envConfig) {
         this.configCache.set(serviceId, {
-          config: { ...config },
+          config: { ...envConfig },
           timestamp: Date.now()
         });
+        return { ...envConfig };
+      }
 
-        // Return a copy to prevent external modifications
-        return { ...config };
+      // 2. 新路径：catalog（管理面板 UI 配置）合成 config
+      try {
+        const { getServiceCatalog } = await import('../db');
+        const catalog = await getServiceCatalog();
+        // 优先级：image > multimodal > text > tts > video（图片生成路径优先）
+        const priority: Array<keyof typeof catalog> = ['image', 'multimodal', 'text', 'tts', 'video'] as any;
+        for (const cat of priority) {
+          const category = catalog[cat as keyof typeof catalog];
+          if (!category || !category.subtasks) continue;
+          // 优先用 defaultSubtaskId 指向的子任务，没配齐再轮询其他
+          const orderedIds = [
+            category.defaultSubtaskId,
+            ...Object.keys(category.subtasks).filter(id => id !== category.defaultSubtaskId)
+          ];
+          for (const subId of orderedIds) {
+            const subtask = category.subtasks[subId];
+            if (!subtask) continue;
+            const baseUrl = (subtask.baseUrl || '').trim();
+            const apiKey = (subtask.apiKey || '').trim();
+            const enabled = subtask.isEnabled !== false;
+            if (enabled && baseUrl && apiKey) {
+              const synthesized: BuiltInServiceConfig = {
+                id: serviceId,
+                name: process.env.BUILT_IN_SERVICE_NAME || '内置服务',
+                provider: 'openai', // catalog 模式默认按 OpenAI 兼容协议处理
+                baseUrl,
+                model: (subtask.model || '').trim() || 'gpt-image-2',
+                apiKey,
+                isEnabled: true,
+                quotaLimits: {
+                  dailyRequests: 10000,
+                  monthlyRequests: 100000,
+                  concurrentRequests: 50
+                },
+                rateLimits: {
+                  requestsPerMinute: 60,
+                  requestsPerHour: 1000,
+                  burstLimit: 10
+                },
+                createdAt: new Date(),
+                updatedAt: new Date()
+              };
+              this.configCache.set(serviceId, {
+                config: { ...synthesized },
+                timestamp: Date.now()
+              });
+              return { ...synthesized };
+            }
+          }
+        }
+      } catch (catalogErr) {
+        console.warn(
+          `[getBuiltInServiceConfig] catalog 查询失败:`,
+          catalogErr instanceof Error ? catalogErr.message : catalogErr
+        );
       }
 
       return null;
@@ -272,6 +329,15 @@ export class BuiltInServiceConfigManagerImpl implements BuiltInServiceConfigMana
 
   /**
    * Check if service is available
+   *
+   * 🔧 FIX (2026-05 #11): 新增 catalog-fallback。
+   *   背景：admin-panel 有两套并存的配置体系 ——
+   *     (A) 旧路径：环境变量 GEMINI_BUILT_IN_API_KEY / GEMINI_BUILT_IN_BASE_URL；
+   *     (B) 新路径：管理面板 UI → catalog（DB），按 5 大类 × N 子任务存 baseUrl+apiKey。
+   *   `getAvailableServices` 内部循环调本方法，本方法此前只看 env，UI 配置完全无效。
+   *   用户删掉 env 后，桌面端切换内置服务直接报"没有可用的内置服务"。
+   *   修复：env 没配时改用 catalog —— 任一 category 有至少一个 enabled 子任务且
+   *   配齐 baseUrl+apiKey，就视为该服务可用。
    */
   async isServiceAvailable(serviceId: string): Promise<boolean> {
     try {
@@ -281,37 +347,43 @@ export class BuiltInServiceConfigManagerImpl implements BuiltInServiceConfigMana
         return cached.available;
       }
 
-      // Check if service is configured
-      const isConfigured = isServiceConfigured(serviceId);
-      if (!isConfigured) {
-        this.availabilityCache.set(serviceId, {
-          available: false,
-          timestamp: Date.now()
-        });
-        return false;
+      // 1. 旧路径：环境变量
+      const isEnvConfigured = isServiceConfigured(serviceId);
+      if (isEnvConfigured) {
+        const config = await this.getBuiltInServiceConfig(serviceId);
+        if (config && config.isEnabled) {
+          const validation = await this.validateServiceConfig(config);
+          const available = validation.isValid;
+          this.availabilityCache.set(serviceId, { available, timestamp: Date.now() });
+          return available;
+        }
       }
 
-      // Get service configuration
-      const config = await this.getBuiltInServiceConfig(serviceId);
-      if (!config || !config.isEnabled) {
-        this.availabilityCache.set(serviceId, {
-          available: false,
-          timestamp: Date.now()
-        });
-        return false;
+      // 2. 新路径：catalog 数据库（管理面板 UI 配置）
+      try {
+        const { getServiceCatalog } = await import('../db');
+        const catalog = await getServiceCatalog();
+        for (const category of Object.values(catalog)) {
+          if (!category || !category.subtasks) continue;
+          for (const subtask of Object.values(category.subtasks)) {
+            const baseUrl = (subtask.baseUrl || '').trim();
+            const apiKey = (subtask.apiKey || '').trim();
+            const enabled = subtask.isEnabled !== false;
+            if (enabled && baseUrl && apiKey) {
+              this.availabilityCache.set(serviceId, { available: true, timestamp: Date.now() });
+              return true;
+            }
+          }
+        }
+      } catch (catalogErr) {
+        console.warn(
+          `[isServiceAvailable] catalog 查询失败，仅 env 路径有效:`,
+          catalogErr instanceof Error ? catalogErr.message : catalogErr
+        );
       }
 
-      // Validate configuration
-      const validation = await this.validateServiceConfig(config);
-      const available = validation.isValid;
-
-      // Cache the result
-      this.availabilityCache.set(serviceId, {
-        available,
-        timestamp: Date.now()
-      });
-
-      return available;
+      this.availabilityCache.set(serviceId, { available: false, timestamp: Date.now() });
+      return false;
     } catch (error) {
       console.error(`Error checking service availability for ${serviceId}:`, error);
       return false;
