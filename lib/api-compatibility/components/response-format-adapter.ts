@@ -338,21 +338,31 @@ export class ResponseFormatAdapter implements IResponseFormatAdapter {
       if (response.data && Array.isArray(response.data)) {
         for (const item of response.data) {
           const imageData: ImageData = {};
-          
+
           // Try different property names for URL
           if (item.url || item.image_url || item.link) {
             imageData.url = item.url || item.image_url || item.link;
           }
-          
+
           // Try different property names for base64 data
-          if (item.b64_json || item.base64 || (item.data && typeof item.data === 'string')) {
-            imageData.b64_json = item.b64_json || item.base64 || item.data;
+          // 🔧 FIX (2026-05 #6): 补 `image` / `image_data` / `imageData` / `b64`
+          // 字段。第三方 OpenAI-compatible 网关返回字段名各异（gpt-image-2 实测有
+          // 出现仅 image 字段的形态），漏接就会触发上层 "No image data in response"。
+          if (
+            item.b64_json || item.b64 || item.base64 ||
+            item.image || item.image_data || item.imageData ||
+            (item.data && typeof item.data === 'string')
+          ) {
+            imageData.b64_json =
+              item.b64_json || item.b64 || item.base64 ||
+              item.image || item.image_data || item.imageData ||
+              item.data;
           }
-          
+
           if (item.revised_prompt) {
             imageData.revised_prompt = item.revised_prompt;
           }
-          
+
           // Only add image if it has actual image data
           if (imageData.url || imageData.b64_json) {
             images.push(imageData);

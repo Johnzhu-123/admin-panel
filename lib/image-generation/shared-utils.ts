@@ -361,6 +361,68 @@ export const isContentPolicyError = (error: string): boolean => {
     return policyErrors.some(err => combined.includes(err));
 };
 
+// ==================== Image Magic-Byte Validation ====================
+
+/**
+ * 校验 Buffer 是否为已知图像格式的 magic-byte 起始。
+ * 与 md2pptWin/lib/image-generation/shared-utils.ts:isLikelyImageBuffer 同语义。
+ *
+ * 必要性：fetch 远端 URL 返回 200 不代表内容是图片 —— 可能是 HTML 登录页 /
+ * JSON 错误体 / 0 字节占位符。Buffer.from(...).toString('base64') 会产出
+ * "看起来合法但解码非图片" 的 base64，前端 <img> 渲染必然失败 → 破图。
+ */
+export const isLikelyImageBuffer = (buffer: Buffer): boolean => {
+    if (!buffer || buffer.length < 16) return false;
+    // PNG: 89 50 4E 47 0D 0A 1A 0A
+    if (
+        buffer[0] === 0x89 && buffer[1] === 0x50 &&
+        buffer[2] === 0x4e && buffer[3] === 0x47 &&
+        buffer[4] === 0x0d && buffer[5] === 0x0a &&
+        buffer[6] === 0x1a && buffer[7] === 0x0a
+    ) return true;
+    // JPEG: FF D8 FF
+    if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return true;
+    // GIF: "GIF87a" / "GIF89a"
+    if (
+        buffer[0] === 0x47 && buffer[1] === 0x49 &&
+        buffer[2] === 0x46 && buffer[3] === 0x38 &&
+        (buffer[4] === 0x37 || buffer[4] === 0x39) &&
+        buffer[5] === 0x61
+    ) return true;
+    // WebP: "RIFF" .... "WEBP"
+    if (
+        buffer[0] === 0x52 && buffer[1] === 0x49 &&
+        buffer[2] === 0x46 && buffer[3] === 0x46 &&
+        buffer[8] === 0x57 && buffer[9] === 0x45 &&
+        buffer[10] === 0x42 && buffer[11] === 0x50
+    ) return true;
+    // BMP: "BM"
+    if (buffer[0] === 0x42 && buffer[1] === 0x4d) return true;
+    // AVIF / HEIC: bytes 4-7 == "ftyp"
+    if (
+        buffer[4] === 0x66 && buffer[5] === 0x74 &&
+        buffer[6] === 0x79 && buffer[7] === 0x70
+    ) return true;
+    return false;
+};
+
+/**
+ * 把 base64 字符串解码后做 magic-byte 校验。空 / 太短 / 非图像格式都返回 false。
+ */
+export const isValidImageBase64 = (base64: string): boolean => {
+    if (!base64 || typeof base64 !== "string") return false;
+    const cleaned = base64.replace(/[\s\n\r]/g, "");
+    if (cleaned.length < 256) return false;
+    if (!/^[A-Za-z0-9+/=]+$/.test(cleaned)) return false;
+    try {
+        // 只解前 64 字节就够判头（节省内存）
+        const head = Buffer.from(cleaned.slice(0, 88), "base64");
+        return isLikelyImageBuffer(head);
+    } catch {
+        return false;
+    }
+};
+
 // ==================== Image Value Coercion (URL → Base64) ====================
 
 /**
@@ -380,10 +442,15 @@ export const isContentPolicyError = (error: string): boolean => {
  * 嵌入）的图片值下载并转码为纯 base64，前端永远拿稳定的内联数据，不再依赖
  * 远程链接的生命周期。
  *
+ * v3 改进（2026-05 第 6 次修复）：
+ *   - URL fetch 后校验 Content-Type，非 image/* 直接判失败；
+ *   - 返回前对 base64 做 magic-byte 校验，过滤 HTML/JSON 错误体；
+ *   - 失败路径打印诊断（URL / status / content-type / head bytes），便于排障。
+ *
  * 入参可能形态：
- *   - 纯 base64：直接返回（去除空白）
- *   - data:image/...;base64,xxx：抽取 base64 部分
- *   - https://... 或 http://...：fetch 后转 base64
+ *   - 纯 base64：magic-byte 通过则返回（去除空白），不通过返回 ""
+ *   - data:image/...;base64,xxx：抽取 base64 部分后做 magic-byte 校验
+ *   - https://... 或 http://...：fetch + Content-Type + magic-byte 三重校验
  *   - markdown ![](...)：抽取 URL 后递归
  *   - 空 / 失败：返回 ""
  */
@@ -402,11 +469,15 @@ export const coerceImageValueToBase64 = async (
     // data URL → 抽 base64 部分
     if (/^data:image\//i.test(extracted)) {
         const comma = extracted.indexOf(",");
-        if (comma >= 0) {
-            const b64 = extracted.slice(comma + 1).replace(/[\s\n\r]/g, "");
-            return b64;
+        if (comma < 0) return "";
+        const b64 = extracted.slice(comma + 1).replace(/[\s\n\r]/g, "");
+        if (!isValidImageBase64(b64)) {
+            console.warn(
+                `[coerceImageValueToBase64] data URL base64 magic-byte 校验失败 head=${b64.slice(0, 64)}`
+            );
+            return "";
         }
-        return "";
+        return b64;
     }
 
     // http(s) URL → 下载并 base64 化
@@ -419,11 +490,30 @@ export const coerceImageValueToBase64 = async (
             );
             if (!res.ok) {
                 console.warn(
-                    `[coerceImageValueToBase64] fetch ${extracted} -> HTTP ${res.status}`
+                    `[coerceImageValueToBase64] fetch ${extracted.substring(0, 120)} -> HTTP ${res.status}`
+                );
+                return "";
+            }
+            const ct = (res.headers.get("content-type") || "").toLowerCase();
+            const ctOk =
+                !ct ||
+                ct.startsWith("image/") ||
+                ct.startsWith("application/octet-stream") ||
+                ct.startsWith("binary/");
+            if (!ctOk) {
+                console.warn(
+                    `[coerceImageValueToBase64] non-image content-type=${ct} url=${extracted.substring(0, 120)}`
                 );
                 return "";
             }
             const buf = Buffer.from(await res.arrayBuffer());
+            if (!isLikelyImageBuffer(buf)) {
+                const headHex = buf.subarray(0, Math.min(16, buf.length)).toString("hex");
+                console.warn(
+                    `[coerceImageValueToBase64] magic-byte 校验失败 url=${extracted.substring(0, 120)} ct=${ct} bytes=${buf.length} head=${headHex}`
+                );
+                return "";
+            }
             return buf.toString("base64");
         } catch (err) {
             console.warn(
@@ -442,6 +532,13 @@ export const coerceImageValueToBase64 = async (
         return "";
     }
 
-    // 其他都按已经是纯 base64 字符串处理（清掉换行/空白）
-    return extracted.replace(/[\s\n\r]/g, "");
+    // 其他都按已经是纯 base64 字符串处理 —— 必须 magic-byte 校验通过才算数
+    const b64 = extracted.replace(/[\s\n\r]/g, "");
+    if (!isValidImageBase64(b64)) {
+        console.warn(
+            `[coerceImageValueToBase64] 上游 b64_json 字段 magic-byte 校验失败 len=${b64.length} head=${b64.slice(0, 64)}`
+        );
+        return "";
+    }
+    return b64;
 };

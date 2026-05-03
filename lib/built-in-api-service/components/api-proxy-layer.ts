@@ -524,18 +524,32 @@ export class APIProxyLayerImpl implements APIProxyLayer {
       // Transform response to expected format
       if (response.images && response.images.length > 0) {
         const image = response.images[0];
-        // 🔧 FIX (2026-05 #5 反复修复的"破坏缩略图 / 当前页生成失败"根因):
-        // gpt-image-2 等兼容服务即使指定 response_format=b64_json，也经常返回
-        // `{ url: "https://..." }`（远程短时签名链接）。旧实现 `image.b64_json || image.url`
-        // 把这个 URL 当作 imageBase64 字段透传给前端，前端把 https:// 当 <img src=...>
-        // 加载远程链接，因签名过期 / CORS / 防盗链失败 → "破坏缩略图"；或上游字段
-        // 提取异常返回空 → "当前页生成失败"。
-        // 修复：统一在服务端 fetch URL 转 base64，前端永远拿稳定内联数据。
-        const rawValue = image.b64_json || image.url || "";
+        // 🔧 FIX (2026-05 #6 反复修复的"破坏缩略图 / 当前页生成失败"根因):
+        // 第 5 次修复（92e41fd）已经处理 "上游返回 URL → 服务端 fetch 转 base64" 路径，
+        // 但漏了关键一环：URL fetch 200 不等于内容是图片 —— 可能是 HTML 登录页 /
+        // JSON 错误体 / 0 字节占位。Buffer.toString('base64') 仍会产出"看似合法但
+        // 解码非图片"的 base64，前端 <img> 渲染必然失败 → 破图缩略图。
+        // 第 6 次修复在 coerceImageValueToBase64 里加了 Content-Type + magic-byte
+        // 双重校验；此处把上游响应原貌打到错误诊断里，避免下次又只能盲修。
+        const rawB64 = typeof image.b64_json === "string" ? image.b64_json : "";
+        const rawUrl = typeof image.url === "string" ? image.url : "";
+        const rawValue = rawB64 || rawUrl || "";
         const imageBase64 = await coerceImageValueToBase64(rawValue);
         if (!imageBase64) {
+          const diag = {
+            hasB64: !!rawB64,
+            b64Len: rawB64.length,
+            b64Head: rawB64.slice(0, 80),
+            hasUrl: !!rawUrl,
+            urlHead: rawUrl.slice(0, 200),
+            otherKeys: Object.keys(image || {}),
+          };
+          console.error(
+            "[built-in-service] coerce 失败，上游响应不可用:",
+            JSON.stringify(diag)
+          );
           throw new Error(
-            'Failed to extract image data from upstream (b64_json/url both unusable)'
+            `Failed to extract image data from upstream (b64_json/url both unusable). diag=${JSON.stringify(diag)}`
           );
         }
         return {
