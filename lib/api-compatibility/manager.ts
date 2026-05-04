@@ -736,11 +736,19 @@ export class APICompatibilityManager implements IAPICompatibilityManager {
         const eCode = (error as any)?.code;
         const isErr = error instanceof Error;
         const keys = (typeof error === 'object') ? Object.keys(error).slice(0, 8) : [];
+        // 🔧 FIX (2026-05 #17): Object.keys 只看到可枚举属性，Error 的 message/name/stack
+        //   都是不可枚举的，对真 Error 实例会返回 []。改用 getOwnPropertyNames 拿全部。
+        const ownProps = (typeof error === 'object')
+          ? Object.getOwnPropertyNames(error).slice(0, 12)
+          : [];
         const causeCtor = (error as any)?.cause?.constructor?.name;
         const stackHead = typeof (error as any)?.stack === 'string'
           ? (error as any).stack.slice(0, 160).replace(/\n/g, ' ')
           : '';
-        const inlineDump = `[v16 dump] ctor=${ctor || '?'} name=${eName || '?'} type=${eType || '?'} code=${eCode || '?'} isErr=${isErr} keys=[${keys.join(',')}] causeCtor=${causeCtor || '?'} stack=${stackHead}`;
+        // 🔧 FIX (2026-05 #17): 拼一个 createAPIError 自己的调用栈，定位是哪个 catch 在调它
+        const callerStack = new Error('createAPIError-invocation').stack || '';
+        const callerLine = callerStack.split('\n').slice(2, 4).join(' ').slice(0, 200).replace(/\s+/g, ' ');
+        const inlineDump = `[v17 dump] ctor=${ctor || '?'} name=${eName || '?'} type=${eType || '?'} code=${eCode || '?'} isErr=${isErr} keys=[${keys.join(',')}] ownProps=[${ownProps.join(',')}] causeCtor=${causeCtor || '?'} stack=${stackHead} caller=${callerLine}`;
         message = `${message} ${inlineDump}`;
       } catch {
         // 忽略 dump 失败本身

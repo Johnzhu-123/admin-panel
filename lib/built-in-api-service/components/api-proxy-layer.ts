@@ -332,11 +332,11 @@ export class APIProxyLayerImpl implements APIProxyLayer {
               : upstreamRawMessage;
 
             const finalMessage = (enhancedRawMessage && enhancedRawMessage !== 'Unknown error occurred')
-              ? `[v16] ${enhancedRawMessage}`
-              : `[v16] ${errorInfo.userMessage}`;
+              ? `[v17] ${enhancedRawMessage}`
+              : `[v17] ${errorInfo.userMessage}`;
 
             console.error(
-              '[built-in-proxy v16] upstream image generation failed:',
+              '[built-in-proxy v17] upstream image generation failed:',
               JSON.stringify({
                 serviceId: optimizedRequest.serviceId,
                 model: optimizedRequest.model,
