@@ -725,15 +725,39 @@ export class APICompatibilityManager implements IAPICompatibilityManager {
       message = error;
     }
 
-    return {
-      type: errorType,
-      code: code,
-      message: message,
-      provider: provider.id,
-      timestamp: new Date(),
-      request: request,
-      response: error
-    };
+    // 🔧 FIX (2026-05 #16): 当上面所有 duck typing 都没能榨出真消息时（即仍是
+    //   "Unknown error occurred" 默认值），把诊断 dump 直接拼进 message，让前端
+    //   响应里就能看到原始 error 的形态，免去 Render 日志依赖。
+    if (message === 'Unknown error occurred' && error) {
+      try {
+        const ctor = (error as any)?.constructor?.name;
+        const eName = (error as any)?.name;
+        const eType = (error as any)?.type;
+        const eCode = (error as any)?.code;
+        const isErr = error instanceof Error;
+        const keys = (typeof error === 'object') ? Object.keys(error).slice(0, 8) : [];
+        const causeCtor = (error as any)?.cause?.constructor?.name;
+        const stackHead = typeof (error as any)?.stack === 'string'
+          ? (error as any).stack.slice(0, 160).replace(/\n/g, ' ')
+          : '';
+        const inlineDump = `[v16 dump] ctor=${ctor || '?'} name=${eName || '?'} type=${eType || '?'} code=${eCode || '?'} isErr=${isErr} keys=[${keys.join(',')}] causeCtor=${causeCtor || '?'} stack=${stackHead}`;
+        message = `${message} ${inlineDump}`;
+      } catch {
+        // 忽略 dump 失败本身
+      }
+    }
+
+    // 🔧 FIX (2026-05 #16): 永远返回 APIErrorImpl 实例，让后续 instanceof 检查
+    //   一致通过，避免上层重复包装丢失结构。
+    return new APIErrorImpl(
+      errorType,
+      code,
+      message,
+      provider.id,
+      new Date(),
+      request,
+      error  // 原始 error 放到 response 字段
+    );
   }
 
   /**
