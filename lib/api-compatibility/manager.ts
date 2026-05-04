@@ -92,9 +92,16 @@ export class APICompatibilityManager implements IAPICompatibilityManager {
       // Attempt image generation with compatibility handling
       return await this.attemptImageGeneration(request, provider, config, context);
     } catch (error) {
-      const apiError = this.createAPIError(error, provider, request, startTime);
+      // 🔧 FIX (2026-05 #13 root cause of "An unexpected error occurred" 第 2 层):
+      //   旧实现一律调 createAPIError(error, ...) 重建 APIError，结果把
+      //   handleAPIError 已经塞进去的 status/statusText/bodyPreview/data 全部丢失，
+      //   message 也被覆盖成 "Unknown error occurred"（因为 createAPIError 默认值）。
+      //   只要 attemptImageGeneration 抛出的本身就是 APIErrorImpl，就直接保留结构。
+      const apiError = error instanceof APIErrorImpl
+        ? error
+        : this.createAPIError(error, provider, request, startTime);
       this.errorMonitor.recordError(apiError);
-      
+
       // Try fallback strategies
       try {
         const fallbackResult = await this.fallbackStrategy.executeFallback(request, apiError);
@@ -479,7 +486,7 @@ export class APICompatibilityManager implements IAPICompatibilityManager {
     provider: APIProvider,
     request: ImageGenerationRequest,
     context: RequestContext
-  ): Promise<APIError> {
+  ): Promise<APIErrorImpl> {
     // 🔧 FIX (2026-05 #12 root cause of "An unexpected error occurred"):
     //   旧实现只调用 extractErrorMessage(responseData)，对没有标准 error 字段的
     //   上游响应（HTML 错误页、网关返回 plain text、502 短文本等）一律返回
@@ -541,22 +548,22 @@ export class APICompatibilityManager implements IAPICompatibilityManager {
       errorType = 'format_error';
     }
 
-    const apiError: APIError = {
-      type: errorType,
-      code: errorCode,
-      message: errorMessage,
-      provider: provider.id,
-      timestamp: new Date(),
-      request: request,
-      // 🔧 FIX (2026-05 #12): 同时保留 status / statusText / 上游原始响应数据 /
-      // body 预览，方便上层再次提取并展示给前端，而不是仅传一个未结构化的 responseData。
-      response: {
+    const apiError = new APIErrorImpl(
+      errorType,
+      errorCode,
+      errorMessage,
+      provider.id,
+      new Date(),
+      request,
+      // 🔧 FIX (2026-05 #12 续): 保留 status / statusText / 上游原始响应数据 /
+      //   body 预览，方便上层再次提取并展示给前端。
+      {
         status: response.status,
         statusText: response.statusText,
         bodyPreview: rawTextPreview,
         data: responseData
       }
-    };
+    );
 
     context.previousErrors.push(apiError);
     return apiError;
@@ -645,20 +652,41 @@ export class APICompatibilityManager implements IAPICompatibilityManager {
     request: ImageGenerationRequest,
     startTime: Date
   ): APIError {
+    // 🔧 FIX (2026-05 #13): 防御式：如果传进来的就已经是结构化 APIError-like 对象
+    //   （有 type/code/message 三件套，或来自 handleAPIError 的旧 plain 对象），
+    //   直接保留，避免被 createAPIError 的默认值覆盖成 "Unknown error occurred"。
+    if (error && typeof error === 'object'
+        && typeof error.type === 'string'
+        && typeof error.message === 'string') {
+      return error as APIError;
+    }
+
     let errorType: ErrorType = 'unknown';
     let message = 'Unknown error occurred';
     let code = 'unknown';
 
     if (error instanceof Error) {
-      message = error.message;
-      
-      if (message.includes('timeout')) {
+      message = error.message || message;
+      // 🔧 FIX (2026-05 #13): undici / fetch 失败时真实 reason 在 error.cause 上，
+      //   把它拼到 message，便于 Render 日志和前端排查。
+      const cause: any = (error as any).cause;
+      if (cause && typeof cause === 'object') {
+        const causeMsg = typeof cause.message === 'string' ? cause.message : '';
+        const causeCode = typeof cause.code === 'string' ? cause.code : '';
+        if (causeMsg || causeCode) {
+          message = `${message} | cause=${[causeCode, causeMsg].filter(Boolean).join(' ')}`;
+        }
+      }
+      if (message.includes('timeout') || message.includes('UND_ERR_HEADERS_TIMEOUT')) {
         errorType = 'network_error';
         code = 'timeout';
-      } else if (message.includes('fetch') || message.includes('network')) {
+      } else if (message.includes('fetch') || message.includes('network')
+                 || message.includes('ECONNRESET') || message.includes('ENOTFOUND')) {
         errorType = 'network_error';
         code = 'network_error';
       }
+    } else if (typeof error === 'string') {
+      message = error;
     }
 
     return {
