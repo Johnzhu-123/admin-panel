@@ -557,10 +557,282 @@ export class APIProxyLayerImpl implements APIProxyLayer {
   }
 
   /**
-   * Proxy request through compatibility system
-   * 🔧 ENHANCED: 传递userId用于请求队列管理
+   * 🔧 FIX (2026-05 #20 ARCHITECTURAL ROOT-CAUSE FIX):
+   *   旧路径走 7 层包装（route → service-manager → proxy-layer →
+   *   compat-integration → compat-manager → fallback-strategy → queuedFetch）。
+   *   每层都有自己的 try/catch，错误经层层重写，最终能让一个真实 Error 蜕变成
+   *   字面量 `{}`（v17 dump 实锤：`ctor=Object isErr=false keys=[] ownProps=[]`）。
+   *   自建模式只走 1 层 fetch 就成功 —— 既然上游、apiKey、baseUrl 完全相同，
+   *   内置模式直接复用同一逻辑必然成功。
+   *
+   *   新路径：fast-path 直接 fetch OpenAI 兼容上游，仅 Gemini Business2API
+   *   等特殊 provider 才走旧 compat 链。每个 step 都用专门的 try/catch 拼出
+   *   step 标签的错误消息，杜绝 `{}` 透漏。
    */
   private async proxyThroughCompatibilitySystem(
+    request: ProxyImageRequest,
+    serviceConfig: BuiltInServiceConfig,
+    signal: AbortSignal
+  ): Promise<any> {
+    // Pre-flight: serviceConfig must have baseUrl + apiKey
+    const baseUrlRaw = (serviceConfig.baseUrl || '').trim();
+    if (!baseUrlRaw) {
+      throw new BuiltInServiceError(
+        BuiltInServiceErrorCodes.INVALID_CONFIG,
+        '[v20 fastpath] serviceConfig.baseUrl is empty — admin 面板该用户尚未配置上游 URL',
+        { upstream: { reason: 'empty_base_url', serviceId: request.serviceId } }
+      );
+    }
+    if (!serviceConfig.apiKey) {
+      throw new BuiltInServiceError(
+        BuiltInServiceErrorCodes.INVALID_CONFIG,
+        '[v20 fastpath] serviceConfig.apiKey is empty — admin 面板该用户尚未配置 API key',
+        { upstream: { reason: 'empty_api_key', serviceId: request.serviceId } }
+      );
+    }
+
+    // Special providers go through legacy compat path
+    if (this.isLegacyCompatProvider(baseUrlRaw, serviceConfig.provider)) {
+      return this.proxyViaCompatibilityChain_LEGACY(request, serviceConfig, signal);
+    }
+
+    // FAST PATH: direct OpenAI-compatible fetch
+    return this.proxyDirectOpenAI(request, serviceConfig, signal);
+  }
+
+  /**
+   * 🔧 NEW (2026-05 #20): 检测是否需要走旧 compat 链（仅 Gemini Business2API
+   *   等特殊 provider）。其它一律 fast-path 直连。
+   */
+  private isLegacyCompatProvider(baseUrl: string, provider?: string): boolean {
+    const url = (baseUrl || '').toLowerCase();
+    const p = (provider || '').toLowerCase();
+    return /business2api/.test(url) || p === 'gemini-business2api';
+  }
+
+  /**
+   * 🔧 FIX (2026-05 #20): 直连 OpenAI 兼容上游，每步显式 try/catch。
+   */
+  private async proxyDirectOpenAI(
+    request: ProxyImageRequest,
+    serviceConfig: BuiltInServiceConfig,
+    signal: AbortSignal
+  ): Promise<any> {
+    const baseUrl = serviceConfig.baseUrl.trim().replace(/\/+$/, '');
+    const apiKey = serviceConfig.apiKey;
+
+    // Step 1: build URL — match self-hosted mode's normalizeOpenAiBaseUrl behaviour.
+    let url: string;
+    try {
+      // baseUrl 形态：".../v1" / ".../v1beta" / ".../v1alpha" / 无 v1
+      const hasV1 = /\/v1(?:beta|alpha)?$/i.test(baseUrl);
+      url = hasV1 ? `${baseUrl}/images/generations` : `${baseUrl}/v1/images/generations`;
+    } catch (e) {
+      throw new BuiltInServiceError(
+        BuiltInServiceErrorCodes.INVALID_CONFIG,
+        `[v20 fastpath:url] failed to build URL from baseUrl=${baseUrl}: ${this.describeErr(e)}`,
+        { upstream: { baseUrl, reason: 'url_build_fail' } }
+      );
+    }
+
+    // Step 2: sanitize body
+    const sanitizedSize = this.sanitizeImageSize(request.size);
+    const sanitizedQuality = this.sanitizeQuality(request.quality);
+    const requestBody: Record<string, any> = {
+      model: request.model || serviceConfig.model,
+      prompt: request.prompt,
+      size: sanitizedSize,
+      response_format: request.response_format || 'b64_json',
+      n: request.n || 1,
+      ...(sanitizedQuality ? { quality: sanitizedQuality } : {})
+    };
+
+    // Step 3: send fetch
+    console.log('[built-in-fastpath v20] →', JSON.stringify({
+      url,
+      provider: serviceConfig.provider,
+      model: requestBody.model,
+      size: requestBody.size,
+      promptLen: (request.prompt || '').length,
+      apiKeyHead: apiKey ? apiKey.slice(0, 6) + '***' : '(missing)'
+    }));
+
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(requestBody),
+        signal
+      });
+    } catch (fetchErr) {
+      const e = fetchErr as any;
+      const cause = e?.cause;
+      const causeBits: string[] = [];
+      if (cause?.code) causeBits.push(`cause.code=${cause.code}`);
+      if (typeof cause?.message === 'string') causeBits.push(`cause.message=${cause.message.slice(0, 200)}`);
+      throw new BuiltInServiceError(
+        BuiltInServiceErrorCodes.SERVICE_UNAVAILABLE,
+        `[v20 fastpath:fetch] network failure → ${url} | ${this.describeErr(fetchErr)}${causeBits.length ? ' | ' + causeBits.join(' ') : ''}`,
+        { upstream: { url, errorName: e?.name, code: e?.code, cause: causeBits.join(' ') } }
+      );
+    }
+
+    // Step 4: read body
+    let responseText = '';
+    try {
+      responseText = await response.text();
+    } catch (textErr) {
+      throw new BuiltInServiceError(
+        BuiltInServiceErrorCodes.PROXY_ERROR,
+        `[v20 fastpath:body] failed to read upstream body (status=${response.status}): ${this.describeErr(textErr)}`,
+        { upstream: { url, status: response.status, statusText: response.statusText } }
+      );
+    }
+
+    // Step 5: handle non-2xx
+    if (!response.ok) {
+      let parsedErr: any = null;
+      try { parsedErr = JSON.parse(responseText); } catch { /* ignore */ }
+      const upstreamMsg =
+        (typeof parsedErr?.error?.message === 'string' && parsedErr.error.message) ||
+        (typeof parsedErr?.error === 'string' && parsedErr.error) ||
+        (typeof parsedErr?.message === 'string' && parsedErr.message) ||
+        responseText.slice(0, 300) ||
+        '(empty body)';
+      console.error('[built-in-fastpath v20] upstream error:', JSON.stringify({
+        url,
+        status: response.status,
+        statusText: response.statusText,
+        upstreamMsg: typeof upstreamMsg === 'string' ? upstreamMsg : JSON.stringify(upstreamMsg)
+      }));
+      const errCode =
+        response.status === 429 ? BuiltInServiceErrorCodes.RATE_LIMIT_EXCEEDED :
+        response.status === 401 || response.status === 403 ? BuiltInServiceErrorCodes.PERMISSION_DENIED :
+        BuiltInServiceErrorCodes.PROXY_ERROR;
+      throw new BuiltInServiceError(
+        errCode,
+        `[v20 fastpath:upstream] ${response.status} ${response.statusText || ''} → ${typeof upstreamMsg === 'string' ? upstreamMsg : JSON.stringify(upstreamMsg)}`,
+        {
+          upstream: {
+            url,
+            status: response.status,
+            statusText: response.statusText,
+            bodyPreview: responseText.slice(0, 500)
+          }
+        }
+      );
+    }
+
+    // Step 6: parse JSON
+    let responseData: any;
+    try {
+      responseData = JSON.parse(responseText);
+    } catch (parseErr) {
+      throw new BuiltInServiceError(
+        BuiltInServiceErrorCodes.PROXY_ERROR,
+        `[v20 fastpath:parse] upstream returned non-JSON (status=${response.status}): ${responseText.slice(0, 300)}`,
+        { upstream: { url, status: response.status, bodyPreview: responseText.slice(0, 500) } }
+      );
+    }
+
+    // Step 7: extract image data — supports both OpenAI shape (data[0].b64_json/url) and direct shapes
+    let dataItem: any = null;
+    if (Array.isArray(responseData?.data) && responseData.data.length > 0) {
+      dataItem = responseData.data[0];
+    } else if (responseData && typeof responseData === 'object'
+        && (responseData.b64_json || responseData.url || responseData.image || responseData.b64)) {
+      dataItem = responseData;
+    }
+
+    if (!dataItem) {
+      const respKeys = responseData && typeof responseData === 'object' ? Object.keys(responseData).slice(0, 10) : [];
+      const upstreamErr =
+        (typeof responseData?.error?.message === 'string' && responseData.error.message) ||
+        (typeof responseData?.error === 'string' && responseData.error) ||
+        (typeof responseData?.message === 'string' && responseData.message) || '';
+      throw new BuiltInServiceError(
+        BuiltInServiceErrorCodes.PROXY_ERROR,
+        `[v20 fastpath:extract] upstream 200 但响应中无 data 数组 | respKeys=[${respKeys.join(',')}] | upstreamMsg=${upstreamErr || '(none)'}`,
+        { upstream: { url, status: response.status, bodyPreview: responseText.slice(0, 500), responseKeys: respKeys } }
+      );
+    }
+
+    const rawB64 =
+      (typeof dataItem.b64_json === 'string' && dataItem.b64_json) ||
+      (typeof dataItem.b64 === 'string' && dataItem.b64) ||
+      (typeof dataItem.base64 === 'string' && dataItem.base64) ||
+      (typeof dataItem.image === 'string' && dataItem.image) ||
+      '';
+    const rawUrl =
+      (typeof dataItem.url === 'string' && dataItem.url) ||
+      (typeof dataItem.image_url === 'string' && dataItem.image_url) ||
+      (typeof dataItem.link === 'string' && dataItem.link) ||
+      '';
+    const rawValue = rawB64 || rawUrl || '';
+    if (!rawValue) {
+      throw new BuiltInServiceError(
+        BuiltInServiceErrorCodes.PROXY_ERROR,
+        `[v20 fastpath:extract] data[0] 既没有 b64_json/b64/base64/image，也没有 url/image_url/link | dataKeys=[${Object.keys(dataItem).join(',')}]`,
+        { upstream: { url, dataItemKeys: Object.keys(dataItem) } }
+      );
+    }
+
+    // Step 8: coerce to base64 (handles URL fetch + magic-byte validation)
+    const imageBase64 = await coerceImageValueToBase64(rawValue);
+    if (!imageBase64) {
+      throw new BuiltInServiceError(
+        BuiltInServiceErrorCodes.PROXY_ERROR,
+        `[v20 fastpath:coerce] coerceImageValueToBase64 失败（上游 b64 invalid 或 URL 抓取失败 / 非图片内容）| rawB64Len=${rawB64.length} rawUrlHead=${rawUrl.slice(0, 100)}`,
+        { upstream: { hasB64: !!rawB64, hasUrl: !!rawUrl, b64Head: rawB64.slice(0, 80), urlHead: rawUrl.slice(0, 200) } }
+      );
+    }
+
+    return {
+      imageBase64,
+      revised_prompt: dataItem.revised_prompt,
+      metadata: {
+        serviceId: request.serviceId,
+        provider: serviceConfig.provider,
+        model: request.model || serviceConfig.model,
+        processingTime: 0,
+        builtInService: true,
+        fastPath: 'v20'
+      }
+    };
+  }
+
+  /**
+   * 🔧 NEW (2026-05 #20): 把任意异常描述成可读字符串，永远不返回空。
+   */
+  private describeErr(e: any): string {
+    if (e == null) return '(thrown null/undefined)';
+    if (e instanceof Error) {
+      const name = e.name || 'Error';
+      const msg = e.message || '(no message)';
+      return `${name}: ${msg}`;
+    }
+    if (typeof e === 'string') return e;
+    if (typeof e === 'object') {
+      const ctor = (e as any).constructor?.name || 'Object';
+      const ownProps = Object.getOwnPropertyNames(e);
+      if (ownProps.length === 0) return `(empty ${ctor} thrown)`;
+      try {
+        return `${ctor} ownProps=[${ownProps.slice(0, 8).join(',')}] body=${JSON.stringify(e).slice(0, 240)}`;
+      } catch {
+        return `${ctor} (unserializable)`;
+      }
+    }
+    return `${typeof e}: ${String(e)}`;
+  }
+
+  /**
+   * 🔧 LEGACY (2026-05 #20): 保留旧 compat 链作为特殊 provider（Gemini Business2API）的兜底。
+   */
+  private async proxyViaCompatibilityChain_LEGACY(
     request: ProxyImageRequest,
     serviceConfig: BuiltInServiceConfig,
     signal: AbortSignal
