@@ -1304,24 +1304,52 @@ Important: The mask indicates where to make changes. All other areas should rema
         //      落到 "Missing apiKey or prompt" 的笼统报错；
         //   3) 当用户自带 apiKey（混合模式）时，仍允许 fallback 到旧路径，但仍要把
         //      原错误打到日志里。
+        //
+        // 🔧 FIX (2026-05 #12 续): 旧错误信息一律是笼统的 "An unexpected error occurred"，
+        //   是因为 BuiltInServiceError.message 在 api-proxy-layer 里被 errorInfo.userMessage
+        //   覆盖。现在那一层已经修好，message 会带真实上游消息；同时 details.upstream 里
+        //   带有 status / statusText / bodyPreview。这里把 details 同时透给前端，
+        //   帮助下一步排障。
         const errMsg =
           error instanceof Error ? error.message : String(error);
         const errStack = error instanceof Error ? error.stack : undefined;
+        const errDetails =
+          error && typeof error === 'object' && 'details' in (error as any)
+            ? (error as any).details
+            : undefined;
+        const errCode =
+          error && typeof error === 'object' && 'code' in (error as any)
+            ? (error as any).code
+            : undefined;
         console.error(
           "[built-in-image] proxyImageGeneration 抛出，原始诊断:",
           errMsg,
+          errCode ? `code=${errCode}` : "",
+          errDetails ? `\ndetails=${JSON.stringify(errDetails)}` : "",
           errStack ? `\nstack: ${errStack}` : ""
         );
 
         const userHasOwnApiKey = !!(body.apiKey && String(body.apiKey).trim());
         if (!userHasOwnApiKey) {
           // 用户明确选了内置服务，没自备 key，fallback 也救不了 —— 直接把错误透传
+          // 用 upstream.status 作为 HTTP 状态码（如果可用），让前端能区分 502 vs 429 vs 401。
+          const upstreamStatus =
+            errDetails && typeof errDetails === 'object' && errDetails.upstream
+              ? errDetails.upstream.status
+              : undefined;
+          const httpStatus =
+            typeof upstreamStatus === 'number' && upstreamStatus >= 400 && upstreamStatus < 600
+              ? upstreamStatus
+              : 502;
           return NextResponse.json(
             {
               error: errMsg || "内置服务调用失败",
-              source: "built-in-service"
+              source: "built-in-service",
+              code: errCode,
+              upstream: errDetails && typeof errDetails === 'object' ? errDetails.upstream : undefined,
+              suggestions: errDetails && typeof errDetails === 'object' ? errDetails.suggestions : undefined
             },
-            { status: 502, headers: noStoreHeaders() }
+            { status: httpStatus, headers: noStoreHeaders() }
           );
         }
         // 否则继续 fallback 到既有路径（用用户自带 apiKey）

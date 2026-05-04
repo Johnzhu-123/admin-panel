@@ -480,7 +480,19 @@ export class APICompatibilityManager implements IAPICompatibilityManager {
     request: ImageGenerationRequest,
     context: RequestContext
   ): Promise<APIError> {
-    const errorMessage = this.extractErrorMessage(responseData);
+    // 🔧 FIX (2026-05 #12 root cause of "An unexpected error occurred"):
+    //   旧实现只调用 extractErrorMessage(responseData)，对没有标准 error 字段的
+    //   上游响应（HTML 错误页、网关返回 plain text、502 短文本等）一律返回
+    //   "Unknown error"，errorType 落到 'unknown'，再被 handleCompatibilityError
+    //   的 default 分支替换成 "An unexpected error occurred"。链路上的真实状态码
+    //   和响应体被三层吞掉，前端只能看到笼统提示。
+    //   现在把 status/statusText/body preview 拼进 message，并在 response 字段里
+    //   保留原始 raw 体，下游错误包装层 / route.ts 可以读取展示。
+    const rawTextPreview = this.makeBodyPreview(responseData);
+    const extracted = this.extractErrorMessage(responseData);
+    const errorMessage = (extracted && extracted !== 'Unknown error')
+      ? `${response.status} ${response.statusText || ''} | ${extracted}`.trim()
+      : `${response.status} ${response.statusText || 'upstream error'} | body=${rawTextPreview || '(empty)'}`;
     const errorCode = this.extractErrorCode(responseData);
     
     // Detect error type
@@ -536,7 +548,14 @@ export class APICompatibilityManager implements IAPICompatibilityManager {
       provider: provider.id,
       timestamp: new Date(),
       request: request,
-      response: responseData
+      // 🔧 FIX (2026-05 #12): 同时保留 status / statusText / 上游原始响应数据 /
+      // body 预览，方便上层再次提取并展示给前端，而不是仅传一个未结构化的 responseData。
+      response: {
+        status: response.status,
+        statusText: response.statusText,
+        bodyPreview: rawTextPreview,
+        data: responseData
+      }
     };
 
     context.previousErrors.push(apiError);
@@ -663,6 +682,27 @@ export class APICompatibilityManager implements IAPICompatibilityManager {
     if (typeof data?.message === 'string') return data.message;
     if (typeof data?.detail === 'string') return data.detail;
     return 'Unknown error';
+  }
+
+  /**
+   * 🔧 NEW (2026-05 #12): 生成上游响应体的可读预览，用来在 error.message 里
+   *   保留诊断信息。优先用 raw 文本（HTML 错误页 / plain text），其次 JSON 序列化。
+   *   截断到 240 字符以避免日志爆炸。
+   */
+  private makeBodyPreview(data: any): string {
+    if (data == null) return '';
+    if (typeof data === 'string') {
+      return data.length > 240 ? `${data.slice(0, 240)}...` : data;
+    }
+    if (typeof data?.raw === 'string') {
+      return data.raw.length > 240 ? `${data.raw.slice(0, 240)}...` : data.raw;
+    }
+    try {
+      const s = JSON.stringify(data);
+      return s.length > 240 ? `${s.slice(0, 240)}...` : s;
+    } catch {
+      return '[unserializable response]';
+    }
   }
 
   /**

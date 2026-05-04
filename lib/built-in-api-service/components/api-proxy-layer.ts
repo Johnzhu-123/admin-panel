@@ -22,6 +22,7 @@ import {
   initializeCompatibilitySystem
 } from '../../api-compatibility/integration';
 import { coerceImageValueToBase64 } from '../../image-generation/shared-utils';
+import { pickOpenAiImageSize } from '../../ai';
 import { recordFailureLog } from '../../diagnostics';
 import { TIMEOUTS, RETRY_CONFIG, SECURITY_SETTINGS } from '../config';
 import { getPerformanceMonitor } from './performance-monitor';
@@ -292,13 +293,56 @@ export class APIProxyLayerImpl implements APIProxyLayer {
             throw error;
           }
 
-          // Handle compatibility system errors
+          // 🔧 FIX (2026-05 #12 root cause of "An unexpected error occurred"):
+          //   旧实现一律调 handleCompatibilityError(error) 然后用 errorInfo.userMessage
+          //   作为 BuiltInServiceError.message。errorInfo.userMessage 在 unknown
+          //   分支上就是 "An unexpected error occurred. Please try again."，把上游真实
+          //   状态码 / 错误体彻底吞了。
+          //   新策略：
+          //     1) 优先把 APIError（含 status / bodyPreview / 真实 message）的诊断
+          //        信息拼到 BuiltInServiceError.message，前端才看得到上游原因。
+          //     2) 同时把结构化诊断放到 details.upstream，route.ts 可以直接透出。
+          //     3) 仍然调用 handleCompatibilityError 收集建议，但作为辅助而非覆盖。
           if (error && typeof error === 'object' && 'message' in error) {
             const errorInfo = handleCompatibilityError(error);
+            const apiErr = error as any;
+            const upstreamStatus = apiErr?.response?.status;
+            const upstreamStatusText = apiErr?.response?.statusText;
+            const upstreamBodyPreview = apiErr?.response?.bodyPreview;
+            const upstreamRawMessage = typeof apiErr?.message === 'string' ? apiErr.message : '';
+
+            // Pick the best-available message. 真实上游消息 > userMessage 兜底。
+            const finalMessage = upstreamRawMessage && upstreamRawMessage !== 'Unknown error occurred'
+              ? upstreamRawMessage
+              : errorInfo.userMessage;
+
+            console.error(
+              '[built-in-proxy] upstream image generation failed:',
+              JSON.stringify({
+                serviceId: optimizedRequest.serviceId,
+                model: optimizedRequest.model,
+                size: optimizedRequest.size,
+                upstreamStatus,
+                upstreamStatusText,
+                upstreamBodyPreview,
+                rawMessage: upstreamRawMessage,
+                friendlyMessage: errorInfo.userMessage
+              })
+            );
+
             throw new BuiltInServiceError(
               BuiltInServiceErrorCodes.PROXY_ERROR,
-              errorInfo.userMessage,
-              { technicalDetails: errorInfo.technicalDetails, suggestions: errorInfo.suggestions }
+              finalMessage,
+              {
+                technicalDetails: errorInfo.technicalDetails,
+                suggestions: errorInfo.suggestions,
+                upstream: {
+                  status: upstreamStatus,
+                  statusText: upstreamStatusText,
+                  bodyPreview: upstreamBodyPreview,
+                  rawMessage: upstreamRawMessage
+                }
+              }
             );
           }
 
@@ -502,7 +546,19 @@ export class APIProxyLayerImpl implements APIProxyLayer {
     try {
       // Map built-in service to compatibility system parameters
       const authType = this.getAuthTypeForProvider(serviceConfig.provider, serviceConfig.baseUrl);
-      
+
+      // 🔧 FIX (2026-05 #12): 桌面端会把 aspectRatio（"16:9"）或 Gemini 风格尺寸
+      //   ("1K"/"2K"/"auto") 直接当作 size 透传过来，OpenAI 兼容上游（gpt-image-2 等）
+      //   收到非 \d+x\d+ 的 size 会直接 502/400，且很多上游错误体没有标准 error 字段，
+      //   就会被当成 "Unknown error" 包成 "An unexpected error occurred"。
+      //   这里在调用兼容层之前先把 size 规范化成 OpenAI 风格 WxH。
+      const sanitizedSize = this.sanitizeImageSize(request.size);
+
+      // 🔧 FIX (2026-05 #12): quality 是少数上游会拒绝的字段（Stability/Replicate/部分
+      //   自建中转），桌面端默认不传，前端也很少显式传。仅当用户明确给出 "standard"/"hd"
+      //   时才向上游传递，其它值丢弃避免触发 400。
+      const sanitizedQuality = this.sanitizeQuality(request.quality);
+
       // Use the compatibility system to handle the request
       const response = await generateImageWithCompatibility(
         request.prompt,
@@ -510,8 +566,8 @@ export class APIProxyLayerImpl implements APIProxyLayer {
         serviceConfig.baseUrl,
         {
           model: request.model || serviceConfig.model,
-          size: request.size,
-          quality: request.quality,
+          size: sanitizedSize,
+          ...(sanitizedQuality ? { quality: sanitizedQuality } : {}),
           response_format: request.response_format || 'b64_json',
           n: request.n || 1,
           authType,
@@ -591,6 +647,37 @@ export class APIProxyLayerImpl implements APIProxyLayer {
       default:
         return 'bearer';
     }
+  }
+
+  /**
+   * 🔧 NEW (2026-05 #12): 把任意 size 输入归一化成 OpenAI 兼容的 WxH 字符串。
+   *   桌面端 / 桥接层会传：
+   *     - "1792x1024" / "1024x1024" / "2048x1152"  → 直接保留
+   *     - "16:9" / "9:16" / "3:4" / "1:1"          → pickOpenAiImageSize 转换
+   *     - "1K" / "2K" / "auto" / undefined         → 落到默认 1024x1024
+   *   注意：保留 4K 以上自定义分辨率（gpt-image-2 实测支持 2048x1152）。
+   */
+  private sanitizeImageSize(input?: string): string {
+    const raw = (input || '').trim();
+    if (!raw) return pickOpenAiImageSize();
+    if (/^\d+x\d+$/i.test(raw)) return raw;
+    if (/^\d+:\d+$/.test(raw)) return pickOpenAiImageSize(raw);
+    // "1K" / "2K" / "auto" / 其它 Gemini 风格 → 用默认 1024x1024，避免上游 400。
+    return pickOpenAiImageSize();
+  }
+
+  /**
+   * 🔧 NEW (2026-05 #12): 仅放行已知可被 OpenAI/兼容上游识别的 quality 值。
+   *   gpt-image-2 等模型对未声明的 quality 直接 400；多数自建中转把 quality
+   *   忽略但少数会报 "unknown parameter"。统一在这里过滤，避免风险参数。
+   */
+  private sanitizeQuality(input?: string): string | undefined {
+    const raw = (input || '').trim().toLowerCase();
+    if (!raw) return undefined;
+    if (raw === 'standard' || raw === 'hd' || raw === 'high' || raw === 'low' || raw === 'medium') {
+      return raw;
+    }
+    return undefined;
   }
 
   /**
