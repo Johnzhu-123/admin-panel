@@ -326,7 +326,7 @@ export default function AdminDashboard() {
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-10 mt-6">
           <Card className="bg-slate-800/50 border-slate-700/70 backdrop-blur-sm hover:bg-slate-800/70 transition-all duration-200 shadow-lg hover:shadow-xl hover:-translate-y-0.5">
             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-              <CardTitle className="text-sm font-medium text-slate-300">总用户数</CardTitle>
+              <CardTitle className="text-sm font-medium text-slate-300">授权用户数</CardTitle>
               <div className="p-2 bg-blue-500/20 rounded-lg">
                 <Users className="h-4 w-4 text-blue-400" />
               </div>
@@ -406,7 +406,7 @@ export default function AdminDashboard() {
                   className="flex items-center gap-2 py-4 px-6 data-[state=active]:bg-slate-700/50 data-[state=active]:text-white text-slate-400 hover:text-white transition-all duration-200 rounded-none border-b-2 border-transparent data-[state=active]:border-blue-500"
                 >
                   <Users className="h-4 w-4" />
-                  用户管理
+                  授权用户管理
                 </TabsTrigger>
                 <TabsTrigger
                   value="analytics"

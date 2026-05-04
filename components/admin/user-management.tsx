@@ -596,10 +596,7 @@ export function AdminUserManagement() {
         <CardHeader>
           <div className="flex items-center justify-between">
             <div>
-              <CardTitle className="text-white text-xl">用户管理</CardTitle>
-              <CardDescription className="text-slate-400">
-                管理授权用户的权限和配额设置
-              </CardDescription>
+              <CardTitle className="text-white text-xl">授权用户管理</CardTitle>
             </div>
             <div className="flex items-center gap-2">
               <Dialog open={showClerkUsersDialog} onOpenChange={setShowClerkUsersDialog}>

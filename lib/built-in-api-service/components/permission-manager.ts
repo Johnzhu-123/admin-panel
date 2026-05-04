@@ -131,6 +131,22 @@ export class PermissionManagerImpl implements PermissionManager {
       this.logChange('remove_user', userId, { removedUser });
       await this.savePermissionConfig();
 
+      // 🔧 FIX (2026-05 #23): savePermissionConfig 只对剩余用户做 upsert，从不
+      //   DELETE 已被踢出列表的行；导致 serverless 容器冷启时
+      //   loadUsersFromDatabase 把"已删除"用户全部拉回，表现为"重新部署后被删除
+      //   的授权用户自动回填，总用户数只加不减"。
+      //
+      //   这里显式调一次 DB 行级 DELETE 兜底；deleteUserFromDatabase 内部已有
+      //   try/catch + ensureAuthorizedUsersTable，幂等且不会因表不存在而抛。
+      try {
+        await deleteUserFromDatabase(userId);
+        console.log(`[PermissionManager] Hard-deleted user from DB: ${userId}`);
+      } catch (dbError) {
+        // DB 删除失败仅记录，不抛；内存/文件已移除，下次 savePermissionConfig
+        // 仍会保持剩余列表正确。但 admin 表里会留下孤立行，需运维介入。
+        console.error(`[PermissionManager] DB hard-delete failed for ${userId}:`, dbError);
+      }
+
       console.log(`Removed authorized user: ${userId}`);
     } catch (error) {
       console.error('Error removing authorized user:', error);
