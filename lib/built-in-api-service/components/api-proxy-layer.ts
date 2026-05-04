@@ -332,11 +332,11 @@ export class APIProxyLayerImpl implements APIProxyLayer {
               : upstreamRawMessage;
 
             const finalMessage = (enhancedRawMessage && enhancedRawMessage !== 'Unknown error occurred')
-              ? `[v17] ${enhancedRawMessage}`
-              : `[v17] ${errorInfo.userMessage}`;
+              ? `[v18] ${enhancedRawMessage}`
+              : `[v18] ${errorInfo.userMessage}`;
 
             console.error(
-              '[built-in-proxy v17] upstream image generation failed:',
+              '[built-in-proxy v18] upstream image generation failed:',
               JSON.stringify({
                 serviceId: optimizedRequest.serviceId,
                 model: optimizedRequest.model,
@@ -643,7 +643,27 @@ export class APIProxyLayerImpl implements APIProxyLayer {
         };
       }
 
-      throw new Error('No image data in response');
+      // 🔧 FIX (2026-05 #18): 上游 200 返回但 images 为空（最常见：模型名错 /
+      //   gateway 把错误塞进 response.error 但 status=200 / "No data" 文本）。
+      //   旧实现只抛笼统 'No image data in response'，把 response.error.message
+      //   和原始响应都吞了。改成把诊断 dump 拼进 message：
+      //   - upstreamError: response.error.message 优先
+      //   - keys / shape: 上游响应顶层字段，便于识别 OpenAI / Stability / 自建 中转
+      //   - body 短预览：截断 200 字
+      const upstreamErrMsg = (response as any)?.error?.message
+        || (typeof (response as any)?.error === 'string' ? (response as any).error : '')
+        || '';
+      const respKeys = response && typeof response === 'object' ? Object.keys(response).slice(0, 8) : [];
+      let bodyPreview = '';
+      try {
+        const s = JSON.stringify(response);
+        bodyPreview = s.length > 240 ? `${s.slice(0, 240)}...` : s;
+      } catch {
+        bodyPreview = '[unserializable]';
+      }
+      const noImgDiag = `upstreamError=${upstreamErrMsg || '(none)'} respKeys=[${respKeys.join(',')}] body=${bodyPreview}`;
+      console.error('[built-in-proxy v18] No image data — upstream raw:', noImgDiag);
+      throw new Error(`No image data in response | ${noImgDiag}`);
     } catch (error) {
       console.error('Error proxying through compatibility system:', error);
       throw error;
