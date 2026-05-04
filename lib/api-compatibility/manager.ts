@@ -531,15 +531,15 @@ export class APICompatibilityManager implements IAPICompatibilityManager {
           });
           
           // If successful, return the result wrapped in a response
-          return {
-            type: 'content_policy' as ErrorType,
-            code: 'content_policy_resolved',
-            message: `Content policy error resolved using safe prompt: "${analysis.modifiedPrompt}"`,
-            provider: provider.id,
-            timestamp: new Date(),
-            request: request,
-            response: result
-          } as APIError;
+          return new APIErrorImpl(
+            'content_policy' as ErrorType,
+            'content_policy_resolved',
+            `Content policy error resolved using safe prompt: "${analysis.modifiedPrompt}"`,
+            provider.id,
+            new Date(),
+            request,
+            result
+          );
         }
       } catch (retryError) {
         // If retry fails, continue with original error
