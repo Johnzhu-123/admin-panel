@@ -310,14 +310,33 @@ export class APIProxyLayerImpl implements APIProxyLayer {
             const upstreamStatusText = apiErr?.response?.statusText;
             const upstreamBodyPreview = apiErr?.response?.bodyPreview;
             const upstreamRawMessage = typeof apiErr?.message === 'string' ? apiErr.message : '';
+            const upstreamCause = apiErr?.cause || apiErr?.response?.cause;
+            const upstreamErrorName = apiErr?.name || apiErr?.constructor?.name;
 
             // Pick the best-available message. 真实上游消息 > userMessage 兜底。
-            const finalMessage = upstreamRawMessage && upstreamRawMessage !== 'Unknown error occurred'
-              ? upstreamRawMessage
-              : errorInfo.userMessage;
+            // 🔧 FIX (2026-05 #14): rawMessage 即便等于 "Unknown error occurred" 也尽量从
+            //   error 自身的别的字段（name/type/code/cause）拼出可诊断的字符串，避免再次落到
+            //   笼统提示。
+            const fallbackHints: string[] = [];
+            if (upstreamErrorName && upstreamErrorName !== 'Error') fallbackHints.push(`name=${upstreamErrorName}`);
+            if (apiErr?.type) fallbackHints.push(`type=${apiErr.type}`);
+            if (apiErr?.code) fallbackHints.push(`code=${apiErr.code}`);
+            if (typeof upstreamStatus === 'number') fallbackHints.push(`status=${upstreamStatus}`);
+            if (upstreamCause) {
+              const causeMsg = typeof (upstreamCause as any)?.message === 'string' ? (upstreamCause as any).message : '';
+              const causeCode = typeof (upstreamCause as any)?.code === 'string' ? (upstreamCause as any).code : '';
+              if (causeMsg || causeCode) fallbackHints.push(`cause=${[causeCode, causeMsg].filter(Boolean).join(' ')}`);
+            }
+            const enhancedRawMessage = fallbackHints.length
+              ? `${upstreamRawMessage} | ${fallbackHints.join(' ')}`
+              : upstreamRawMessage;
+
+            const finalMessage = (enhancedRawMessage && enhancedRawMessage !== 'Unknown error occurred')
+              ? `[v14] ${enhancedRawMessage}`
+              : `[v14] ${errorInfo.userMessage}`;
 
             console.error(
-              '[built-in-proxy] upstream image generation failed:',
+              '[built-in-proxy v14] upstream image generation failed:',
               JSON.stringify({
                 serviceId: optimizedRequest.serviceId,
                 model: optimizedRequest.model,
@@ -336,11 +355,14 @@ export class APIProxyLayerImpl implements APIProxyLayer {
               {
                 technicalDetails: errorInfo.technicalDetails,
                 suggestions: errorInfo.suggestions,
+                version: 'v14',
                 upstream: {
                   status: upstreamStatus,
                   statusText: upstreamStatusText,
                   bodyPreview: upstreamBodyPreview,
-                  rawMessage: upstreamRawMessage
+                  rawMessage: upstreamRawMessage,
+                  enhancedRawMessage,
+                  hints: fallbackHints
                 }
               }
             );
