@@ -1,0 +1,32 @@
+feat(admin): v22 — 服务清单与桌面端 1:1 对齐（5 tabs / 6 categories / auto-probe / vision 独立）
+
+BACKGROUND:
+v21 之前 admin-panel 把每个 category 切成 2-3 个子任务（如 multimodal=音频理解+通用多模态+视觉理解、image=generation+understanding+edit），
+但桌面端「API 设置」面板每个 tab 只调用 1 个 renderCategoryCatalogEditor（image tab 例外，调 2 次：image+vision）。
+这导致：(1) 管理员要在 admin 入库 3 次但默认预设只能选 1 个；(2) 桌面端按 category 单维度读取时，模型下拉缺料/混杂。
+
+CHANGES:
+1. lib/built-in-api-service/db.ts
+   - BUILT_IN_SERVICE_CATEGORIES 新增 'vision'（图像理解 AI），与桌面端 ApiModelCategory 完全对齐
+   - SUBTASK_PRESETS 全部简化为单 default 子任务（不再有 generation/understanding/edit/audio_understanding 等多桶）
+   - 新增 legacy migration：旧的 3-子任务数据按 baseUrl/apiKey/model 信息密度自动收敛到 default
+   - 特殊：image:understanding 老数据自动迁移到 vision:default 兜底
+2. components/admin/service-catalog-management.tsx — 完全重写（946 行）
+   - 5 个 Tabs：多模态 / 文本 / 图像 / 配音 TTS / 视频
+   - 「图像 AI」tab 横向并列两个独立表单（图像生成 image + 图像理解 vision）
+   - 其他 tab 各 1 个表单
+   - 每个表单：BaseURL + API Key（可隐显）+ 模型收纳区（chips，⭐ 标默认）+ 默认模型 select
+     + 「分类模型」输入框（datalist 候选 = 上游 /models 探测结果）+ 加入分类 + 全部加入 + 一键移除
+   - Auto-probe：BaseURL/apiKey 改变后 800ms debounce 自动调上游 /models 拉候选模型列表
+   - 通用凭据卡片：一键写入全部 6 个 category，并自动给每个 category 触发 probe
+   - 完全去除「subtasks 列表 / 设置默认子任务 / 新增子任务 / 删除子任务」UI
+
+VERIFICATION:
+- npx tsc --noEmit：admin-panel + md2pptWin 双端 TS 通过
+- npm run build：admin-panel ✓ Compiled successfully in 4.7s（Clerk env 错误是本地 prerender，Render 有 env）
+
+桌面端配套（commit 在 md2pptWin 仓库另作）：
+- BuiltInCategoryKey 新增 'vision'
+- catalogVisionModel = pickBuiltInCategoryModel(builtInConfig, "vision", catalogMultimodalModel)
+- vision 不再当 multimodal 的别名，优先消费 admin 独立 vision，缺省时回退 multimodal 兜底
+- preferredModels.vision + openAiVisionModel 都切到 catalogVisionModel

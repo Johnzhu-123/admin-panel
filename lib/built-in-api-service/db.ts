@@ -8,13 +8,23 @@ import { AuthorizedUser } from './types';
 import { encryptSecret, decryptSecret, maskSecret } from './encryption';
 
 /**
- * 7 大类内置服务（实际暴露 5 个 catalog 项，对应 7 个字段角色：
- * 多模态/文本/图像 AI + 配音 TTS + 视频 AI；BaseURL 与 API Key 为每类独立维护）
+ * 6 大类内置服务，与桌面端 API 设置面板严格 1:1 对齐：
+ *   - 多模态 AI (multimodal) → desktop 多模态 AI tab
+ *   - 文本 AI (text)         → desktop 文本 AI tab
+ *   - 图像生成 (image)        → desktop 图像 AI tab 上半 ("图像生成 AI")
+ *   - 图像理解 (vision)       → desktop 图像 AI tab 下半 ("图像理解 AI")
+ *   - 配音 TTS (tts)          → desktop 配音 TTS tab
+ *   - 视频 AI (video)         → desktop 视频 AI tab
+ *
+ * 🔧 BREAKING (2026-05 #22): 新增 'vision'；同时把所有类的 subtask 预设
+ *   从「3 子类（音频理解 / 通用多模态 / 视觉理解 等）」收敛成「1 个 default」，
+ *   admin UI 只暴露每类一个表单，与桌面端一致。
  */
 export const BUILT_IN_SERVICE_CATEGORIES = [
   'multimodal',
   'text',
   'image',
+  'vision',
   'tts',
   'video',
 ] as const;
@@ -56,43 +66,42 @@ export type BuiltInServiceCatalog = Record<BuiltInServiceCategory, BuiltInServic
 const SERVICE_CATALOG_SETTING_KEY_PREFIX = 'service_catalog_';
 
 /**
- * 5 大类的中文展示信息
+ * 6 大类的中文展示信息
  */
 const CATEGORY_META: Record<BuiltInServiceCategory, { displayName: string; description: string }> = {
   multimodal: { displayName: '多模态 AI', description: '同时处理图像/音频/文本的综合理解模型' },
   text: { displayName: '文本 AI', description: '纯文本生成、改写、摘要、规划' },
-  image: { displayName: '图像 AI', description: '图像生成 / 图像理解 / 图像编辑' },
+  image: { displayName: '图像生成 AI', description: '文生图 / 图生图 / 图像编辑' },
+  vision: { displayName: '图像理解 AI', description: '识别图像内容 / 视觉问答' },
   tts: { displayName: '配音 TTS', description: '文本转语音' },
   video: { displayName: '视频 AI', description: '文生视频 / 图生视频' },
 };
 
 /**
- * 子任务预设：用于初始化空数据库或 UI 提示用户可选项
+ * 子任务预设：为对齐桌面端 1:1 UI，每类只保留 1 个 default 预设。
+ * 旧 catalog 里的 subcategory（如 image:generation/understanding/edit）会在
+ * loadServiceCatalog 时被收敛到 default 子任务。
  */
 type SubtaskPreset = { id: string; displayName: string; description?: string; defaultModel: string };
 
 const SUBTASK_PRESETS: Record<BuiltInServiceCategory, SubtaskPreset[]> = {
   multimodal: [
-    { id: 'default', displayName: '通用多模态', description: '默认多模态推理', defaultModel: 'gpt-4o' },
-    { id: 'vision', displayName: '视觉理解', description: '图像/视频帧分析', defaultModel: 'gpt-4o' },
-    { id: 'audio', displayName: '音频理解', description: '音频转写/分析', defaultModel: 'gpt-4o-audio-preview' },
+    { id: 'default', displayName: '多模态 AI', description: '与桌面端「多模态 AI」tab 对齐', defaultModel: 'gpt-4o' },
   ],
   text: [
-    { id: 'default', displayName: '通用文本', description: '通用文本生成', defaultModel: 'gpt-4o-mini' },
-    { id: 'plan', displayName: '大纲规划', description: 'PPT / 视频大纲生成', defaultModel: 'gpt-4o' },
-    { id: 'summary', displayName: '摘要总结', description: '内容摘要 / 提炼要点', defaultModel: 'gpt-4o-mini' },
+    { id: 'default', displayName: '文本 AI', description: '与桌面端「文本 AI」tab 对齐', defaultModel: 'gpt-4o-mini' },
   ],
   image: [
-    { id: 'generation', displayName: '图像生成', description: '文生图 / 图生图', defaultModel: 'gpt-image-1' },
-    { id: 'understanding', displayName: '图像理解', description: '识别图像内容', defaultModel: 'gpt-4o' },
-    { id: 'edit', displayName: '图像编辑', description: '局部重绘 / 扩图', defaultModel: 'gpt-image-1' },
+    { id: 'default', displayName: '图像生成 AI', description: '与桌面端「图像 AI」tab 上半部分对齐', defaultModel: 'gpt-image-1' },
+  ],
+  vision: [
+    { id: 'default', displayName: '图像理解 AI', description: '与桌面端「图像 AI」tab 下半部分对齐', defaultModel: 'gpt-4o' },
   ],
   tts: [
-    { id: 'default', displayName: '默认配音', description: '通用 TTS', defaultModel: 'tts-1' },
+    { id: 'default', displayName: '配音 TTS', description: '与桌面端「配音 TTS」tab 对齐', defaultModel: 'tts-1' },
   ],
   video: [
-    { id: 'text2video', displayName: '文生视频', description: '由文本生成视频', defaultModel: 'sora-1' },
-    { id: 'image2video', displayName: '图生视频', description: '由图片生成视频', defaultModel: 'sora-1' },
+    { id: 'default', displayName: '视频 AI', description: '与桌面端「视频 AI」tab 对齐', defaultModel: 'sora-1' },
   ],
 };
 
@@ -490,6 +499,9 @@ export async function setSystemSetting(settingKey: string, settingValue: string)
 
 async function loadServiceCatalog(): Promise<BuiltInServiceCatalog> {
   const catalog = makeEmptyCatalog();
+  // 🔧 NEW (2026-05 #22): 在迁移时把 image 旧 subtask 的 understanding 抓出来，
+  //   迁移完成后若 vision:default 为空，就用它兜底（保留老数据）
+  let imageUnderstandingLegacy: BuiltInServiceSubtaskConfig | null = null;
   try {
     const records = await Promise.all(
       BUILT_IN_SERVICE_CATEGORIES.map((category) =>
@@ -508,42 +520,75 @@ async function loadServiceCatalog(): Promise<BuiltInServiceCatalog> {
         if (hasSubtasks) {
           // 新格式：完整读取
           const subtasksRaw = parsed.subtasks as Record<string, unknown>;
-          const merged: Record<string, BuiltInServiceSubtaskConfig> = {};
 
-          // 先用预设作为兜底（确保所有预设 ID 都存在）
-          for (const preset of SUBTASK_PRESETS[category]) {
-            merged[preset.id] = makeDefaultSubtask(category, preset);
-          }
-
-          // 用 DB 数据覆盖
+          // 🔧 BREAKING (2026-05 #22): 现在每类只保留 1 个 default。
+          //   旧 catalog（image:generation/understanding/edit、multimodal:vision/audio、
+          //   text:plan/summary、video:text2video/image2video 等）会被收敛：
+          //   挑「最丰满」的那个 subtask（先看是否有 baseUrl+apiKey+model，再看 models[] 长度）
+          //   把它的数据塞进 default。其余子任务从 catalog 里彻底丢弃。
+          //   特殊：image:understanding 会被额外缓存，作为 vision:default 的兜底来源。
+          const allSubtasks: BuiltInServiceSubtaskConfig[] = [];
           for (const [subtaskId, subtaskRaw] of Object.entries(subtasksRaw)) {
             const safeId = sanitizeSubtaskId(subtaskId);
             if (!safeId) continue;
             const record = subtaskRaw as Record<string, unknown>;
             const decryptedApiKey = typeof record?.apiKey === 'string' ? decryptSecret(record.apiKey) : '';
-            merged[safeId] = normalizeSubtaskInput(
+            const tmp = normalizeSubtaskInput(
               category,
               safeId,
-              { ...record, apiKey: decryptedApiKey },
-              merged[safeId]
+              { ...record, apiKey: decryptedApiKey }
             );
             if (typeof record?.updatedAt === 'string') {
-              merged[safeId].updatedAt = record.updatedAt;
+              tmp.updatedAt = record.updatedAt;
+            }
+            allSubtasks.push(tmp);
+          }
+
+          // 缓存 image:understanding 给后续 vision migration
+          if (category === 'image') {
+            const u = allSubtasks.find((s) => s.id === 'understanding');
+            if (u && (u.baseUrl || u.apiKey || u.model)) {
+              imageUnderstandingLegacy = u;
             }
           }
 
-          const defaultSubtaskId = sanitizeSubtaskId(
-            parsed.defaultSubtaskId,
-            SUBTASK_PRESETS[category][0].id
-          );
+          // 排序：default 优先；其次按 (有 url & key) → models 长度 → updatedAt
+          const richness = (s: BuiltInServiceSubtaskConfig) => {
+            const hasCred = s.baseUrl && s.apiKey ? 1000 : 0;
+            const hasModel = s.model ? 100 : 0;
+            const modelsLen = Array.isArray(s.models) ? s.models.length : 0;
+            return hasCred + hasModel + modelsLen;
+          };
+          const sorted = [...allSubtasks].sort((a, b) => {
+            if (a.id === 'default' && b.id !== 'default') return -1;
+            if (b.id === 'default' && a.id !== 'default') return 1;
+            return richness(b) - richness(a);
+          });
+
+          // 选最丰满的（或 default 自身）作为 default 的源
+          const winner = sorted[0];
+          const merged: Record<string, BuiltInServiceSubtaskConfig> = {};
+          if (winner) {
+            const collapsed: BuiltInServiceSubtaskConfig = {
+              id: 'default',
+              displayName: SUBTASK_PRESETS[category][0].displayName,
+              description: SUBTASK_PRESETS[category][0].description,
+              baseUrl: winner.baseUrl,
+              apiKey: winner.apiKey,
+              model: winner.model,
+              models: ensureModelInList(winner.model, winner.models || []),
+              isEnabled: winner.isEnabled,
+              updatedAt: winner.updatedAt,
+            };
+            merged.default = collapsed;
+          } else {
+            merged.default = makeDefaultSubtask(category, SUBTASK_PRESETS[category][0]);
+          }
 
           catalog[category] = {
-            displayName: String(parsed.displayName || CATEGORY_META[category].displayName),
-            description:
-              typeof parsed.description === 'string'
-                ? parsed.description
-                : CATEGORY_META[category].description,
-            defaultSubtaskId: merged[defaultSubtaskId] ? defaultSubtaskId : SUBTASK_PRESETS[category][0].id,
+            displayName: CATEGORY_META[category].displayName,
+            description: CATEGORY_META[category].description,
+            defaultSubtaskId: 'default',
             subtasks: merged,
           };
         } else {
@@ -551,18 +596,43 @@ async function loadServiceCatalog(): Promise<BuiltInServiceCatalog> {
           const legacyApiKey = typeof parsed.apiKey === 'string' ? decryptSecret(parsed.apiKey) : '';
           const legacy = normalizeSubtaskInput(
             category,
-            SUBTASK_PRESETS[category][0].id,
+            'default',
             { ...parsed, apiKey: legacyApiKey }
           );
           legacy.updatedAt = typeof parsed.updatedAt === 'string' ? parsed.updatedAt : undefined;
           const empty = makeEmptyCategory(category);
-          empty.subtasks[legacy.id] = legacy;
+          empty.subtasks.default = legacy;
           catalog[category] = empty;
         }
       } catch (error) {
         console.warn(`[serviceCatalog] 解析 ${category} 配置失败:`, error);
       }
     });
+
+    // 🔧 NEW (2026-05 #22): vision 兜底迁移：
+    //   如果 vision:default 还是空（admin 从未配过 vision），
+    //   而 image:understanding 在旧数据里有内容，就把它搬过来。
+    if (imageUnderstandingLegacy && catalog.vision) {
+      const vd = catalog.vision.subtasks.default;
+      const visionEmpty = !vd || (!vd.baseUrl && !vd.apiKey && !vd.model);
+      if (visionEmpty) {
+        catalog.vision.subtasks.default = {
+          id: 'default',
+          displayName: SUBTASK_PRESETS.vision[0].displayName,
+          description: SUBTASK_PRESETS.vision[0].description,
+          baseUrl: imageUnderstandingLegacy.baseUrl,
+          apiKey: imageUnderstandingLegacy.apiKey,
+          model: imageUnderstandingLegacy.model,
+          models: ensureModelInList(
+            imageUnderstandingLegacy.model,
+            imageUnderstandingLegacy.models || []
+          ),
+          isEnabled: imageUnderstandingLegacy.isEnabled,
+          updatedAt: imageUnderstandingLegacy.updatedAt,
+        };
+        console.log('[serviceCatalog v22] migrated image:understanding → vision:default');
+      }
+    }
   } catch (error) {
     console.error('[serviceCatalog] 加载失败:', error);
   }
