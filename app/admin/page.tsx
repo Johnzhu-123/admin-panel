@@ -81,7 +81,10 @@ export default function AdminDashboard() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [systemSettings, setSystemSettings] = useState<RuntimeSystemSettings>({
-    serviceGatewayUrl: 'https://ppt2admin.onrender.com',
+    // 🔧 FIX (2026-05 #19): serviceGatewayUrl 是「上游 AI 网关」（如
+    //   api.seeyjys.eu.org），不是 admin-panel URL（ppt2admin.onrender.com）。
+    //   初始 state 留空，等 fetchSystemSettings 拉到正确值再显示。
+    serviceGatewayUrl: '',
     updatePageUrl: '',
     downloadChannels: [],
   });
@@ -165,10 +168,11 @@ export default function AdminDashboard() {
       const settings = data?.settings || {};
       const parsedChannels = parseDownloadChannelsInput(settings.downloadChannels);
       const next: RuntimeSystemSettings = {
+        // 🔧 FIX (2026-05 #19): 拉不到时留空，避免错把 admin-panel URL 当 gateway URL
         serviceGatewayUrl:
           typeof settings.serviceGatewayUrl === 'string' && settings.serviceGatewayUrl.trim()
             ? settings.serviceGatewayUrl.trim()
-            : 'https://ppt2admin.onrender.com',
+            : '',
         updatePageUrl:
           typeof settings.updatePageUrl === 'string' && settings.updatePageUrl.trim()
             ? normalizeUrl(settings.updatePageUrl)

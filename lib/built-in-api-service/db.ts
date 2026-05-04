@@ -669,10 +669,14 @@ export async function getInternalServiceConfig(
 }
 
 export async function getBuiltInRuntimeSettings(): Promise<BuiltInRuntimeSettings> {
+  // 🔧 FIX (2026-05 #19): envGateway 用于填充 serviceGatewayUrl，是「上游 AI
+  //   网关」(api.seeyjys.eu.org) 的 URL，不是 admin-panel 自身 URL。旧默认
+  //   'https://ppt2admin.onrender.com' 是 admin-panel URL，把两个概念搞混了。
+  //   改为空字符串：必须显式通过 env 或 DB 配置，避免误用。
   const envGateway = normalizeUrl(
     process.env.BUILT_IN_SERVICE_SERVER_URL ||
       process.env.NEXT_PUBLIC_BUILT_IN_SERVICE_SERVER_URL ||
-      'https://ppt2admin.onrender.com'
+      ''
   );
   const envUpdatePageUrl = normalizeUrl(
     process.env.BUILT_IN_RELEASE_PAGE_URL ||
