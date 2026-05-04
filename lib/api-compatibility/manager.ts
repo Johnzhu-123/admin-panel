@@ -661,31 +661,67 @@ export class APICompatibilityManager implements IAPICompatibilityManager {
       return error as APIError;
     }
 
+    // 🔧 NEW (2026-05 #15): 把 createAPIError 实际收到的 error 对象 dump 到日志，
+    //   便于在 Render 上排查为什么 "An unexpected error occurred" 还在出现。
+    try {
+      const dump: any = {
+        v: 'v15',
+        provider: provider?.id,
+        ctor: error?.constructor?.name,
+        name: error?.name,
+        msg: typeof error?.message === 'string' ? error.message.slice(0, 200) : null,
+        msgEmpty: typeof error?.message === 'string' && error.message === '',
+        isError: error instanceof Error,
+        keys: error && typeof error === 'object' ? Object.keys(error).slice(0, 12) : null,
+        causeCtor: (error as any)?.cause?.constructor?.name,
+        causeMsg: typeof (error as any)?.cause?.message === 'string'
+          ? (error as any).cause.message.slice(0, 200)
+          : null,
+        causeCode: (error as any)?.cause?.code,
+        stackHead: typeof error?.stack === 'string' ? error.stack.slice(0, 240) : null
+      };
+      console.error('[createAPIError v15] received error dump:', JSON.stringify(dump));
+    } catch (logErr) {
+      console.error('[createAPIError v15] failed to dump error:', logErr);
+    }
+
     let errorType: ErrorType = 'unknown';
     let message = 'Unknown error occurred';
     let code = 'unknown';
 
-    if (error instanceof Error) {
-      message = error.message || message;
-      // 🔧 FIX (2026-05 #13): undici / fetch 失败时真实 reason 在 error.cause 上，
-      //   把它拼到 message，便于 Render 日志和前端排查。
-      const cause: any = (error as any).cause;
-      if (cause && typeof cause === 'object') {
-        const causeMsg = typeof cause.message === 'string' ? cause.message : '';
-        const causeCode = typeof cause.code === 'string' ? cause.code : '';
-        if (causeMsg || causeCode) {
-          message = `${message} | cause=${[causeCode, causeMsg].filter(Boolean).join(' ')}`;
-        }
+    // 🔧 FIX (2026-05 #15): 不再依赖 instanceof Error（undici 在 worker 边界经常
+    //   把 error 抹成 plain object）。改成 duck typing：只要有可读的 message/cause
+    //   就尽量提取。
+    const errMessage = typeof error?.message === 'string' ? error.message : '';
+    if (errMessage) {
+      message = errMessage;
+    }
+    // undici / fetch 失败时真实 reason 在 error.cause 上，拼到 message。
+    const cause: any = (error as any)?.cause;
+    if (cause && typeof cause === 'object') {
+      const causeMsg = typeof cause.message === 'string' ? cause.message : '';
+      const causeCode = typeof cause.code === 'string' ? cause.code : '';
+      if (causeMsg || causeCode) {
+        message = `${message} | cause=${[causeCode, causeMsg].filter(Boolean).join(' ')}`;
       }
-      if (message.includes('timeout') || message.includes('UND_ERR_HEADERS_TIMEOUT')) {
-        errorType = 'network_error';
-        code = 'timeout';
-      } else if (message.includes('fetch') || message.includes('network')
-                 || message.includes('ECONNRESET') || message.includes('ENOTFOUND')) {
-        errorType = 'network_error';
-        code = 'network_error';
-      }
-    } else if (typeof error === 'string') {
+    }
+    // error.name 也有诊断价值（AbortError / TypeError / FetchError）
+    const errName = typeof error?.name === 'string' ? error.name : '';
+    if (errName && errName !== 'Error' && !message.includes(errName)) {
+      message = `${errName}: ${message}`;
+    }
+
+    if (message.includes('timeout') || message.includes('UND_ERR_HEADERS_TIMEOUT')
+        || message.includes('AbortError') || message.includes('aborted')) {
+      errorType = 'network_error';
+      code = 'timeout';
+    } else if (message.includes('fetch') || message.includes('network')
+               || message.includes('ECONNRESET') || message.includes('ENOTFOUND')
+               || message.includes('UND_ERR_')) {
+      errorType = 'network_error';
+      code = 'network_error';
+    }
+    if (typeof error === 'string') {
       message = error;
     }
 
