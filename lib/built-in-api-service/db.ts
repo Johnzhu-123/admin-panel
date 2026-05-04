@@ -23,6 +23,11 @@ export type BuiltInServiceCategory = (typeof BUILT_IN_SERVICE_CATEGORIES)[number
 
 /**
  * 单一子任务配置（同一类下可有多个子任务，例如图像生成 vs 图像理解）
+ *
+ * 🔧 NEW (2026-05 #21): models 字段 — 该子任务可用的全部模型列表（默认排序：
+ *   model 永远在 models[0]）。桌面端「API 设置 → 分类模型」下拉用 models 全量
+ *   显示，model 作为 ⭐ 默认选中。旧 catalog（无 models 字段）会被自动补成
+ *   models = [model]，保证不会出现"只有一个默认模型"的窘境。
  */
 export interface BuiltInServiceSubtaskConfig {
   id: string;
@@ -31,6 +36,7 @@ export interface BuiltInServiceSubtaskConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
+  models?: string[]; // 🔧 NEW (2026-05 #21)
   isEnabled: boolean;
   updatedAt?: string;
 }
@@ -147,6 +153,7 @@ function normalizeSubtaskInput(
   const fallbackName = preset?.displayName || base?.displayName || subtaskId;
   const fallbackDesc = preset?.description ?? base?.description;
   if (!raw || typeof raw !== 'object') {
+    const fallbackModels = Array.isArray(base?.models) ? [...(base?.models || [])] : [];
     return {
       id: subtaskId,
       displayName: fallbackName,
@@ -154,6 +161,7 @@ function normalizeSubtaskInput(
       baseUrl: base?.baseUrl || '',
       apiKey: base?.apiKey || '',
       model: base?.model || fallbackModel,
+      models: ensureModelInList(base?.model || fallbackModel, fallbackModels),
       isEnabled: base?.isEnabled || false,
     };
   }
@@ -170,7 +178,53 @@ function normalizeSubtaskInput(
     typeof record.description === 'string'
       ? record.description
       : base?.description ?? fallbackDesc;
-  return { id: subtaskId, displayName, description, baseUrl, apiKey, model, isEnabled };
+  // 🔧 NEW (2026-05 #21): models 字段。优先用 patch 里的 models（admin 显式传入），
+  // 否则保留 base 里既有的，最后兜底 [model] 防止空列表。
+  const incomingModels = sanitizeModelList(record.models);
+  const baseModels = Array.isArray(base?.models) ? [...(base?.models || [])] : [];
+  const modelsRaw = incomingModels !== null ? incomingModels : baseModels;
+  const models = ensureModelInList(model, modelsRaw);
+  return { id: subtaskId, displayName, description, baseUrl, apiKey, model, models, isEnabled };
+}
+
+/**
+ * 🔧 NEW (2026-05 #21): 校验/清洗 models 数组。
+ *   - 非数组 → null（表示"未传"，由 base/fallback 接管）
+ *   - 数组里每条 trim、去空、去重；保持顺序
+ */
+function sanitizeModelList(raw: unknown): string[] | null {
+  if (raw === undefined || raw === null) return null;
+  if (!Array.isArray(raw)) return null;
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of raw) {
+    const t = typeof item === 'string' ? item.trim() : '';
+    if (!t || seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+  }
+  return out;
+}
+
+/**
+ * 🔧 NEW (2026-05 #21): 确保 default model 永远在 models[0]。
+ *   admin 即使忘记把默认 model 加进 models 列表，前端拉到的列表也会先看见它。
+ */
+function ensureModelInList(model: string, models: string[]): string[] {
+  const m = (model || '').trim();
+  const cleaned: string[] = [];
+  const seen = new Set<string>();
+  if (m) {
+    cleaned.push(m);
+    seen.add(m);
+  }
+  for (const item of models || []) {
+    const t = (item || '').trim();
+    if (!t || seen.has(t)) continue;
+    seen.add(t);
+    cleaned.push(t);
+  }
+  return cleaned;
 }
 
 export function getSubtaskPresets(): Record<BuiltInServiceCategory, SubtaskPreset[]> {
@@ -528,6 +582,8 @@ async function persistServiceCatalog(catalog: BuiltInServiceCatalog): Promise<vo
           baseUrl: subtask.baseUrl,
           apiKey: subtask.apiKey ? encryptSecret(subtask.apiKey) : '',
           model: subtask.model,
+          // 🔧 NEW (2026-05 #21): 持久化 models 数组
+          models: ensureModelInList(subtask.model, subtask.models || []),
           isEnabled: subtask.isEnabled,
           updatedAt: subtask.updatedAt || new Date().toISOString(),
         };
@@ -637,6 +693,8 @@ export function sanitizeServiceCatalog(
         baseUrl: subtask.baseUrl,
         apiKey: options.includeKeyMask && subtask.apiKey ? maskSecret(subtask.apiKey) : '',
         model: subtask.model,
+        // 🔧 NEW (2026-05 #21): models 数组直通到客户端（不含敏感数据）
+        models: ensureModelInList(subtask.model, subtask.models || []),
         isEnabled: subtask.isEnabled,
         updatedAt: subtask.updatedAt,
       };

@@ -190,12 +190,14 @@ export async function GET(req: Request) {
             defaultSubtaskId: string;
             baseUrl: string;
             model: string;
+            models: string[]; // 🔧 NEW (2026-05 #21): 该分类全部模型聚合
             isEnabled: boolean;
             subtasks: Array<{
               id: string;
               displayName: string;
               baseUrl: string;
               model: string;
+              models: string[]; // 🔧 NEW (2026-05 #21): 该子任务的模型列表
               isEnabled: boolean;
             }>;
           }
@@ -205,17 +207,37 @@ export async function GET(req: Request) {
           const defaultSubtask =
             cfg.subtasks[defaultSubtaskId] ||
             Object.values(cfg.subtasks)[0];
+          // 🔧 NEW (2026-05 #21): 把该分类所有子任务的 models 聚合（默认子任务排首位、去重）
+          const aggregatedModels: string[] = [];
+          const seenModels = new Set<string>();
+          const orderedSubtasks = Object.values(cfg.subtasks).sort((a, b) =>
+            a.id === defaultSubtaskId ? -1 : b.id === defaultSubtaskId ? 1 : 0
+          );
+          for (const s of orderedSubtasks) {
+            const list = Array.isArray(s.models) ? s.models : [];
+            const candidates = list.length ? list : (s.model ? [s.model] : []);
+            for (const m of candidates) {
+              const t = (m || '').trim();
+              if (!t || seenModels.has(t)) continue;
+              seenModels.add(t);
+              aggregatedModels.push(t);
+            }
+          }
           categories[category] = {
             displayName: cfg.displayName,
             defaultSubtaskId,
             baseUrl: defaultSubtask?.baseUrl || '',
             model: defaultSubtask?.model || '',
+            models: aggregatedModels,
             isEnabled: defaultSubtask?.isEnabled ?? false,
             subtasks: Object.values(cfg.subtasks).map((subtask) => ({
               id: subtask.id,
               displayName: subtask.displayName,
               baseUrl: subtask.baseUrl,
               model: subtask.model,
+              models: Array.isArray(subtask.models) && subtask.models.length
+                ? subtask.models
+                : (subtask.model ? [subtask.model] : []),
               isEnabled: subtask.isEnabled,
             })),
           };

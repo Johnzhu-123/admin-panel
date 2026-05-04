@@ -89,6 +89,18 @@ const sanitizeSubtaskPatch = (
     }
   }
   if (typeof record.model === "string") out.model = record.model.trim();
+  // 🔧 NEW (2026-05 #21): 接受 models 数组（每条 trim、去空、去重；非数组直接忽略）
+  if (Array.isArray(record.models)) {
+    const seen = new Set<string>();
+    const cleaned: string[] = [];
+    for (const item of record.models) {
+      const t = typeof item === "string" ? item.trim() : "";
+      if (!t || seen.has(t)) continue;
+      seen.add(t);
+      cleaned.push(t);
+    }
+    out.models = cleaned;
+  }
   if (typeof record.isEnabled === "boolean") out.isEnabled = record.isEnabled;
   return out as Partial<Omit<BuiltInServiceSubtaskConfig, "id">>;
 };

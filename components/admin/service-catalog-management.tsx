@@ -37,6 +37,7 @@ interface SubtaskConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
+  models?: string[]; // 🔧 NEW (2026-05 #21): 该子任务可用的全部模型列表
   isEnabled: boolean;
   updatedAt?: string;
 }
@@ -189,6 +190,8 @@ export function ServiceCatalogManagement() {
       description: subtask.description,
       baseUrl: subtask.baseUrl,
       model: subtask.model,
+      // 🔧 NEW (2026-05 #21): 把当前编辑态的 models 列表写回（包含 model 自身）
+      models: Array.isArray(subtask.models) ? subtask.models : (subtask.model ? [subtask.model] : []),
       isEnabled: subtask.isEnabled,
     };
     // 只有 apiKey 有值且不是掩码（如 "abcd********wxyz"）时才发送，
@@ -756,7 +759,7 @@ export function ServiceCatalogManagement() {
                       <CardContent className="space-y-3 pt-3">
                         <div className="grid gap-3 md:grid-cols-2">
                           <div className="space-y-1.5">
-                            <Label className="text-xs text-slate-400">Model</Label>
+                            <Label className="text-xs text-slate-400">默认 Model</Label>
                             <Input
                               list={datalistOptions.length ? datalistId : undefined}
                               value={subtask.model}
@@ -786,6 +789,131 @@ export function ServiceCatalogManagement() {
                             />
                           </div>
                         </div>
+
+                        {/* 🔧 NEW (2026-05 #21): Models 列表 — 桌面端「分类模型」下拉直接消费 */}
+                        <div className="space-y-1.5">
+                          <div className="flex items-center justify-between">
+                            <Label className="text-xs text-slate-400">
+                              Models 列表（每行一个 · 桌面端分类下拉显示）
+                            </Label>
+                            <div className="flex items-center gap-2">
+                              <span className="text-[11px] text-slate-500">
+                                {(subtask.models || []).length} 条
+                              </span>
+                              {subtaskProbeModels.length > 0 && (
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  className="h-6 px-2 text-[11px] text-indigo-300 hover:text-indigo-200 hover:bg-slate-700/60"
+                                  onClick={() => {
+                                    // 把上游 probe 出来的全部模型 import 到 models 列表，
+                                    // 默认 model 排首位、保留用户已自填但 probe 没回的条目。
+                                    const existing = Array.isArray(subtask.models) ? subtask.models : [];
+                                    const seen = new Set<string>();
+                                    const merged: string[] = [];
+                                    const head = (subtask.model || "").trim();
+                                    if (head) {
+                                      merged.push(head);
+                                      seen.add(head);
+                                    }
+                                    for (const m of subtaskProbeModels) {
+                                      const t = (m || "").trim();
+                                      if (!t || seen.has(t)) continue;
+                                      seen.add(t);
+                                      merged.push(t);
+                                    }
+                                    for (const m of existing) {
+                                      const t = (m || "").trim();
+                                      if (!t || seen.has(t)) continue;
+                                      seen.add(t);
+                                      merged.push(t);
+                                    }
+                                    setCatalog((prev) => {
+                                      if (!prev) return prev;
+                                      const next = structuredClone(prev) as Catalog;
+                                      const target = next[meta.key]?.subtasks?.[subtask.id];
+                                      if (target) {
+                                        target.models = merged;
+                                      }
+                                      return next;
+                                    });
+                                  }}
+                                  title={`把刚刚 probe 拉到的 ${subtaskProbeModels.length} 个模型导入到 Models 列表`}
+                                >
+                                  <Plus className="mr-1 h-3 w-3" />
+                                  导入 probe ({subtaskProbeModels.length})
+                                </Button>
+                              )}
+                              {bulkProbeModels.length > 0 && subtaskProbeModels.length === 0 && (
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  className="h-6 px-2 text-[11px] text-indigo-300 hover:text-indigo-200 hover:bg-slate-700/60"
+                                  onClick={() => {
+                                    const existing = Array.isArray(subtask.models) ? subtask.models : [];
+                                    const seen = new Set<string>();
+                                    const merged: string[] = [];
+                                    const head = (subtask.model || "").trim();
+                                    if (head) {
+                                      merged.push(head);
+                                      seen.add(head);
+                                    }
+                                    for (const m of bulkProbeModels) {
+                                      const t = (m || "").trim();
+                                      if (!t || seen.has(t)) continue;
+                                      seen.add(t);
+                                      merged.push(t);
+                                    }
+                                    for (const m of existing) {
+                                      const t = (m || "").trim();
+                                      if (!t || seen.has(t)) continue;
+                                      seen.add(t);
+                                      merged.push(t);
+                                    }
+                                    setCatalog((prev) => {
+                                      if (!prev) return prev;
+                                      const next = structuredClone(prev) as Catalog;
+                                      const target = next[meta.key]?.subtasks?.[subtask.id];
+                                      if (target) {
+                                        target.models = merged;
+                                      }
+                                      return next;
+                                    });
+                                  }}
+                                  title={`把一键应用拉到的 ${bulkProbeModels.length} 个共享模型导入到本子任务`}
+                                >
+                                  <Plus className="mr-1 h-3 w-3" />
+                                  导入共享 ({bulkProbeModels.length})
+                                </Button>
+                              )}
+                            </div>
+                          </div>
+                          <textarea
+                            value={(subtask.models || []).join("\n")}
+                            onChange={(e) => {
+                              const lines = e.target.value
+                                .split(/\n/)
+                                .map((s) => s.trim())
+                                .filter((s) => s.length > 0);
+                              setCatalog((prev) => {
+                                if (!prev) return prev;
+                                const next = structuredClone(prev) as Catalog;
+                                const target = next[meta.key]?.subtasks?.[subtask.id];
+                                if (target) {
+                                  target.models = lines;
+                                }
+                                return next;
+                              });
+                            }}
+                            placeholder="gpt-4o&#10;gpt-4o-mini&#10;claude-3-5-sonnet&#10;..."
+                            rows={Math.max(3, Math.min(8, ((subtask.models || []).length || 1) + 1))}
+                            className="w-full rounded-md bg-slate-900/70 border border-slate-600 text-slate-100 placeholder:text-slate-500 px-3 py-2 text-sm font-mono leading-relaxed focus:outline-none focus:border-indigo-500/60"
+                          />
+                          <p className="text-[11px] text-slate-500">
+                            桌面端 API 设置 → 「{cfg.displayName}」 → 「分类模型」下拉会显示这里的全部条目；默认 Model 永远在首位。留空则只显示默认 Model 一项。
+                          </p>
+                        </div>
+
                         <div className="space-y-1.5">
                           <Label className="text-xs text-slate-400">BaseURL</Label>
                           <Input
