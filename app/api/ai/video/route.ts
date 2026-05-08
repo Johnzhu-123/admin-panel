@@ -21,8 +21,8 @@ const buildBuiltInVideoEndpoint = (baseUrl: string, endpointPath?: string) => {
   const normalized = normalizeRemoteBase(baseUrl);
   if (!normalized) return "";
 
-  // 🔧 NEW (2026-05 #24): 优先走 admin 控制台显式配置的 endpointPath。
-  //   留空时才走兜底白名单识别 + /video/generations。
+  // Built-in/self-hosted video models are exposed through streaming
+  // OpenAI-compatible Chat Completions unless admin explicitly overrides it.
   const pathOverride = (endpointPath || "").trim();
   if (pathOverride) {
     if (/^https?:\/\//i.test(pathOverride)) return pathOverride;
@@ -48,15 +48,15 @@ const buildBuiltInVideoEndpoint = (baseUrl: string, endpointPath?: string) => {
   try {
     const parsed = new URL(normalized);
     const path = parsed.pathname.replace(/\/+$/, "");
-    if (/\/(?:video\/generations|videos|generate)$/i.test(path)) {
+    if (/\/chat\/completions$/i.test(path)) {
       return normalized;
     }
   } catch {
-    if (/\/(?:video\/generations|videos|generate)\/?$/i.test(normalized)) {
+    if (/\/chat\/completions\/?$/i.test(normalized)) {
       return normalized;
     }
   }
-  return `${normalized}/video/generations`;
+  return `${normalized}/chat/completions`;
 };
 
 const shouldReplaceBuiltInVideoEndpoint = (endpointUrl: string) => {
@@ -64,7 +64,16 @@ const shouldReplaceBuiltInVideoEndpoint = (endpointUrl: string) => {
   try {
     const parsed = new URL(endpointUrl);
     const path = parsed.pathname.replace(/\/+$/, "");
-    return /\/chat\/completions$/i.test(path);
+    return /\/(?:video\/generations|videos|generate)$/i.test(path);
+  } catch {
+    return /\/(?:video\/generations|videos|generate)\/?$/i.test(endpointUrl);
+  }
+};
+
+const isChatCompletionsEndpoint = (endpointUrl: string) => {
+  try {
+    const parsed = new URL(endpointUrl);
+    return /\/chat\/completions\/?$/i.test(parsed.pathname);
   } catch {
     return /\/chat\/completions\/?$/i.test(endpointUrl);
   }
@@ -76,53 +85,56 @@ const extractBase64FromDataUrl = (value: unknown) => {
   return match?.[1] || "";
 };
 
-const normalizeChatPayloadForVideoGeneration = (
+const normalizeVideoPayloadForChatCompletions = (
   payload: Record<string, unknown> | null,
   fallbackModel: string
 ): Record<string, unknown> | null => {
-  if (!payload || !Array.isArray(payload.messages)) return payload;
-  const texts: string[] = [];
-  const images: string[] = [];
-
-  for (const message of payload.messages) {
-    if (!message || typeof message !== "object") continue;
-    const content = (message as { content?: unknown }).content;
-    if (typeof content === "string" && content.trim()) {
-      texts.push(content.trim());
-      continue;
-    }
-    if (!Array.isArray(content)) continue;
-    for (const part of content) {
-      if (!part || typeof part !== "object") continue;
-      const typedPart = part as {
-        type?: unknown;
-        text?: unknown;
-        image_url?: { url?: unknown };
-      };
-      if (typedPart.type === "text" && typeof typedPart.text === "string") {
-        texts.push(typedPart.text.trim());
-      }
-      if (typedPart.type === "image_url") {
-        const base64 = extractBase64FromDataUrl(typedPart.image_url?.url);
-        if (base64) images.push(base64);
-      }
-    }
+  if (!payload) return payload;
+  if (Array.isArray(payload.messages)) {
+    return {
+      ...payload,
+      model:
+        typeof payload.model === "string" && payload.model.trim()
+          ? payload.model
+          : fallbackModel,
+      stream: true,
+    };
   }
 
-  const prompt = texts.filter(Boolean).join("\n\n").trim();
-  const rest = { ...payload };
-  delete rest.messages;
-  delete rest.stream;
+  const prompt = typeof payload.prompt === "string" ? payload.prompt : "";
+  const content: Array<Record<string, unknown>> = [{ type: "text", text: prompt }];
+  const firstFrame =
+    extractBase64FromDataUrl(payload.image) ||
+    extractBase64FromDataUrl(payload.first_frame) ||
+    (typeof payload.image === "string" ? payload.image : "") ||
+    (typeof payload.first_frame === "string" ? payload.first_frame : "");
+  const lastFrame =
+    extractBase64FromDataUrl(payload.last_frame) ||
+    (typeof payload.last_frame === "string" ? payload.last_frame : "");
+  if (firstFrame) {
+    content.push({
+      type: "image_url",
+      image_url: { url: `data:image/jpeg;base64,${firstFrame}` },
+    });
+  }
+  if (lastFrame) {
+    content.push({
+      type: "image_url",
+      image_url: { url: `data:image/jpeg;base64,${lastFrame}` },
+    });
+  }
   return {
-    ...rest,
     model:
       typeof payload.model === "string" && payload.model.trim()
         ? payload.model
         : fallbackModel,
-    prompt,
-    duration: typeof payload.duration === "number" ? payload.duration : 5,
-    ...(images[0] ? { image: images[0] } : {}),
-    ...(images[1] ? { last_frame: images[1] } : {}),
+    messages: [
+      {
+        role: "user",
+        content: content.length === 1 ? prompt : content,
+      },
+    ],
+    stream: true,
   };
 };
 
@@ -161,10 +173,13 @@ export async function POST(request: Request) {
         const merged = enriched as unknown as VideoProxyRequest;
         const currentEndpoint =
           typeof merged.endpointUrl === "string" ? merged.endpointUrl.trim() : "";
-        const replacedEndpoint = shouldReplaceBuiltInVideoEndpoint(currentEndpoint);
+        const replacedEndpoint =
+          !!config.endpointPath || shouldReplaceBuiltInVideoEndpoint(currentEndpoint);
         if (replacedEndpoint) {
           merged.endpointUrl = buildBuiltInVideoEndpoint(config.baseUrl, config.endpointPath);
-          merged.payload = normalizeChatPayloadForVideoGeneration(
+        }
+        if (isChatCompletionsEndpoint(merged.endpointUrl || "")) {
+          merged.payload = normalizeVideoPayloadForChatCompletions(
             merged.payload || null,
             config.model
           ) || merged.payload;
