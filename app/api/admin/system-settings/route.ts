@@ -89,6 +89,9 @@ const sanitizeSubtaskPatch = (
     }
   }
   if (typeof record.model === "string") out.model = record.model.trim();
+  if (typeof record.endpointPath === "string") {
+    out.endpointPath = record.endpointPath.trim();
+  }
   // 🔧 NEW (2026-05 #21): 接受 models 数组（每条 trim、去空、去重；非数组直接忽略）
   if (Array.isArray(record.models)) {
     const seen = new Set<string>();

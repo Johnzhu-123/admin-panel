@@ -17,9 +17,34 @@ const BUILT_IN_PROXY_HEADER = "x-built-in-service-server-url";
 const normalizeRemoteBase = (base?: string) =>
   (base || "").trim().replace(/\/+$/, "");
 
-const buildBuiltInVideoEndpoint = (baseUrl: string) => {
+const buildBuiltInVideoEndpoint = (baseUrl: string, endpointPath?: string) => {
   const normalized = normalizeRemoteBase(baseUrl);
   if (!normalized) return "";
+
+  // 🔧 NEW (2026-05 #24): 优先走 admin 控制台显式配置的 endpointPath。
+  //   留空时才走兜底白名单识别 + /video/generations。
+  const pathOverride = (endpointPath || "").trim();
+  if (pathOverride) {
+    if (/^https?:\/\//i.test(pathOverride)) return pathOverride;
+    const cleaned = pathOverride.startsWith("/") ? pathOverride : `/${pathOverride}`;
+    try {
+      const parsed = new URL(normalized);
+      const basePath = parsed.pathname.replace(/\/+$/, "");
+      if (
+        basePath &&
+        cleaned.toLowerCase().startsWith(`${basePath.toLowerCase()}/`)
+      ) {
+        parsed.pathname = cleaned;
+        parsed.search = "";
+        parsed.hash = "";
+        return parsed.toString().replace(/\/+$/, "");
+      }
+    } catch {
+      // Fall back to simple concatenation for non-URL bases; validation happens later.
+    }
+    return `${normalized}${cleaned}`;
+  }
+
   try {
     const parsed = new URL(normalized);
     const path = parsed.pathname.replace(/\/+$/, "");
@@ -138,7 +163,7 @@ export async function POST(request: Request) {
           typeof merged.endpointUrl === "string" ? merged.endpointUrl.trim() : "";
         const replacedEndpoint = shouldReplaceBuiltInVideoEndpoint(currentEndpoint);
         if (replacedEndpoint) {
-          merged.endpointUrl = buildBuiltInVideoEndpoint(config.baseUrl);
+          merged.endpointUrl = buildBuiltInVideoEndpoint(config.baseUrl, config.endpointPath);
           merged.payload = normalizeChatPayloadForVideoGeneration(
             merged.payload || null,
             config.model

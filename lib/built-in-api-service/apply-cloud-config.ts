@@ -17,6 +17,9 @@ export interface BuiltInResolvedConfig {
   apiKey: string;
   model: string;
   subtaskId: string;
+  // 🔧 NEW (2026-05 #24): video category 专用 — 上游视频接口路径（如 /v1/videos）。
+  //   仅 video route 会读取；其它 category 忽略。
+  endpointPath?: string;
 }
 
 const RESOLVED_BASE_URL_KEYS = [
@@ -41,6 +44,7 @@ export async function resolveBuiltInCategoryConfig(
       apiKey: subtask.apiKey,
       model: subtask.model || "",
       subtaskId: subtask.id,
+      endpointPath: subtask.endpointPath || undefined,
     };
   } catch (error) {
     console.error(

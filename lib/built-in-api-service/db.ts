@@ -47,6 +47,10 @@ export interface BuiltInServiceSubtaskConfig {
   apiKey: string;
   model: string;
   models?: string[]; // 🔧 NEW (2026-05 #21)
+  // 🔧 NEW (2026-05 #24): video category 专用 — 上游视频接口路径（如 /v1/videos）。
+  //   留空时 video route 走兜底（baseUrl + /video/generations）。
+  //   其它 category 不读这个字段。
+  endpointPath?: string;
   isEnabled: boolean;
   updatedAt?: string;
 }
@@ -151,6 +155,15 @@ function sanitizeSubtaskId(raw: unknown, fallback = 'default'): string {
   return trimmed || fallback;
 }
 
+function normalizeEndpointPath(raw: unknown, fallback?: string): string | undefined {
+  if (raw === undefined || raw === null) return fallback || undefined;
+  if (typeof raw !== 'string') return fallback || undefined;
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  return trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+}
+
 function normalizeSubtaskInput(
   category: BuiltInServiceCategory,
   subtaskId: string,
@@ -171,6 +184,7 @@ function normalizeSubtaskInput(
       apiKey: base?.apiKey || '',
       model: base?.model || fallbackModel,
       models: ensureModelInList(base?.model || fallbackModel, fallbackModels),
+      endpointPath: base?.endpointPath,
       isEnabled: base?.isEnabled || false,
     };
   }
@@ -193,7 +207,12 @@ function normalizeSubtaskInput(
   const baseModels = Array.isArray(base?.models) ? [...(base?.models || [])] : [];
   const modelsRaw = incomingModels !== null ? incomingModels : baseModels;
   const models = ensureModelInList(model, modelsRaw);
-  return { id: subtaskId, displayName, description, baseUrl, apiKey, model, models, isEnabled };
+  // endpointPath is a PATCH tri-state: missing keeps the old value, an empty
+  // string clears it, and a non-empty value may be either a path or full URL.
+  const endpointPath = Object.prototype.hasOwnProperty.call(record, 'endpointPath')
+    ? normalizeEndpointPath(record.endpointPath)
+    : base?.endpointPath || undefined;
+  return { id: subtaskId, displayName, description, baseUrl, apiKey, model, models, endpointPath, isEnabled };
 }
 
 /**
@@ -577,6 +596,7 @@ async function loadServiceCatalog(): Promise<BuiltInServiceCatalog> {
               apiKey: winner.apiKey,
               model: winner.model,
               models: ensureModelInList(winner.model, winner.models || []),
+              endpointPath: winner.endpointPath,
               isEnabled: winner.isEnabled,
               updatedAt: winner.updatedAt,
             };
@@ -654,6 +674,7 @@ async function persistServiceCatalog(catalog: BuiltInServiceCatalog): Promise<vo
           model: subtask.model,
           // 🔧 NEW (2026-05 #21): 持久化 models 数组
           models: ensureModelInList(subtask.model, subtask.models || []),
+          endpointPath: subtask.endpointPath,
           isEnabled: subtask.isEnabled,
           updatedAt: subtask.updatedAt || new Date().toISOString(),
         };
@@ -765,6 +786,8 @@ export function sanitizeServiceCatalog(
         model: subtask.model,
         // 🔧 NEW (2026-05 #21): models 数组直通到客户端（不含敏感数据）
         models: ensureModelInList(subtask.model, subtask.models || []),
+        // 🔧 NEW (2026-05 #24): endpointPath 直通（video 专用，非敏感数据）
+        endpointPath: subtask.endpointPath,
         isEnabled: subtask.isEnabled,
         updatedAt: subtask.updatedAt,
       };

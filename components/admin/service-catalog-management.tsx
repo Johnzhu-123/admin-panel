@@ -51,6 +51,7 @@ interface SubtaskConfig {
   apiKey: string;
   model: string;
   models?: string[];
+  endpointPath?: string;
   isEnabled: boolean;
   updatedAt?: string;
 }
@@ -171,6 +172,7 @@ function makeEmptySubtask(): SubtaskConfig {
     apiKey: "",
     model: "",
     models: [],
+    endpointPath: "",
     isEnabled: false,
   };
 }
@@ -363,6 +365,9 @@ export function ServiceCatalogManagement() {
         models: Array.isArray(subtask.models) ? subtask.models : (subtask.model ? [subtask.model] : []),
         isEnabled: subtask.isEnabled,
       };
+      if (category === "video") {
+        patch.endpointPath = subtask.endpointPath || "";
+      }
       if (subtask.apiKey && !isMaskedApiKey(subtask.apiKey)) {
         patch.apiKey = subtask.apiKey;
       }
@@ -589,6 +594,21 @@ export function ServiceCatalogManagement() {
               className="bg-slate-900/70 border-slate-600 text-slate-100 placeholder:text-slate-500"
             />
           </div>
+
+          {category === "video" && (
+            <div className="space-y-1.5">
+              <Label className="text-xs text-slate-400">视频 Endpoint Path</Label>
+              <Input
+                value={sub.endpointPath || ""}
+                onChange={(e) => updateSubtaskField(category, "endpointPath", e.target.value)}
+                placeholder="/video/generations 或 https://provider.example.com/v1/videos"
+                className="bg-slate-900/70 border-slate-600 text-slate-100 placeholder:text-slate-500"
+              />
+              <p className="text-[11px] text-slate-500">
+                留空使用默认拼接；填相对路径会拼到 BaseURL 后，填完整 URL 则直接使用该地址。
+              </p>
+            </div>
+          )}
 
           {/* API Key */}
           <div className="space-y-1.5">
