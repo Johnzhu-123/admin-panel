@@ -25,6 +25,18 @@ import {
   AlertTriangle
 } from 'lucide-react';
 
+interface ServiceUsage {
+  service: string;
+  label: string;
+  dailyUsage: number;
+  monthlyUsage: number;
+  totalRequests: number;
+  successfulRequests: number;
+  failedRequests: number;
+  averageResponseTime: number;
+  lastUsed: string | null;
+}
+
 interface User {
   userId: string;
   email: string;
@@ -54,6 +66,7 @@ interface User {
     averageResponseTime: number;
     lastUsed: string | null;
   };
+  serviceUsage?: ServiceUsage[];
 }
 
 interface ClerkUser {
@@ -425,11 +438,26 @@ export function AdminUserManagement() {
   };
 
   const isUsageAbnormal = (user: User) => {
-    const dailyUsagePercent = (user.usage.dailyUsed / user.permissions.quotaLimits.dailyRequests) * 100;
-    const monthlyUsagePercent = (user.usage.monthlyUsed / user.permissions.quotaLimits.monthlyRequests) * 100;
+    const dailyLimit = Math.max(1, user.permissions.quotaLimits.dailyRequests || 0);
+    const monthlyLimit = Math.max(1, user.permissions.quotaLimits.monthlyRequests || 0);
+    const dailyUsagePercent = (user.usage.dailyUsed / dailyLimit) * 100;
+    const monthlyUsagePercent = (user.usage.monthlyUsed / monthlyLimit) * 100;
     
     // 标记为异常：每日使用超过90%或每月使用超过95%
     return dailyUsagePercent > 90 || monthlyUsagePercent > 95;
+  };
+
+  const getServiceUsageRows = (user: User) => {
+    const fallback: ServiceUsage[] = [
+      { service: 'image', label: '图像生成', dailyUsage: 0, monthlyUsage: 0, totalRequests: 0, successfulRequests: 0, failedRequests: 0, averageResponseTime: 0, lastUsed: null },
+      { service: 'tts', label: '云端 TTS', dailyUsage: 0, monthlyUsage: 0, totalRequests: 0, successfulRequests: 0, failedRequests: 0, averageResponseTime: 0, lastUsed: null },
+      { service: 'video', label: '视频生成', dailyUsage: 0, monthlyUsage: 0, totalRequests: 0, successfulRequests: 0, failedRequests: 0, averageResponseTime: 0, lastUsed: null },
+    ];
+    const fromApi = Array.isArray(user.serviceUsage) ? user.serviceUsage : [];
+    return fallback.map((item) => ({
+      ...item,
+      ...fromApi.find((entry) => entry.service === item.service),
+    }));
   };
 
   const getStatusBadge = (status: string) => {
@@ -654,6 +682,9 @@ export function AdminUserManagement() {
               <TableBody>
                 {users.map((user) => {
                   const isAbnormal = isUsageAbnormal(user);
+                  const dailyLimit = Math.max(1, user.permissions.quotaLimits.dailyRequests || 0);
+                  const monthlyLimit = Math.max(1, user.permissions.quotaLimits.monthlyRequests || 0);
+                  const serviceUsageRows = getServiceUsageRows(user);
                   return (
                     <TableRow 
                       key={user.userId} 
@@ -685,27 +716,37 @@ export function AdminUserManagement() {
                         <div className="space-y-3">
                           <div>
                             <div className="flex justify-between text-sm mb-1">
-                              <span className="text-slate-400">每日</span>
-                              <span className={`text-slate-300 ${(user.usage.dailyUsed / user.permissions.quotaLimits.dailyRequests) > 0.9 ? 'text-red-400 font-bold' : ''}`}>
+                              <span className="text-slate-400">每日共享额度</span>
+                              <span className={`text-slate-300 ${(user.usage.dailyUsed / dailyLimit) > 0.9 ? 'text-red-400 font-bold' : ''}`}>
                                 {user.usage.dailyUsed}/{user.permissions.quotaLimits.dailyRequests}
                               </span>
                             </div>
-                            <Progress 
-                              value={(user.usage.dailyUsed / user.permissions.quotaLimits.dailyRequests) * 100} 
-                              className={`h-2 ${(user.usage.dailyUsed / user.permissions.quotaLimits.dailyRequests) > 0.9 ? 'bg-red-900' : 'bg-slate-700'}`}
+                            <Progress
+                              value={(user.usage.dailyUsed / dailyLimit) * 100}
+                              className={`h-2 ${(user.usage.dailyUsed / dailyLimit) > 0.9 ? 'bg-red-900' : 'bg-slate-700'}`}
                             />
                           </div>
                           <div>
                             <div className="flex justify-between text-sm mb-1">
-                              <span className="text-slate-400">每月</span>
-                              <span className={`text-slate-300 ${(user.usage.monthlyUsed / user.permissions.quotaLimits.monthlyRequests) > 0.95 ? 'text-red-400 font-bold' : ''}`}>
+                              <span className="text-slate-400">每月共享额度</span>
+                              <span className={`text-slate-300 ${(user.usage.monthlyUsed / monthlyLimit) > 0.95 ? 'text-red-400 font-bold' : ''}`}>
                                 {user.usage.monthlyUsed}/{user.permissions.quotaLimits.monthlyRequests}
                               </span>
                             </div>
-                            <Progress 
-                              value={(user.usage.monthlyUsed / user.permissions.quotaLimits.monthlyRequests) * 100} 
-                              className={`h-2 ${(user.usage.monthlyUsed / user.permissions.quotaLimits.monthlyRequests) > 0.95 ? 'bg-red-900' : 'bg-slate-700'}`}
+                            <Progress
+                              value={(user.usage.monthlyUsed / monthlyLimit) * 100}
+                              className={`h-2 ${(user.usage.monthlyUsed / monthlyLimit) > 0.95 ? 'bg-red-900' : 'bg-slate-700'}`}
                             />
+                          </div>
+                          <div className="space-y-1 rounded-md border border-slate-700/80 bg-slate-900/40 p-2">
+                            {serviceUsageRows.map((service) => (
+                              <div key={service.service} className="grid grid-cols-[72px_1fr] items-center gap-2 text-xs">
+                                <span className="text-slate-400">{service.label}</span>
+                                <span className="text-slate-200">
+                                  今日 {service.dailyUsage} / 本月 {service.monthlyUsage}
+                                </span>
+                              </div>
+                            ))}
                           </div>
                         </div>
                       </TableCell>
@@ -714,6 +755,19 @@ export function AdminUserManagement() {
                           <div className="text-slate-300">总请求: <span className="text-white font-medium">{user.stats.totalRequests}</span></div>
                           <div className="text-slate-300">成功率: <span className="text-green-400 font-medium">{user.stats.totalRequests > 0 ? Math.round((user.stats.successfulRequests / user.stats.totalRequests) * 100) : 0}%</span></div>
                           <div className="text-slate-300">平均响应: <span className="text-blue-400 font-medium">{user.stats.averageResponseTime}ms</span></div>
+                          <div className="mt-2 space-y-1 border-t border-slate-700/80 pt-2">
+                            {serviceUsageRows.map((service) => (
+                              <div key={service.service} className="flex justify-between gap-3 text-xs">
+                                <span className="text-slate-400">{service.label}</span>
+                                <span className="text-slate-200">
+                                  {service.totalRequests} 次
+                                  {service.failedRequests > 0 && (
+                                    <span className="text-red-400"> / 失败 {service.failedRequests}</span>
+                                  )}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
                         </div>
                       </TableCell>
                       <TableCell>

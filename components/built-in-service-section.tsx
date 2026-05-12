@@ -6,7 +6,7 @@
 
 "use client";
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { useUser } from '@clerk/nextjs';
 
 interface ServiceStatus {
@@ -32,6 +32,17 @@ type BuiltInUserSummary = {
   monthlyRequests: number;
   dailyUsed: number;
   monthlyUsed: number;
+  serviceUsage?: Array<{
+    service: string;
+    label: string;
+    dailyUsage: number;
+    monthlyUsage: number;
+    totalRequests: number;
+    successfulRequests: number;
+    failedRequests: number;
+    averageResponseTime: number;
+    lastUsed: string | null;
+  }>;
 };
 
 // Styles matching the existing API modal design
@@ -126,6 +137,64 @@ const styles = {
     fontWeight: 600,
     color: '#e2e8f0',
     margin: 0,
+  },
+  serviceUsagePanel: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: '8px',
+    padding: '12px 16px',
+    background: '#101116',
+    border: '1px solid #2b2b31',
+    borderRadius: '8px',
+  },
+  serviceUsageHeader: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    gap: '8px',
+  },
+  serviceUsageTitle: {
+    margin: 0,
+    fontSize: '0.75rem',
+    color: '#d4d4dc',
+    fontWeight: 700,
+  },
+  serviceUsageHint: {
+    margin: 0,
+    fontSize: '0.68rem',
+    color: '#7c7c86',
+  },
+  serviceUsageGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
+    gap: '8px',
+  },
+  serviceUsageItem: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: '4px',
+    minWidth: 0,
+    padding: '8px',
+    background: '#0b0c10',
+    border: '1px solid #25262d',
+    borderRadius: '6px',
+  },
+  serviceUsageLabel: {
+    margin: 0,
+    fontSize: '0.7rem',
+    color: '#a8a8b3',
+    fontWeight: 700,
+  },
+  serviceUsageValue: {
+    margin: 0,
+    fontSize: '0.78rem',
+    color: '#f1f1f5',
+    fontWeight: 700,
+  },
+  serviceUsageMeta: {
+    margin: 0,
+    fontSize: '0.68rem',
+    color: '#7c7c86',
   },
   statusInfo: {
     display: 'flex',
@@ -225,6 +294,18 @@ export const BuiltInServiceSection: React.FC<BuiltInServiceSectionProps> = ({
   const [switching, setSwitching] = useState<boolean>(false);
   const [error, setError] = useState<string>('');
   const [success, setSuccess] = useState<string>('');
+  const serviceUsageRows = useMemo(() => {
+    const defaults = [
+      { service: 'image', label: '图像生成', dailyUsage: 0, monthlyUsage: 0, totalRequests: 0 },
+      { service: 'tts', label: '云端 TTS', dailyUsage: 0, monthlyUsage: 0, totalRequests: 0 },
+      { service: 'video', label: '视频生成', dailyUsage: 0, monthlyUsage: 0, totalRequests: 0 },
+    ];
+    const fromApi = Array.isArray(userSummary?.serviceUsage) ? userSummary.serviceUsage : [];
+    return defaults.map((item) => ({
+      ...item,
+      ...fromApi.find((entry) => entry.service === item.service),
+    }));
+  }, [userSummary?.serviceUsage]);
 
   // Load service data function (defined before useEffect)
   const loadServiceData = useCallback(async () => {
@@ -443,11 +524,11 @@ export const BuiltInServiceSection: React.FC<BuiltInServiceSectionProps> = ({
               </div>
               <div style={styles.quotaBlock}>
                 <p style={styles.quotaLabel}>每日上限</p>
-                <p style={styles.quotaValue}>{userSummary.dailyRequests} 张</p>
+                <p style={styles.quotaValue}>{userSummary.dailyRequests} 次</p>
               </div>
               <div style={styles.quotaBlock}>
                 <p style={styles.quotaLabel}>每月上限</p>
-                <p style={styles.quotaValue}>{userSummary.monthlyRequests} 张</p>
+                <p style={styles.quotaValue}>{userSummary.monthlyRequests} 次</p>
               </div>
             </div>
           )}
@@ -456,11 +537,31 @@ export const BuiltInServiceSection: React.FC<BuiltInServiceSectionProps> = ({
             <div style={styles.usageRow}>
               <div style={styles.usageBlock}>
                 <p style={styles.usageLabel}>今日已用</p>
-                <p style={styles.usageValue}>{userSummary.dailyUsed} 张</p>
+                <p style={styles.usageValue}>{userSummary.dailyUsed} 次</p>
               </div>
               <div style={styles.usageBlock}>
                 <p style={styles.usageLabel}>本月已用</p>
-                <p style={styles.usageValue}>{userSummary.monthlyUsed} 张</p>
+                <p style={styles.usageValue}>{userSummary.monthlyUsed} 次</p>
+              </div>
+            </div>
+          )}
+
+          {userSummary && (
+            <div style={styles.serviceUsagePanel}>
+              <div style={styles.serviceUsageHeader}>
+                <p style={styles.serviceUsageTitle}>按服务用量</p>
+                <p style={styles.serviceUsageHint}>共享同一内置服务配额</p>
+              </div>
+              <div style={styles.serviceUsageGrid}>
+                {serviceUsageRows.map((item) => (
+                  <div key={item.service} style={styles.serviceUsageItem}>
+                    <p style={styles.serviceUsageLabel}>{item.label}</p>
+                    <p style={styles.serviceUsageValue}>
+                      今日 {item.dailyUsage} / 本月 {item.monthlyUsage}
+                    </p>
+                    <p style={styles.serviceUsageMeta}>累计 {item.totalRequests} 次</p>
+                  </div>
+                ))}
               </div>
             </div>
           )}

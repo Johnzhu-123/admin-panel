@@ -7,7 +7,12 @@
 import { NextResponse } from "next/server";
 import { noStoreHeaders } from "@/lib/ai";
 import { getBuiltInAPIService } from "@/lib/built-in-api-service";
-import { getBuiltInRuntimeSettings, sanitizeServiceCatalog, getSubtaskPresets } from "@/lib/built-in-api-service/db";
+import {
+  getBuiltInRuntimeSettings,
+  sanitizeServiceCatalog,
+  getSubtaskPresets,
+  getUserServiceUsageStats,
+} from "@/lib/built-in-api-service/db";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -273,6 +278,9 @@ export async function GET(req: Request) {
         }
         // 🔧 UPDATED: Now using await for async getUserQuotaUsage
         const quotaUsage = await builtInService.getUserQuotaUsage(userId);
+        const serviceUsage = await getUserServiceUsageStats(user.userId || userId, user.email);
+        const serviceDailyUsed = serviceUsage.reduce((sum, item) => sum + (item.dailyUsage || 0), 0);
+        const serviceMonthlyUsed = serviceUsage.reduce((sum, item) => sum + (item.monthlyUsage || 0), 0);
         const dailyRequests = user.permissions?.quotaLimits?.dailyRequests ?? 0;
         const monthlyRequests = user.permissions?.quotaLimits?.monthlyRequests ?? 0;
         return NextResponse.json(
@@ -281,8 +289,9 @@ export async function GET(req: Request) {
               group: resolveUserGroup(dailyRequests),
               dailyRequests,
               monthlyRequests,
-              dailyUsed: quotaUsage?.dailyRequests ?? 0,
-              monthlyUsed: quotaUsage?.monthlyRequests ?? 0,
+              dailyUsed: serviceDailyUsed || quotaUsage?.dailyRequests || 0,
+              monthlyUsed: serviceMonthlyUsed || quotaUsage?.monthlyRequests || 0,
+              serviceUsage,
             },
           },
           { headers: noStoreHeaders() }

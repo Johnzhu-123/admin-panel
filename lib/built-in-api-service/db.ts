@@ -7,6 +7,149 @@ import { sql } from '@vercel/postgres';
 import { AuthorizedUser } from './types';
 import { encryptSecret, decryptSecret, maskSecret } from './encryption';
 
+export type BuiltInUsageServiceStat = {
+  service: string;
+  label: string;
+  dailyUsage: number;
+  monthlyUsage: number;
+  totalRequests: number;
+  successfulRequests: number;
+  failedRequests: number;
+  averageResponseTime: number;
+  lastUsed: string | null;
+};
+
+const TRACKED_USAGE_SERVICES = [
+  { service: 'image', label: '图像生成' },
+  { service: 'tts', label: '云端 TTS' },
+  { service: 'video', label: '视频生成' },
+] as const;
+
+export const normalizeBuiltInUsageService = (serviceId: unknown) => {
+  const raw = String(serviceId || '').trim().toLowerCase();
+  if (raw.startsWith('tts')) return { service: 'tts', label: '云端 TTS' };
+  if (raw.startsWith('video')) return { service: 'video', label: '视频生成' };
+  if (raw.startsWith('image')) return { service: 'image', label: '图像生成' };
+  if (
+    raw === 'built-in-default' ||
+    raw === 'gemini-built-in' ||
+    raw.includes('image') ||
+    raw.includes('gemini')
+  ) {
+    return { service: 'image', label: '图像生成' };
+  }
+  return { service: raw || 'other', label: raw || '其它服务' };
+};
+
+type ServiceUsageAccumulator = BuiltInUsageServiceStat & {
+  responseTimeTotal: number;
+  responseTimeWeight: number;
+};
+
+const createServiceUsageMap = () => {
+  const map = new Map<string, ServiceUsageAccumulator>();
+  for (const service of TRACKED_USAGE_SERVICES) {
+    map.set(service.service, {
+      service: service.service,
+      label: service.label,
+      dailyUsage: 0,
+      monthlyUsage: 0,
+      totalRequests: 0,
+      successfulRequests: 0,
+      failedRequests: 0,
+      averageResponseTime: 0,
+      lastUsed: null,
+      responseTimeTotal: 0,
+      responseTimeWeight: 0,
+    });
+  }
+  return map;
+};
+
+const normalizeDbDate = (value: unknown): string | null => {
+  if (!value) return null;
+  if (value instanceof Date) return value.toISOString();
+  const parsed = new Date(String(value));
+  return Number.isNaN(parsed.getTime()) ? String(value) : parsed.toISOString();
+};
+
+const addServiceUsageRow = (
+  map: Map<string, ServiceUsageAccumulator>,
+  row: {
+    service_id?: unknown;
+    daily_usage?: unknown;
+    monthly_usage?: unknown;
+    total_requests?: unknown;
+    successful_requests?: unknown;
+    failed_requests?: unknown;
+    average_response_time?: unknown;
+    last_used?: unknown;
+  }
+) => {
+  if (!row.service_id) return;
+  const normalized = normalizeBuiltInUsageService(row.service_id);
+  const current =
+    map.get(normalized.service) || {
+      service: normalized.service,
+      label: normalized.label,
+      dailyUsage: 0,
+      monthlyUsage: 0,
+      totalRequests: 0,
+      successfulRequests: 0,
+      failedRequests: 0,
+      averageResponseTime: 0,
+      lastUsed: null,
+      responseTimeTotal: 0,
+      responseTimeWeight: 0,
+    };
+
+  const totalRequests = Number(row.total_requests) || 0;
+  const averageResponseTime = Number(row.average_response_time) || 0;
+  current.dailyUsage += Number(row.daily_usage) || 0;
+  current.monthlyUsage += Number(row.monthly_usage) || 0;
+  current.totalRequests += totalRequests;
+  current.successfulRequests += Number(row.successful_requests) || 0;
+  current.failedRequests += Number(row.failed_requests) || 0;
+  if (averageResponseTime > 0 && totalRequests > 0) {
+    current.responseTimeTotal += averageResponseTime * totalRequests;
+    current.responseTimeWeight += totalRequests;
+  }
+
+  const lastUsed = normalizeDbDate(row.last_used);
+  if (lastUsed && (!current.lastUsed || new Date(lastUsed) > new Date(current.lastUsed))) {
+    current.lastUsed = lastUsed;
+  }
+  map.set(normalized.service, current);
+};
+
+const finalizeServiceUsageMap = (
+  map: Map<string, ServiceUsageAccumulator>
+): BuiltInUsageServiceStat[] => {
+  const serviceOrder = new Map<string, number>(
+    TRACKED_USAGE_SERVICES.map((item, index) => [item.service, index])
+  );
+  return Array.from(map.values())
+    .map((item) => ({
+      service: item.service,
+      label: item.label,
+      dailyUsage: item.dailyUsage,
+      monthlyUsage: item.monthlyUsage,
+      totalRequests: item.totalRequests,
+      successfulRequests: item.successfulRequests,
+      failedRequests: item.failedRequests,
+      averageResponseTime:
+        item.responseTimeWeight > 0
+          ? Math.round(item.responseTimeTotal / item.responseTimeWeight)
+          : 0,
+      lastUsed: item.lastUsed,
+    }))
+    .sort((a, b) => {
+      const left = serviceOrder.get(a.service) ?? 99;
+      const right = serviceOrder.get(b.service) ?? 99;
+      return left === right ? b.totalRequests - a.totalRequests : left - right;
+    });
+};
+
 /**
  * 6 大类内置服务，与桌面端 API 设置面板严格 1:1 对齐：
  *   - 多模态 AI (multimodal) → desktop 多模态 AI tab
@@ -1339,22 +1482,22 @@ export async function getUserUsageStats(userId: string): Promise<{
   try {
     const normalizedUserId = userId.trim().toLowerCase();
 
-    // Get today's usage - 使用大小写不敏感匹配
+    // Get today's usage - 使用大小写不敏感匹配，并按北京时间统计用户可见「今日」
     const { rows: dailyRows } = await sql`
       SELECT COUNT(*) as count
       FROM api_usage_records
       WHERE LOWER(user_id) = ${normalizedUserId}
-        AND created_at >= CURRENT_DATE
-        AND created_at < CURRENT_DATE + INTERVAL '1 day'
+        AND (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Shanghai')::date
+            = (NOW() AT TIME ZONE 'Asia/Shanghai')::date
     `;
 
-    // Get this month's usage - 使用大小写不敏感匹配
+    // Get this month's usage - 使用大小写不敏感匹配，并按北京时间统计用户可见「本月」
     const { rows: monthlyRows } = await sql`
       SELECT COUNT(*) as count
       FROM api_usage_records
       WHERE LOWER(user_id) = ${normalizedUserId}
-        AND created_at >= DATE_TRUNC('month', CURRENT_DATE)
-        AND created_at < DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'
+        AND date_trunc('month', (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Shanghai'))
+            = date_trunc('month', NOW() AT TIME ZONE 'Asia/Shanghai')
     `;
 
     return {
@@ -1364,6 +1507,43 @@ export async function getUserUsageStats(userId: string): Promise<{
   } catch (error) {
     console.error('Failed to get user usage stats:', error);
     return { dailyUsage: 0, monthlyUsage: 0 };
+  }
+}
+
+export async function getUserServiceUsageStats(
+  userId: string,
+  email?: string
+): Promise<BuiltInUsageServiceStat[]> {
+  try {
+    const normalizedUserId = userId.trim().toLowerCase();
+    const normalizedEmail = (email || '').trim().toLowerCase();
+
+    const { rows } = await sql`
+      SELECT
+        service_id,
+        COUNT(CASE WHEN (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Shanghai')::date
+                       = (NOW() AT TIME ZONE 'Asia/Shanghai')::date THEN 1 END) as daily_usage,
+        COUNT(CASE WHEN date_trunc('month', (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Shanghai'))
+                       = date_trunc('month', NOW() AT TIME ZONE 'Asia/Shanghai') THEN 1 END) as monthly_usage,
+        COUNT(request_id) as total_requests,
+        COUNT(CASE WHEN success = true THEN 1 END) as successful_requests,
+        COUNT(CASE WHEN success = false THEN 1 END) as failed_requests,
+        COALESCE(AVG(NULLIF(response_time, 0))::int, 0) as average_response_time,
+        MAX(created_at) as last_used
+      FROM api_usage_records
+      WHERE LOWER(user_id) = ${normalizedUserId}
+        OR (${normalizedEmail} <> '' AND LOWER(user_id) = ${normalizedEmail})
+      GROUP BY service_id
+    `;
+
+    const map = createServiceUsageMap();
+    for (const row of rows) {
+      addServiceUsageRow(map, row);
+    }
+    return finalizeServiceUsageMap(map);
+  } catch (error) {
+    console.error('Failed to get user service usage stats:', error);
+    return finalizeServiceUsageMap(createServiceUsageMap());
   }
 }
 
@@ -1387,6 +1567,7 @@ export async function getAllUsersUsageStats(): Promise<Array<{
   failedRequests: number;
   averageResponseTime: number;
   lastUsed: string | null;
+  serviceUsage: BuiltInUsageServiceStat[];
 }>> {
   try {
     await ensureAuthorizedUsersTable();
@@ -1396,8 +1577,10 @@ export async function getAllUsersUsageStats(): Promise<Array<{
       SELECT
         u.user_id,
         u.email,
-        COUNT(CASE WHEN r.created_at >= CURRENT_DATE THEN 1 END) as daily_usage,
-        COUNT(CASE WHEN r.created_at >= DATE_TRUNC('month', CURRENT_DATE) THEN 1 END) as monthly_usage,
+        COUNT(CASE WHEN (r.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Shanghai')::date
+                       = (NOW() AT TIME ZONE 'Asia/Shanghai')::date THEN 1 END) as daily_usage,
+        COUNT(CASE WHEN date_trunc('month', (r.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Shanghai'))
+                       = date_trunc('month', NOW() AT TIME ZONE 'Asia/Shanghai') THEN 1 END) as monthly_usage,
         COUNT(r.request_id) as total_requests,
         COUNT(CASE WHEN r.success = true THEN 1 END) as successful_requests,
         COUNT(CASE WHEN r.success = false THEN 1 END) as failed_requests,
@@ -1412,6 +1595,38 @@ export async function getAllUsersUsageStats(): Promise<Array<{
       GROUP BY u.user_id, u.email
     `;
 
+    const { rows: serviceRows } = await sql`
+      SELECT
+        u.user_id,
+        u.email,
+        r.service_id,
+        COUNT(CASE WHEN (r.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Shanghai')::date
+                       = (NOW() AT TIME ZONE 'Asia/Shanghai')::date THEN 1 END) as daily_usage,
+        COUNT(CASE WHEN date_trunc('month', (r.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Shanghai'))
+                       = date_trunc('month', NOW() AT TIME ZONE 'Asia/Shanghai') THEN 1 END) as monthly_usage,
+        COUNT(r.request_id) as total_requests,
+        COUNT(CASE WHEN r.success = true THEN 1 END) as successful_requests,
+        COUNT(CASE WHEN r.success = false THEN 1 END) as failed_requests,
+        COALESCE(AVG(NULLIF(r.response_time, 0))::int, 0) as average_response_time,
+        MAX(r.created_at) as last_used
+      FROM authorized_users u
+      LEFT JOIN api_usage_records r ON (
+        LOWER(u.user_id) = LOWER(r.user_id) OR
+        LOWER(u.email) = LOWER(r.user_id)
+      )
+      WHERE u.status = 'active'
+      GROUP BY u.user_id, u.email, r.service_id
+    `;
+
+    const serviceUsageByUser = new Map<string, Map<string, ServiceUsageAccumulator>>();
+    for (const row of serviceRows) {
+      const userKey = String(row.user_id || '').trim().toLowerCase();
+      if (!userKey) continue;
+      const map = serviceUsageByUser.get(userKey) || createServiceUsageMap();
+      addServiceUsageRow(map, row);
+      serviceUsageByUser.set(userKey, map);
+    }
+
     return rows.map(row => ({
       userId: row.user_id,
       dailyUsage: parseInt(row.daily_usage || '0'),
@@ -1425,6 +1640,10 @@ export async function getAllUsersUsageStats(): Promise<Array<{
             ? row.last_used.toISOString()
             : String(row.last_used))
         : null,
+      serviceUsage: finalizeServiceUsageMap(
+        serviceUsageByUser.get(String(row.user_id || '').trim().toLowerCase()) ||
+          createServiceUsageMap()
+      ),
     }));
   } catch (error) {
     console.error('Failed to get all users usage stats:', error);

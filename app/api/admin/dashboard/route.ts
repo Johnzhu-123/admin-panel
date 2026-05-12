@@ -7,7 +7,7 @@ import { requireAdminSession } from "@/app/api/admin/_auth";
 import { NextResponse } from "next/server";
 import { noStoreHeaders } from "@/lib/ai";
 import { getBuiltInAPIService } from "@/lib/built-in-api-service";
-import { getDatabaseStats } from "@/lib/built-in-api-service/db";
+import { getDatabaseStats, normalizeBuiltInUsageService } from "@/lib/built-in-api-service/db";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -477,22 +477,6 @@ const FALLBACK_USAGE_SUMMARY: DashboardUsageSummary = {
   lastRequestAt: null,
 };
 
-const normalizeUsageService = (serviceId: unknown) => {
-  const raw = String(serviceId || '').trim().toLowerCase();
-  if (raw.startsWith('tts')) return { service: 'tts', label: '云端 TTS' };
-  if (raw.startsWith('video')) return { service: 'video', label: '视频生成' };
-  if (raw.startsWith('image')) return { service: 'image', label: '图像生成' };
-  if (
-    raw === 'built-in-default' ||
-    raw === 'gemini-built-in' ||
-    raw.includes('image') ||
-    raw.includes('gemini')
-  ) {
-    return { service: 'image', label: '图像生成' };
-  }
-  return { service: raw || 'other', label: raw || '其它服务' };
-};
-
 async function getDashboardUsageSummary(): Promise<DashboardUsageSummary> {
   try {
     const { sql } = await import('@vercel/postgres');
@@ -577,7 +561,7 @@ async function getDashboardServiceBreakdown(): Promise<DashboardServiceBreakdown
     }>();
 
     for (const row of rows) {
-      const normalized = normalizeUsageService(row.service_id);
+      const normalized = normalizeBuiltInUsageService(row.service_id);
       const requests = Number(row.requests) || 0;
       const successfulRequests = Number(row.successful_requests) || 0;
       const failedRequests = Number(row.failed_requests) || 0;
@@ -773,6 +757,7 @@ async function getAllUsersWithStats(service: any) {
         monthlyRemaining: Math.max(0, monthlyLimit - monthlyUsed)
       },
       stats,
+      serviceUsage: dbUsage?.serviceUsage || [],
     };
   });
 }
