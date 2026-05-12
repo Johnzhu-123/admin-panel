@@ -38,6 +38,30 @@ const resolveIndextts2ServiceUrl = (serviceUrl?: string) => {
 const resolveCloudBaseUrl = (baseUrl?: string) =>
   typeof baseUrl === "string" ? baseUrl.trim() : "";
 
+async function recordBuiltInTtsUsage(
+  body: Record<string, unknown>,
+  success: boolean,
+  startedAt: number,
+  error?: string
+) {
+  if (body?.useBuiltInService !== true) return;
+  const userId = typeof body?.userId === "string" ? body.userId.trim() : "";
+  if (!userId) return;
+  try {
+    const { recordUsageToDatabase } = await import("@/lib/built-in-api-service/db");
+    await recordUsageToDatabase(
+      `tts_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+      userId,
+      "tts/default",
+      success,
+      Math.max(1, Date.now() - startedAt),
+      error
+    );
+  } catch (usageError) {
+    console.error("[TTS API] failed to record usage:", usageError);
+  }
+}
+
 const arrayBufferToBase64 = (buffer: ArrayBuffer) => {
   const bytes = new Uint8Array(buffer);
   const chunkSize = 0x8000;
@@ -126,8 +150,10 @@ async function synthesizeWithOpenAiCompatibleTts(
 
 export async function POST(request: NextRequest) {
   const startedAt = Date.now();
+  let bodyForUsage: Record<string, unknown> = {};
   try {
     let body = await request.json();
+    bodyForUsage = body as Record<string, unknown>;
 
     // admin-panel 端：useBuiltInService=true 时从 catalog 注入 baseUrl/apiKey/model
     if (body?.useBuiltInService === true) {
@@ -137,7 +163,9 @@ export async function POST(request: NextRequest) {
       );
       if (applied) {
         body = enriched;
+        bodyForUsage = body as Record<string, unknown>;
       } else {
+        await recordBuiltInTtsUsage(bodyForUsage, false, startedAt, "TTS 服务未在管理后台启用或配置");
         return NextResponse.json(
           { error: "TTS 服务未在管理后台启用或配置" },
           { status: 503 }
@@ -175,6 +203,7 @@ export async function POST(request: NextRequest) {
     } = body;
 
     if (!text?.trim()) {
+      await recordBuiltInTtsUsage(bodyForUsage, false, startedAt, "缺少文本内容");
       return NextResponse.json(
         { error: "缺少文本内容" },
         { status: 400 }
@@ -182,6 +211,12 @@ export async function POST(request: NextRequest) {
     }
 
     if ((provider || "indextts2") === "indextts2" && !referenceAudioBase64) {
+      await recordBuiltInTtsUsage(
+        bodyForUsage,
+        false,
+        startedAt,
+        "index-tts2 缺少音色参考音频"
+      );
       return NextResponse.json(
         {
           error:
@@ -230,24 +265,28 @@ export async function POST(request: NextRequest) {
         textLength: text.length,
         elapsedMs: Date.now() - startedAt,
       });
+      await recordBuiltInTtsUsage(bodyForUsage, true, startedAt);
       return NextResponse.json(result);
     }
 
     if (provider === "openai") {
       const resolvedBaseUrl = resolveCloudBaseUrl(baseUrl);
       if (!resolvedBaseUrl) {
+        await recordBuiltInTtsUsage(bodyForUsage, false, startedAt, "云端 TTS 缺少 Base URL");
         return NextResponse.json(
           { error: "云端 TTS 缺少 Base URL" },
           { status: 400 }
         );
       }
       if (!apiKey?.trim()) {
+        await recordBuiltInTtsUsage(bodyForUsage, false, startedAt, "云端 TTS 缺少 API Key");
         return NextResponse.json(
           { error: "云端 TTS 缺少 API Key" },
           { status: 400 }
         );
       }
       if (!model?.trim()) {
+        await recordBuiltInTtsUsage(bodyForUsage, false, startedAt, "云端 TTS 缺少模型");
         return NextResponse.json(
           { error: "云端 TTS 缺少模型" },
           { status: 400 }
@@ -265,6 +304,7 @@ export async function POST(request: NextRequest) {
         textLength: text.length,
         elapsedMs: Date.now() - startedAt,
       });
+      await recordBuiltInTtsUsage(bodyForUsage, true, startedAt);
       return NextResponse.json(result);
     }
 
@@ -281,6 +321,7 @@ export async function POST(request: NextRequest) {
       hasReferenceAudio: !!referenceAudioBase64,
       elapsedMs: Date.now() - startedAt,
     });
+    await recordBuiltInTtsUsage(bodyForUsage, true, startedAt);
     return NextResponse.json(result);
   } catch (err) {
     const message =
@@ -289,6 +330,7 @@ export async function POST(request: NextRequest) {
     console.error("[TTS API]", message, {
       elapsedMs: Date.now() - startedAt,
     });
+    await recordBuiltInTtsUsage(bodyForUsage, false, startedAt, message);
     return NextResponse.json(
       {
         error: isTimeout

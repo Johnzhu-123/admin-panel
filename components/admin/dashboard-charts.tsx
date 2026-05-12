@@ -40,7 +40,23 @@ interface UsageStats {
     requestsLast24h: number;
     averageResponseTimeLast24h: number;
   };
+  serviceBreakdown?: Array<{
+    service: string;
+    label: string;
+    requests: number;
+    successfulRequests: number;
+    failedRequests: number;
+    averageResponseTime: number;
+    successRate: number;
+  }>;
 }
+
+const SERVICE_COLORS: Record<string, string> = {
+  image: '#3b82f6',
+  tts: '#14b8a6',
+  video: '#f59e0b',
+  other: '#64748b',
+};
 
 export function AdminDashboardCharts() {
   const [usageStats, setUsageStats] = useState<UsageStats | null>(null);
@@ -99,11 +115,18 @@ export function AdminDashboardCharts() {
     { name: '失败请求', value: Math.round(usageStats.summary.totalRequests * (100 - usageStats.summary.successRate) / 100), color: '#ef4444' }
   ];
 
-  const userTypeData = [
-    { name: '基础用户', value: 60, color: '#3b82f6' },
-    { name: '高级用户', value: 30, color: '#8b5cf6' },
-    { name: 'VIP用户', value: 10, color: '#f59e0b' }
-  ];
+  const serviceDistributionData = (usageStats.serviceBreakdown || [])
+    .filter((item) => Number(item.requests) > 0)
+    .map((item) => ({
+      name: item.label,
+      service: item.service,
+      value: Number(item.requests) || 0,
+      successfulRequests: Number(item.successfulRequests) || 0,
+      failedRequests: Number(item.failedRequests) || 0,
+      averageResponseTime: Number(item.averageResponseTime) || 0,
+      successRate: Number(item.successRate) || 0,
+      color: SERVICE_COLORS[item.service] || SERVICE_COLORS.other,
+    }));
 
   return (
     <div className="space-y-6">
@@ -402,47 +425,74 @@ export function AdminDashboardCharts() {
 
                 <Card className="bg-slate-700/30 border-slate-600">
                   <CardHeader>
-                    <CardTitle className="text-white">用户类型分布</CardTitle>
-                    <CardDescription className="text-slate-400">不同类型用户的占比</CardDescription>
+                    <CardTitle className="text-white">服务用量分布</CardTitle>
+                    <CardDescription className="text-slate-400">图像生成、云端 TTS 与视频生成请求量</CardDescription>
                   </CardHeader>
                   <CardContent>
-                    <ResponsiveContainer width="100%" height={300}>
-                      <PieChart>
-                        <Pie
-                          data={userTypeData}
-                          cx="50%"
-                          cy="50%"
-                          innerRadius={60}
-                          outerRadius={100}
-                          paddingAngle={5}
-                          dataKey="value"
-                        >
-                          {userTypeData.map((entry, index) => (
-                            <Cell key={`cell-${index}`} fill={entry.color} />
+                    {serviceDistributionData.length > 0 ? (
+                      <>
+                        <ResponsiveContainer width="100%" height={300}>
+                          <PieChart>
+                            <Pie
+                              data={serviceDistributionData}
+                              cx="50%"
+                              cy="50%"
+                              innerRadius={60}
+                              outerRadius={100}
+                              paddingAngle={5}
+                              dataKey="value"
+                            >
+                              {serviceDistributionData.map((entry, index) => (
+                                <Cell key={`cell-${entry.service}-${index}`} fill={entry.color} />
+                              ))}
+                            </Pie>
+                            <Tooltip
+                              formatter={(value, _name, item) => {
+                                const payload = item?.payload as
+                                  | {
+                                      successfulRequests?: number;
+                                      failedRequests?: number;
+                                      averageResponseTime?: number;
+                                      successRate?: number;
+                                    }
+                                  | undefined;
+                                return [
+                                  `${value} 次，成功 ${payload?.successfulRequests || 0} 次，失败 ${payload?.failedRequests || 0} 次，成功率 ${payload?.successRate || 0}%，平均 ${payload?.averageResponseTime || 0}ms`,
+                                  '请求数',
+                                ];
+                              }}
+                              contentStyle={{
+                                backgroundColor: '#1f2937',
+                                border: '1px solid #374151',
+                                borderRadius: '8px',
+                                color: '#fff'
+                              }}
+                            />
+                          </PieChart>
+                        </ResponsiveContainer>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-4">
+                          {serviceDistributionData.map((entry, index) => (
+                            <div
+                              key={`${entry.service}-${index}`}
+                              className="flex items-center justify-between gap-3 rounded-md border border-slate-600/70 bg-slate-800/40 px-3 py-2"
+                            >
+                              <div className="flex items-center gap-2 min-w-0">
+                                <div
+                                  className="w-3 h-3 rounded-full shrink-0"
+                                  style={{ backgroundColor: entry.color }}
+                                />
+                                <span className="text-sm text-slate-300 truncate">{entry.name}</span>
+                              </div>
+                              <span className="text-sm font-medium text-white shrink-0">{entry.value} 次</span>
+                            </div>
                           ))}
-                        </Pie>
-                        <Tooltip 
-                          formatter={(value) => [`${value}%`, '占比']} 
-                          contentStyle={{ 
-                            backgroundColor: '#1f2937', 
-                            border: '1px solid #374151',
-                            borderRadius: '8px',
-                            color: '#fff'
-                          }}
-                        />
-                      </PieChart>
-                    </ResponsiveContainer>
-                    <div className="flex justify-center gap-4 mt-4">
-                      {userTypeData.map((entry, index) => (
-                        <div key={index} className="flex items-center gap-2">
-                          <div 
-                            className="w-3 h-3 rounded-full" 
-                            style={{ backgroundColor: entry.color }}
-                          />
-                          <span className="text-sm text-slate-300">{entry.name}</span>
                         </div>
-                      ))}
-                    </div>
+                      </>
+                    ) : (
+                      <div className="flex h-[300px] items-center justify-center rounded-md border border-dashed border-slate-600 bg-slate-800/30 text-sm text-slate-400">
+                        暂无服务用量数据
+                      </div>
+                    )}
                   </CardContent>
                 </Card>
               </div>
@@ -453,4 +503,3 @@ export function AdminDashboardCharts() {
     </div>
   );
 }
-

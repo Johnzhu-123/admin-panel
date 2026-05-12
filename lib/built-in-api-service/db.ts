@@ -1036,6 +1036,10 @@ export async function initializeUsageTrackingTable(): Promise<void> {
       CREATE INDEX IF NOT EXISTS idx_user_date_usage ON api_usage_records(user_id, created_at)
     `;
 
+    await sql`
+      CREATE INDEX IF NOT EXISTS idx_service_created_usage ON api_usage_records(service_id, created_at)
+    `;
+
     console.log('✅ api_usage_records table initialized successfully');
   } catch (error) {
     console.error('❌ Failed to initialize api_usage_records table:', error);

@@ -157,11 +157,39 @@ type VideoProxyRequest = {
   method?: "GET" | "POST";
   payload?: Record<string, unknown>;
   useBuiltInService?: boolean;
+  userId?: string;
 };
 
+async function recordBuiltInVideoUsage(
+  body: VideoProxyRequest | null | undefined,
+  success: boolean,
+  startedAt: number,
+  error?: string
+) {
+  if (body?.useBuiltInService !== true) return;
+  const userId = typeof body.userId === "string" ? body.userId.trim() : "";
+  if (!userId) return;
+  try {
+    const { recordUsageToDatabase } = await import("@/lib/built-in-api-service/db");
+    await recordUsageToDatabase(
+      `video_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+      userId,
+      "video/default",
+      success,
+      Math.max(1, Date.now() - startedAt),
+      error
+    );
+  } catch (usageError) {
+    console.error("[Video API] failed to record usage:", usageError);
+  }
+}
+
 export async function POST(request: Request) {
+  const startedAt = Date.now();
+  let bodyForUsage: VideoProxyRequest | null = null;
   try {
     let body = (await request.json()) as VideoProxyRequest;
+    bodyForUsage = body;
 
     // admin-panel 端：useBuiltInService=true 时从 catalog 注入 endpointUrl/apiKey
     if (body?.useBuiltInService === true) {
@@ -186,7 +214,9 @@ export async function POST(request: Request) {
         }
         if (!merged.apiKey) merged.apiKey = config.apiKey;
         body = merged;
+        bodyForUsage = body;
       } else {
+        await recordBuiltInVideoUsage(bodyForUsage, false, startedAt, "视频服务未在管理后台启用或配置");
         return NextResponse.json(
           { error: "视频服务未在管理后台启用或配置" },
           { status: 503, headers: noStoreHeaders() }
@@ -201,12 +231,14 @@ export async function POST(request: Request) {
     const method = body?.method === "GET" ? "GET" : "POST";
 
     if (!endpointUrl) {
+      await recordBuiltInVideoUsage(bodyForUsage, false, startedAt, "缺少有效的视频接口地址。");
       return NextResponse.json(
         { error: "缺少有效的视频接口地址。" },
         { status: 400, headers: noStoreHeaders() }
       );
     }
     if (method === "POST" && !payload) {
+      await recordBuiltInVideoUsage(bodyForUsage, false, startedAt, "缺少视频请求体。");
       return NextResponse.json(
         { error: "缺少视频请求体。" },
         { status: 400, headers: noStoreHeaders() }
@@ -217,6 +249,7 @@ export async function POST(request: Request) {
       typeof upstreamBody === "string" &&
       upstreamBody.length > MAX_VIDEO_UPSTREAM_BODY_CHARS
     ) {
+      await recordBuiltInVideoUsage(bodyForUsage, false, startedAt, "视频请求体过大。");
       return NextResponse.json(
         {
           error:
@@ -237,6 +270,12 @@ export async function POST(request: Request) {
         allowPrivateNetwork,
       });
     } catch (error) {
+      await recordBuiltInVideoUsage(
+        bodyForUsage,
+        false,
+        startedAt,
+        error instanceof Error ? error.message : "缺少有效的视频接口地址。"
+      );
       return NextResponse.json(
         {
           error:
@@ -275,12 +314,19 @@ export async function POST(request: Request) {
 
     if (!upstream.ok) {
       const detail = await serverReadErrorMessage(upstream);
+      await recordBuiltInVideoUsage(
+        bodyForUsage,
+        false,
+        startedAt,
+        detail || `视频接口请求失败 (${upstream.status})`
+      );
       return NextResponse.json(
         { error: detail || `视频接口请求失败 (${upstream.status})` },
         { status: upstream.status, headers: noStoreHeaders() }
       );
     }
 
+    await recordBuiltInVideoUsage(bodyForUsage, true, startedAt);
     return new Response(upstream.body, {
       status: upstream.status,
       headers: {
@@ -291,6 +337,12 @@ export async function POST(request: Request) {
       },
     });
   } catch (error) {
+    await recordBuiltInVideoUsage(
+      bodyForUsage,
+      false,
+      startedAt,
+      error instanceof Error ? error.message : "视频代理请求失败。"
+    );
     return NextResponse.json(
       {
         error:

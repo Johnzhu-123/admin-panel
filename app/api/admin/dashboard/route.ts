@@ -23,6 +23,14 @@ const getQuotaPreset = (userType: string) => {
   return { dailyRequests: 50, monthlyRequests: 1000, concurrentRequests: 3 };
 };
 
+const parseUserIds = (value: unknown): string[] => {
+  if (!Array.isArray(value)) return [];
+  const cleaned = value
+    .map((item) => String(item || '').trim())
+    .filter((item): item is string => Boolean(item));
+  return Array.from(new Set(cleaned));
+};
+
 export async function GET(req: Request) {
   const unauthorized = await requireAdminSession();
   if (unauthorized) return unauthorized;
@@ -90,6 +98,7 @@ export async function GET(req: Request) {
             usageStats: {
               daily: [],
               hourly: [],
+              serviceBreakdown: [],
               summary: {
                 totalRequests: 0,
                 successRate: 100,
@@ -221,15 +230,7 @@ export async function POST(req: Request) {
 
       case 'batch-remove-users':
         try {
-          const userIds = Array.isArray(body?.userIds)
-            ? Array.from(
-                new Set(
-                  body.userIds
-                    .map((item: unknown) => String(item || '').trim())
-                    .filter(Boolean)
-                )
-              )
-            : [];
+          const userIds = parseUserIds(body?.userIds);
           if (!userIds.length) {
             return NextResponse.json(
               { error: "userIds is required and must be a non-empty array" },
@@ -265,15 +266,7 @@ export async function POST(req: Request) {
 
       case 'batch-update-user-type':
         try {
-          const userIds = Array.isArray(body?.userIds)
-            ? Array.from(
-                new Set(
-                  body.userIds
-                    .map((item: unknown) => String(item || '').trim())
-                    .filter(Boolean)
-                )
-              )
-            : [];
+          const userIds = parseUserIds(body?.userIds);
           if (!userIds.length) {
             return NextResponse.json(
               { error: "userIds is required and must be a non-empty array" },
@@ -464,6 +457,16 @@ type DashboardUsageSummary = {
   lastRequestAt: string | null;
 };
 
+type DashboardServiceBreakdown = Array<{
+  service: string;
+  label: string;
+  requests: number;
+  successfulRequests: number;
+  failedRequests: number;
+  averageResponseTime: number;
+  successRate: number;
+}>;
+
 const FALLBACK_USAGE_SUMMARY: DashboardUsageSummary = {
   totalRequests: 0,
   successRate: 100,
@@ -472,6 +475,22 @@ const FALLBACK_USAGE_SUMMARY: DashboardUsageSummary = {
   requestsLast24h: 0,
   averageResponseTimeLast24h: 0,
   lastRequestAt: null,
+};
+
+const normalizeUsageService = (serviceId: unknown) => {
+  const raw = String(serviceId || '').trim().toLowerCase();
+  if (raw.startsWith('tts')) return { service: 'tts', label: '云端 TTS' };
+  if (raw.startsWith('video')) return { service: 'video', label: '视频生成' };
+  if (raw.startsWith('image')) return { service: 'image', label: '图像生成' };
+  if (
+    raw === 'built-in-default' ||
+    raw === 'gemini-built-in' ||
+    raw.includes('image') ||
+    raw.includes('gemini')
+  ) {
+    return { service: 'image', label: '图像生成' };
+  }
+  return { service: raw || 'other', label: raw || '其它服务' };
 };
 
 async function getDashboardUsageSummary(): Promise<DashboardUsageSummary> {
@@ -529,6 +548,79 @@ async function getDashboardUsageSummary(): Promise<DashboardUsageSummary> {
   } catch (error) {
     console.error('[Dashboard] Failed to aggregate usage summary from database:', error);
     return FALLBACK_USAGE_SUMMARY;
+  }
+}
+
+async function getDashboardServiceBreakdown(): Promise<DashboardServiceBreakdown> {
+  try {
+    const { sql } = await import('@vercel/postgres');
+    const { rows } = await sql`
+      SELECT
+        service_id,
+        COUNT(*)::int AS requests,
+        COUNT(*) FILTER (WHERE success = true)::int AS successful_requests,
+        COUNT(*) FILTER (WHERE success = false)::int AS failed_requests,
+        COALESCE(ROUND(AVG(NULLIF(response_time, 0)))::int, 0) AS average_response_time
+      FROM api_usage_records
+      GROUP BY service_id
+      ORDER BY requests DESC
+    `;
+
+    const grouped = new Map<string, {
+      service: string;
+      label: string;
+      requests: number;
+      successfulRequests: number;
+      failedRequests: number;
+      responseTimeTotal: number;
+      responseTimeWeight: number;
+    }>();
+
+    for (const row of rows) {
+      const normalized = normalizeUsageService(row.service_id);
+      const requests = Number(row.requests) || 0;
+      const successfulRequests = Number(row.successful_requests) || 0;
+      const failedRequests = Number(row.failed_requests) || 0;
+      const averageResponseTime = Number(row.average_response_time) || 0;
+      const current =
+        grouped.get(normalized.service) || {
+          ...normalized,
+          requests: 0,
+          successfulRequests: 0,
+          failedRequests: 0,
+          responseTimeTotal: 0,
+          responseTimeWeight: 0,
+        };
+      current.requests += requests;
+      current.successfulRequests += successfulRequests;
+      current.failedRequests += failedRequests;
+      if (averageResponseTime > 0 && requests > 0) {
+        current.responseTimeTotal += averageResponseTime * requests;
+        current.responseTimeWeight += requests;
+      }
+      grouped.set(normalized.service, current);
+    }
+
+    return Array.from(grouped.values())
+      .map((item) => ({
+        service: item.service,
+        label: item.label,
+        requests: item.requests,
+        successfulRequests: item.successfulRequests,
+        failedRequests: item.failedRequests,
+        averageResponseTime:
+          item.responseTimeWeight > 0
+            ? Math.round(item.responseTimeTotal / item.responseTimeWeight)
+            : 0,
+        successRate:
+          item.requests > 0
+            ? Math.round((item.successfulRequests / item.requests) * 100)
+            : 100,
+      }))
+      .sort((a, b) => b.requests - a.requests);
+  } catch (error) {
+    console.error('[Dashboard] Failed to aggregate service breakdown:', error);
+    return [];
   }
 }
 
@@ -760,6 +852,7 @@ async function getUsageStatistics(service: any) {
 
   // 璁＄畻鐪熷疄鐨勬垚鍔熺巼
   const usageSummary = await getDashboardUsageSummary();
+  const serviceBreakdown = await getDashboardServiceBreakdown();
   const fallbackTotalRequests = dailyStats.reduce((sum, d) => sum + d.requests, 0);
   const totalRequests = usageSummary.totalRequests || systemStats.totalRequests || fallbackTotalRequests;
   const finalSuccessRate =
@@ -793,6 +886,7 @@ async function getUsageStatistics(service: any) {
   return {
     daily: dailyStats,
     hourly: hourlyStats,
+    serviceBreakdown,
     summary: {
       totalRequests,
       successRate: finalSuccessRate,
@@ -852,4 +946,3 @@ async function autoEnableBuiltInService(service: any, userId: string) {
     // Don't throw - this is a convenience feature, not critical
   }
 }
-
