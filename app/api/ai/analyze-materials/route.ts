@@ -87,6 +87,15 @@ const summarizeBaseUrlForLog = (raw?: string) => {
   }
 };
 
+const isGoogleGenerativeLanguageHost = (rawUrl: string) => {
+  try {
+    const url = new URL(rawUrl);
+    return /(^|\.)generativelanguage\.googleapis\.com$/i.test(url.hostname);
+  } catch {
+    return false;
+  }
+};
+
 const parseJsonLikeText = (text: string) => {
   return parseOpenAiCompatibleResponseText(text);
 };
@@ -615,11 +624,15 @@ export async function POST(req: Request) {
         .toString()
         .trim();
 
-      if (!looksLikeGeminiModel(fallbackModel) || !fallbackBaseUrl) {
+      const geminiTarget = normalizeGeminiBaseUrl(fallbackBaseUrl);
+      const shouldUseGeminiRestFallback =
+        looksLikeGeminiModel(fallbackModel) &&
+        !!fallbackBaseUrl &&
+        isGoogleGenerativeLanguageHost(geminiTarget.baseUrl);
+      if (!shouldUseGeminiRestFallback) {
         throw openAiError;
       }
 
-      const geminiTarget = normalizeGeminiBaseUrl(fallbackBaseUrl);
       const apiVersion = shouldUseGeminiAlpha(fallbackModel)
         ? "v1alpha"
         : geminiTarget.apiVersion;

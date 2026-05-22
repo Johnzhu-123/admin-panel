@@ -101,6 +101,23 @@ export function rewriteUpstreamError(
   category: BuiltInServiceCategory
 ): string {
   const trimmed = (rawMessage || "").trim();
+  if (
+    status === 429 &&
+    /model_cooldown|cooling\s+down|credentials\s+for\s+model.+cooling|冷却|限流/i.test(trimmed)
+  ) {
+    const model =
+      trimmed.match(/"model"\s*:\s*"([^"]+)"/i)?.[1] ||
+      trimmed.match(/model\s+([A-Za-z0-9._:-]+)/i)?.[1] ||
+      `${category} 分类当前模型`;
+    const resetTime =
+      trimmed.match(/"reset_time"\s*:\s*"([^"]+)"/i)?.[1] ||
+      trimmed.match(/"reset_seconds"\s*:\s*(\d+)/i)?.[1];
+    const waitHint = resetTime ? `建议等待 ${resetTime} 后重试` : "建议稍后重试";
+    return `内置服务上游模型 ${model} 当前触发限流冷却（${category} 分类，HTTP 429），${waitHint}，或在管理面板切换到其它可用模型。`;
+  }
+  if (status === 429) {
+    return `内置服务上游触发限流（${category} 分类，HTTP 429）。请稍后重试，或在管理面板切换到其它可用模型。${trimmed ? ` 原始错误：${trimmed}` : ""}`;
+  }
   if (status === 530) {
     return `内置服务上游网关已下线（${category} 分类）。请在管理面板 → 服务目录里把 ${category} 子任务的 BaseURL 改成可用的上游 API（530 The origin has been unregistered from Argo Tunnel）。`;
   }
@@ -131,4 +148,3 @@ export function makeUpstreamTimeout(ms = 15000): {
     cancel: () => clearTimeout(timer),
   };
 }
-
