@@ -372,6 +372,146 @@ const runOpenAiCompatibleAnalyzeRequest = async (options: {
   );
 };
 
+// 2026-05-23：streaming 路径
+// 客户端在 body 里显式带 `stream: true` 时启用。
+// 上游 OpenAI-compatible chat/completions 用 stream:true 后会返回 SSE，
+// admin-panel 把 res.body 这个 ReadableStream 原样 pipe 给下游 Response，
+// 避免在中间层 buffer 完整响应。
+// 关键作用：让上游 API gateway 前面的 Cloudflare 看到持续 chunk 抵达，
+// 不再因 100s 内无字节而触发 524。
+const streamOpenAiCompatibleAnalyzeRequest = async (options: {
+  provider: "openai" | "gemini_compat";
+  apiKey: string;
+  baseUrl: string;
+  authHeader?: string;
+  requestedTextModel: string;
+  prompt: string;
+}): Promise<Response> => {
+  const normalizedBaseUrl = normalizeOpenAiBaseUrl(options.baseUrl);
+  const openAiAuthHeader = normalizeOpenAiAuthHeader(options.authHeader);
+  const candidateModel = (options.requestedTextModel || "").trim();
+  if (!candidateModel) {
+    return NextResponse.json(
+      { error: "Missing openAiTextModel/model. 请先明确指定文本分析模型。" },
+      { status: 400, headers: noStoreHeaders() }
+    );
+  }
+
+  const isReasoningLike = /gpt-5|o1|o3|o4|reasoning|think/i.test(candidateModel);
+  const requestUrl = `${normalizedBaseUrl}/chat/completions`;
+
+  const rawRequestBody: Record<string, unknown> = {
+    model: candidateModel,
+    max_tokens: 8192,
+    stream: true,
+    messages: [
+      {
+        role: "system",
+        content:
+          "你是一位多模态内容分析专家。请根据用户提供的素材生成结构化的 JSON 分析报告。",
+      },
+      { role: "user", content: options.prompt },
+    ],
+  };
+  if (!isReasoningLike) {
+    rawRequestBody.temperature = 0.5;
+  }
+
+  const enhancedConfig = await enhanceOpenAICompatibility(
+    {
+      url: requestUrl,
+      method: "POST",
+      headers: {
+        ...buildOpenAiHeaders(options.apiKey, true, openAiAuthHeader),
+        Accept: "text/event-stream",
+      },
+      body: rawRequestBody,
+    },
+    {
+      provider: options.provider,
+      baseUrl: normalizedBaseUrl,
+      operation: "chat/completions",
+    }
+  );
+
+  let upstream: Response;
+  try {
+    upstream = await serverFetchWithRetry(
+      enhancedConfig.url,
+      {
+        method: enhancedConfig.method,
+        headers: enhancedConfig.headers,
+        body: stringifyJsonAsciiSafe(enhancedConfig.body),
+        cache: "no-store",
+      },
+      {
+        // streaming 模式不重试：响应一旦开始读就无法回放
+        retries: 1,
+        retryDelayMs: 0,
+        timeoutMs: ANALYZE_REQUEST_TIMEOUT_MS,
+      }
+    );
+  } catch (fetchError) {
+    const fetchMessage =
+      fetchError instanceof Error
+        ? fetchError.message
+        : String(fetchError || "OpenAI-compatible analyze stream request failed.");
+    recordFailureLog({
+      provider: options.provider,
+      operation: "chat/completions (analyze-materials-stream-network)",
+      url: enhancedConfig.url,
+      status: null,
+      requestBody: { model: candidateModel, stream: true },
+      responseBody: fetchMessage,
+    });
+    return NextResponse.json(
+      {
+        error: `素材分析未返回可用文本。已尝试模型：${candidateModel}: ${formatAsciiCodecCompatMessage(
+          fetchMessage
+        )}`,
+      },
+      { status: 502, headers: noStoreHeaders() }
+    );
+  }
+
+  if (!upstream.ok || !upstream.body) {
+    const detail = upstream.body
+      ? await serverReadErrorMessage(upstream)
+      : `HTTP ${upstream.status}`;
+    const normalizedDetail = normalizeOpenAiAnalyzeError(
+      upstream.status,
+      detail,
+      candidateModel
+    );
+    recordFailureLog({
+      provider: options.provider,
+      operation: "chat/completions (analyze-materials-stream)",
+      url: enhancedConfig.url,
+      status: upstream.status,
+      requestBody: { model: candidateModel, stream: true },
+      responseBody: normalizedDetail,
+    });
+    return NextResponse.json(
+      {
+        error: `素材分析未返回可用文本。已尝试模型：${candidateModel}: ${normalizedDetail}`,
+      },
+      { status: upstream.status, headers: noStoreHeaders() }
+    );
+  }
+
+  // 把上游 SSE 流原样 pipe 给下游，不在 admin-panel 里 buffer
+  return new Response(upstream.body, {
+    status: 200,
+    headers: {
+      ...noStoreHeaders(),
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    },
+  });
+};
+
 /**
  * POST /api/ai/analyze-materials
  *
@@ -415,6 +555,40 @@ export async function POST(req: Request) {
         { error: "Missing apiKey or prompt." },
         { status: 400, headers: noStoreHeaders() }
       );
+    }
+
+    // 2026-05-23：streaming 分支
+    // 仅 OpenAI-compatible（openai / gemini_compat）路径、纯文本场景启用。
+    // 让上游 SSE 直接 pipe 到下游，避免上游 API gateway 前面的 CF 524。
+    // 多模态（images.length > 0）走原 buffered 路径，因为多模态推理一般 < 100s 不需要 streaming。
+    const wantsStream = body?.stream === true;
+    if (
+      wantsStream &&
+      images.length === 0 &&
+      (provider === "openai" || provider === "gemini_compat")
+    ) {
+      const streamRequestedModel =
+        provider === "openai"
+          ? body.openAiTextModel || body.model
+          : body.openAiTextModel || body.geminiTextModel || body.model;
+      const streamRequestedBaseUrl =
+        provider === "openai"
+          ? body.openAiBaseUrl || body.baseUrl
+          : body.geminiCompatBaseUrl || body.baseUrl;
+      console.log("[analyze-materials] Streaming request:", {
+        provider,
+        model: String(streamRequestedModel || "").trim(),
+        promptLength: prompt.length,
+        baseUrl: summarizeBaseUrlForLog(streamRequestedBaseUrl),
+      });
+      return await streamOpenAiCompatibleAnalyzeRequest({
+        provider,
+        apiKey,
+        baseUrl: String(streamRequestedBaseUrl || ""),
+        authHeader: body.openAiAuthHeader || body.authHeader,
+        requestedTextModel: String(streamRequestedModel || ""),
+        prompt,
+      });
     }
 
     const requestedBaseUrl =
