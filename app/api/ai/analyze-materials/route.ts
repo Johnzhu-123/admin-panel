@@ -28,6 +28,18 @@ import {
   summarizeOpenAiCompatiblePayload,
 } from "@/lib/openai-compatible-response";
 import { injectBuiltInCategoryConfig } from "@/lib/built-in-api-service/apply-cloud-config";
+import {
+  resolveBuiltInAnalyzeCategory,
+} from "@/lib/built-in-api-service/analyze-category";
+import {
+  getAnalyzeSystemInstruction,
+  getOpenAiCompatibleTokenLimitParamOrder,
+  resolveAnalyzeMaxOutputTokens,
+  resolveAnalyzeOutputMode,
+  type AnalyzeOutputMode,
+  type OpenAiCompatibleTokenLimitParam,
+} from "@/lib/built-in-api-service/analyze-request";
+import type { BuiltInServiceCategory } from "@/lib/built-in-api-service/db";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -172,6 +184,8 @@ const runOpenAiCompatibleAnalyzeRequest = async (options: {
   requestedVisionModel?: string;
   prompt: string;
   images: InlineImage[];
+  maxOutputTokens: number;
+  outputMode: AnalyzeOutputMode;
 }) => {
   const normalizedBaseUrl = normalizeOpenAiBaseUrl(options.baseUrl);
   const openAiAuthHeader = normalizeOpenAiAuthHeader(options.authHeader);
@@ -198,16 +212,18 @@ const runOpenAiCompatibleAnalyzeRequest = async (options: {
   const requestUrl = `${normalizedBaseUrl}/chat/completions`;
   const errors: string[] = [];
 
-  const runAttempt = async (candidateModel: string, useAsciiLiteralPayload: boolean) => {
-    const isReasoningLike = /gpt-5|o1|o3|o4|reasoning|think/i.test(candidateModel);
+  const runAttempt = async (
+    candidateModel: string,
+    useAsciiLiteralPayload: boolean,
+    tokenLimitParam: OpenAiCompatibleTokenLimitParam
+  ) => {
     const rawRequestBody: Record<string, unknown> = {
       model: candidateModel,
-      max_tokens: 8192,
+      [tokenLimitParam]: options.maxOutputTokens,
       messages: [
         {
           role: "system",
-          content:
-            "你是一位多模态内容分析专家。请根据用户提供的素材生成结构化的 JSON 分析报告。",
+          content: getAnalyzeSystemInstruction(options.outputMode),
         },
         options.images.length
           ? {
@@ -225,7 +241,7 @@ const runOpenAiCompatibleAnalyzeRequest = async (options: {
           : { role: "user", content: options.prompt },
       ],
     };
-    if (!isReasoningLike) {
+    if (tokenLimitParam !== "max_completion_tokens") {
       rawRequestBody.temperature = 0.5;
     }
 
@@ -278,6 +294,7 @@ const runOpenAiCompatibleAnalyzeRequest = async (options: {
         status: res.status,
         requestBody: {
           model: candidateModel,
+          tokenLimitParam,
           asciiLiteralPayload: useAsciiLiteralPayload,
         },
         responseBody: normalizedDetail,
@@ -296,6 +313,7 @@ const runOpenAiCompatibleAnalyzeRequest = async (options: {
         status: res.status,
         requestBody: {
           model: candidateModel,
+          tokenLimitParam,
           asciiLiteralPayload: useAsciiLiteralPayload,
         },
         responseBody: data,
@@ -321,6 +339,7 @@ const runOpenAiCompatibleAnalyzeRequest = async (options: {
       status: res.status,
       requestBody: {
         model: candidateModel,
+        tokenLimitParam,
         asciiLiteralPayload: useAsciiLiteralPayload,
       },
       responseBody: data,
@@ -329,40 +348,44 @@ const runOpenAiCompatibleAnalyzeRequest = async (options: {
   };
 
   for (const candidateModel of candidateModels) {
-    let firstErrorMessage = "";
-    try {
-      return await runAttempt(candidateModel, false);
-    } catch (firstError) {
-      firstErrorMessage = formatAsciiCodecCompatMessage(
-        firstError instanceof Error ? firstError.message : String(firstError || "")
-      );
-    }
-
-    const shouldRetryAsciiLiteralPayload =
-      isAsciiCodecError(firstErrorMessage) && containsNonAsciiText(options.prompt);
-    if (shouldRetryAsciiLiteralPayload) {
-      console.log(
-        "[analyze-materials] Retrying OpenAI-compatible request with ASCII-literal prompt payload.",
-        {
-          provider: options.provider,
-          model: candidateModel,
-          baseUrl: summarizeBaseUrlForLog(normalizedBaseUrl),
-        }
-      );
+    const tokenLimitParams = getOpenAiCompatibleTokenLimitParamOrder(candidateModel);
+    for (const tokenLimitParam of tokenLimitParams) {
+      let firstErrorMessage = "";
       try {
-        return await runAttempt(candidateModel, true);
-      } catch (retryError) {
-        const retryErrorMessage = formatAsciiCodecCompatMessage(
-          retryError instanceof Error ? retryError.message : String(retryError || "")
+        return await runAttempt(candidateModel, false, tokenLimitParam);
+      } catch (firstError) {
+        firstErrorMessage = formatAsciiCodecCompatMessage(
+          firstError instanceof Error ? firstError.message : String(firstError || "")
         );
-        errors.push(
-          `${candidateModel}: ${firstErrorMessage}；ASCII 字面量重试失败：${retryErrorMessage}`
-        );
-        continue;
       }
-    }
 
-    errors.push(`${candidateModel}: ${firstErrorMessage}`);
+      const shouldRetryAsciiLiteralPayload =
+        isAsciiCodecError(firstErrorMessage) && containsNonAsciiText(options.prompt);
+      if (shouldRetryAsciiLiteralPayload) {
+        console.log(
+          "[analyze-materials] Retrying OpenAI-compatible request with ASCII-literal prompt payload.",
+          {
+            provider: options.provider,
+            model: candidateModel,
+            tokenLimitParam,
+            baseUrl: summarizeBaseUrlForLog(normalizedBaseUrl),
+          }
+        );
+        try {
+          return await runAttempt(candidateModel, true, tokenLimitParam);
+        } catch (retryError) {
+          const retryErrorMessage = formatAsciiCodecCompatMessage(
+            retryError instanceof Error ? retryError.message : String(retryError || "")
+          );
+          errors.push(
+            `${candidateModel}/${tokenLimitParam}: ${firstErrorMessage}；ASCII 字面量重试失败：${retryErrorMessage}`
+          );
+          continue;
+        }
+      }
+
+      errors.push(`${candidateModel}/${tokenLimitParam}: ${firstErrorMessage}`);
+    }
   }
 
   throw new Error(
@@ -386,6 +409,8 @@ const streamOpenAiCompatibleAnalyzeRequest = async (options: {
   authHeader?: string;
   requestedTextModel: string;
   prompt: string;
+  maxOutputTokens: number;
+  outputMode: AnalyzeOutputMode;
 }): Promise<Response> => {
   const normalizedBaseUrl = normalizeOpenAiBaseUrl(options.baseUrl);
   const openAiAuthHeader = normalizeOpenAiAuthHeader(options.authHeader);
@@ -397,23 +422,22 @@ const streamOpenAiCompatibleAnalyzeRequest = async (options: {
     );
   }
 
-  const isReasoningLike = /gpt-5|o1|o3|o4|reasoning|think/i.test(candidateModel);
+  const tokenLimitParam = getOpenAiCompatibleTokenLimitParamOrder(candidateModel)[0];
   const requestUrl = `${normalizedBaseUrl}/chat/completions`;
 
   const rawRequestBody: Record<string, unknown> = {
     model: candidateModel,
-    max_tokens: 8192,
+    [tokenLimitParam]: options.maxOutputTokens,
     stream: true,
     messages: [
       {
         role: "system",
-        content:
-          "你是一位多模态内容分析专家。请根据用户提供的素材生成结构化的 JSON 分析报告。",
+        content: getAnalyzeSystemInstruction(options.outputMode),
       },
       { role: "user", content: options.prompt },
     ],
   };
-  if (!isReasoningLike) {
+  if (tokenLimitParam !== "max_completion_tokens") {
     rawRequestBody.temperature = 0.5;
   }
 
@@ -461,7 +485,7 @@ const streamOpenAiCompatibleAnalyzeRequest = async (options: {
       operation: "chat/completions (analyze-materials-stream-network)",
       url: enhancedConfig.url,
       status: null,
-      requestBody: { model: candidateModel, stream: true },
+      requestBody: { model: candidateModel, stream: true, tokenLimitParam },
       responseBody: fetchMessage,
     });
     return NextResponse.json(
@@ -488,7 +512,7 @@ const streamOpenAiCompatibleAnalyzeRequest = async (options: {
       operation: "chat/completions (analyze-materials-stream)",
       url: enhancedConfig.url,
       status: upstream.status,
-      requestBody: { model: candidateModel, stream: true },
+      requestBody: { model: candidateModel, stream: true, tokenLimitParam },
       responseBody: normalizedDetail,
     });
     return NextResponse.json(
@@ -522,17 +546,27 @@ export async function POST(req: Request) {
   try {
     let body = await req.json();
 
-    // admin-panel 端：useBuiltInService=true 时从 catalog 注入 baseUrl/apiKey/model（multimodal 类别）
+    const hasImages = Array.isArray(body?.images) && body.images.length > 0;
+
+    // admin-panel 端：useBuiltInService=true 时从 catalog 注入 baseUrl/apiKey/model。
+    // 素材中心综合分析是 text-only：桌面端会传 builtInCategory="text"。
+    // 旧代码硬编码 multimodal，会把 text 模型和 multimodal baseUrl/apiKey 拼错。
     if (body?.useBuiltInService === true) {
+      const resolvedCategory = resolveBuiltInAnalyzeCategory({
+        builtInCategory: body?.builtInCategory,
+        forceTextOnly: body?.forceTextOnly === true,
+        analysisMode: body?.analysisMode,
+        hasImages,
+      });
       const { body: enriched, applied } = await injectBuiltInCategoryConfig(
         body as Record<string, unknown>,
-        "multimodal"
+        resolvedCategory as BuiltInServiceCategory
       );
       if (applied) {
         body = enriched;
       } else {
         return NextResponse.json(
-          { error: "多模态服务未在管理后台启用或配置" },
+          { error: `${resolvedCategory} 服务未在管理后台启用或配置` },
           { status: 503, headers: noStoreHeaders() }
         );
       }
@@ -549,6 +583,10 @@ export async function POST(req: Request) {
     const images = Array.isArray(body.images)
       ? (body.images as InlineImage[])
       : [];
+    const analysisOutputMode = resolveAnalyzeOutputMode(body.analysisOutputMode);
+    const requestedMaxOutputTokens = resolveAnalyzeMaxOutputTokens(
+      body.maxTokens ?? body.maxOutputTokens
+    );
 
     if (!apiKey || !prompt) {
       return NextResponse.json(
@@ -588,6 +626,8 @@ export async function POST(req: Request) {
         authHeader: body.openAiAuthHeader || body.authHeader,
         requestedTextModel: String(streamRequestedModel || ""),
         prompt,
+        maxOutputTokens: requestedMaxOutputTokens,
+        outputMode: analysisOutputMode,
       });
     }
 
@@ -750,6 +790,8 @@ export async function POST(req: Request) {
               body.model,
             prompt,
             images,
+            maxOutputTokens: requestedMaxOutputTokens,
+            outputMode: analysisOutputMode,
           });
           return NextResponse.json({ text }, { headers: noStoreHeaders() });
         } catch (openAiCompatError) {
@@ -781,6 +823,8 @@ export async function POST(req: Request) {
       requestedVisionModel: body.openAiVisionModel || body.model,
       prompt,
       images,
+      maxOutputTokens: requestedMaxOutputTokens,
+      outputMode: analysisOutputMode,
     }).catch(async (openAiError) => {
       const fallbackModel = (
         images.length
