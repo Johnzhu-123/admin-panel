@@ -104,4 +104,47 @@ describe("POST /api/ai/analyze-materials built-in routing", () => {
     expect(upstreamBody.temperature).toBeUndefined();
     expect(upstreamBody.messages[0].content).toContain("Markdown");
   });
+
+  it("inlines documentAttachments into OpenAI-compatible prompts for structured long-document analysis", async () => {
+    const fullDocument = [
+      "# 第4章 实证结果",
+      "4.4.3 DID 基准回归，主规格系数 0.00631。",
+      "4.5 稳健性检验与安慰剂检验。",
+      "# 第5章 机制与异质性",
+      "5.2 异质性分析。",
+      "# 第6章 结论与建议",
+    ].join("\n");
+
+    await POST(
+      makeRequest({
+        provider: "openai",
+        useBuiltInService: true,
+        builtInCategory: "text",
+        forceTextOnly: true,
+        analysisMode: "material-text",
+        analysisOutputMode: "structured-json",
+        openAiTextModel: "mimo-v2.5-pro",
+        maxTokens: 12000,
+        prompt: "请基于附件生成结构化 JSON 报告。",
+        documentAttachments: [
+          {
+            mimeType: "text/plain",
+            data: Buffer.from(fullDocument, "utf8").toString("base64"),
+            name: "素材论文.mineru.md",
+          },
+        ],
+      })
+    );
+
+    const call = (serverFetchWithRetry as jest.Mock).mock.calls[0];
+    const init = call[1] as RequestInit;
+    const upstreamBody = JSON.parse(String(init.body));
+    const userContent = upstreamBody.messages[1].content;
+
+    expect(userContent).toContain("<attachment");
+    expect(userContent).toContain("素材论文.mineru.md");
+    expect(userContent).toContain("4.4.3 DID 基准回归");
+    expect(userContent).toContain("0.00631");
+    expect(userContent).toContain("第6章 结论与建议");
+  });
 });

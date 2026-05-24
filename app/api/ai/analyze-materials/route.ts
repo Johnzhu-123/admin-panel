@@ -69,22 +69,127 @@ const toInlinePart = (img: InlineImage) => ({
   inlineData: { mimeType: img.mimeType, data: img.data },
 });
 
+type TextDocumentAttachment = {
+  mimeType: string;
+  data: string;
+  name?: string;
+};
+
 const buildGeminiRestUrl = (baseUrl: string, apiVersion: string, model: string) =>
   `${baseUrl.replace(/\/+$/, "")}/${apiVersion}/models/${encodeURIComponent(
     model
   )}:generateContent`;
 
-const buildGeminiRestBody = (prompt: string, images: InlineImage[]) => ({
+const buildGeminiRestBody = (
+  prompt: string,
+  images: InlineImage[],
+  documentAttachments: TextDocumentAttachment[] = []
+) => ({
   contents: [
     {
       role: "user",
-      parts: images.length ? [{ text: prompt }, ...images.map(toInlinePart)] : [{ text: prompt }],
+      parts:
+        images.length || documentAttachments.length
+          ? [
+              { text: prompt },
+              ...documentAttachments.map((att) => ({
+                inlineData: { mimeType: att.mimeType, data: att.data },
+              })),
+              ...images.map(toInlinePart),
+            ]
+          : [{ text: prompt }],
     },
   ],
 });
 
-const buildGeminiAsciiLiteralBody = (prompt: string, images: InlineImage[]) =>
-  convertJsonStringsToAsciiLiterals(buildGeminiRestBody(prompt, images));
+const buildGeminiAsciiLiteralBody = (
+  prompt: string,
+  images: InlineImage[],
+  documentAttachments: TextDocumentAttachment[] = []
+) =>
+  convertJsonStringsToAsciiLiterals(
+    buildGeminiRestBody(prompt, images, documentAttachments)
+  );
+
+const MAX_ATTACHMENT_BYTES_PER_REQUEST = 18 * 1024 * 1024;
+
+const sanitizeDocumentAttachments = (
+  raw: unknown
+): { attachments: TextDocumentAttachment[]; rejected: string[] } => {
+  const rejected: string[] = [];
+  if (!Array.isArray(raw)) return { attachments: [], rejected };
+  const out: TextDocumentAttachment[] = [];
+  let totalBytes = 0;
+  for (let i = 0; i < raw.length; i++) {
+    const entry = raw[i];
+    if (!entry || typeof entry !== "object") {
+      rejected.push(`#${i}: not an object`);
+      continue;
+    }
+    const rawMimeType = String((entry as any).mimeType || "").trim();
+    const mimeType = /^text\/markdown(?:\s*;.*)?$/i.test(rawMimeType)
+      ? "text/plain"
+      : rawMimeType;
+    const data = String((entry as any).data || "").trim();
+    const name = String((entry as any).name || "").trim() || undefined;
+    if (!mimeType || !data) {
+      rejected.push(`#${i}: missing mimeType or data`);
+      continue;
+    }
+    const estimatedBytes = Math.floor((data.length * 3) / 4);
+    if (estimatedBytes > MAX_ATTACHMENT_BYTES_PER_REQUEST) {
+      rejected.push(
+        `#${i} (${name || mimeType}): single attachment ${estimatedBytes} bytes exceeds 18MB cap`
+      );
+      continue;
+    }
+    if (totalBytes + estimatedBytes > MAX_ATTACHMENT_BYTES_PER_REQUEST) {
+      rejected.push(
+        `#${i} (${name || mimeType}): cumulative attachment size exceeds 18MB cap`
+      );
+      continue;
+    }
+    totalBytes += estimatedBytes;
+    out.push({ mimeType, data, ...(name ? { name } : {}) });
+  }
+  return { attachments: out, rejected };
+};
+
+const inlinePromptAttachmentsForTextChannel = (
+  prompt: string,
+  attachments: ReadonlyArray<TextDocumentAttachment>
+): string => {
+  if (!attachments.length) return prompt;
+  const inlinedBlocks: string[] = [];
+  const unsupported: string[] = [];
+  for (const att of attachments) {
+    if (/^text\//i.test(att.mimeType)) {
+      try {
+        const decoded = Buffer.from(att.data, "base64").toString("utf8");
+        inlinedBlocks.push(
+          `<attachment name="${att.name || "document"}" mimeType="${att.mimeType}">\n${decoded}\n</attachment>`
+        );
+      } catch {
+        unsupported.push(`${att.name || "document"} (${att.mimeType}) - base64 decode failed`);
+      }
+    } else {
+      unsupported.push(`${att.name || "document"} (${att.mimeType}) - binary not supported on this channel`);
+    }
+  }
+  const sections: string[] = [prompt];
+  if (inlinedBlocks.length > 0) {
+    sections.push(
+      "\n注意：以下完整文档原文已通过附件附在 prompt 末尾，请直接阅读其中的 <attachment> 块作为分析依据：\n" +
+        inlinedBlocks.join("\n\n")
+    );
+  }
+  if (unsupported.length > 0) {
+    sections.push(
+      "\n通道限制：以下附件因当前接口不支持二进制附件被丢弃 - " + unsupported.join("; ")
+    );
+  }
+  return sections.join("\n\n");
+};
 
 const ANALYZE_REQUEST_TIMEOUT_MS = 180000;
 
@@ -583,6 +688,16 @@ export async function POST(req: Request) {
     const images = Array.isArray(body.images)
       ? (body.images as InlineImage[])
       : [];
+    const { attachments: documentAttachments, rejected: attachmentRejections } =
+      sanitizeDocumentAttachments(body.documentAttachments);
+    if (attachmentRejections.length > 0) {
+      console.warn("[analyze-materials] documentAttachments partially rejected", {
+        rejected: attachmentRejections,
+      });
+    }
+    const promptForTextChannel = documentAttachments.length
+      ? inlinePromptAttachmentsForTextChannel(prompt, documentAttachments)
+      : prompt;
     const analysisOutputMode = resolveAnalyzeOutputMode(body.analysisOutputMode);
     const requestedMaxOutputTokens = resolveAnalyzeMaxOutputTokens(
       body.maxTokens ?? body.maxOutputTokens
@@ -616,8 +731,9 @@ export async function POST(req: Request) {
       console.log("[analyze-materials] Streaming request:", {
         provider,
         model: String(streamRequestedModel || "").trim(),
-        promptLength: prompt.length,
+        promptLength: promptForTextChannel.length,
         baseUrl: summarizeBaseUrlForLog(streamRequestedBaseUrl),
+        attachmentCount: documentAttachments.length,
       });
       return await streamOpenAiCompatibleAnalyzeRequest({
         provider,
@@ -625,7 +741,7 @@ export async function POST(req: Request) {
         baseUrl: String(streamRequestedBaseUrl || ""),
         authHeader: body.openAiAuthHeader || body.authHeader,
         requestedTextModel: String(streamRequestedModel || ""),
-        prompt,
+        prompt: promptForTextChannel,
         maxOutputTokens: requestedMaxOutputTokens,
         outputMode: analysisOutputMode,
       });
@@ -649,8 +765,10 @@ export async function POST(req: Request) {
     console.log("[analyze-materials] Request:", {
       provider,
       model: typeof requestedModel === "string" ? requestedModel.trim() : "",
-      promptLength: prompt.length,
+      promptLength: promptForTextChannel.length,
       imagesCount: images.length,
+      attachmentCount: documentAttachments.length,
+      attachmentRejectedCount: attachmentRejections.length,
       baseUrl: summarizeBaseUrlForLog(requestedBaseUrl),
     });
 
@@ -675,10 +793,10 @@ export async function POST(req: Request) {
         geminiTextModel
       );
       const requestBody = stringifyJsonAsciiSafe(
-        buildGeminiRestBody(prompt, images)
+        buildGeminiRestBody(prompt, images, documentAttachments)
       );
       const requestBodyAsciiLiteral = stringifyJsonAsciiSafe(
-        buildGeminiAsciiLiteralBody(prompt, images)
+        buildGeminiAsciiLiteralBody(prompt, images, documentAttachments)
       );
 
       try {
@@ -788,7 +906,7 @@ export async function POST(req: Request) {
               body.openAiTextModel ||
               body.geminiTextModel ||
               body.model,
-            prompt,
+            prompt: promptForTextChannel,
             images,
             maxOutputTokens: requestedMaxOutputTokens,
             outputMode: analysisOutputMode,
@@ -821,7 +939,7 @@ export async function POST(req: Request) {
       authHeader: body.openAiAuthHeader || body.authHeader,
       requestedTextModel: body.openAiTextModel || body.model,
       requestedVisionModel: body.openAiVisionModel || body.model,
-      prompt,
+      prompt: promptForTextChannel,
       images,
       maxOutputTokens: requestedMaxOutputTokens,
       outputMode: analysisOutputMode,
@@ -860,10 +978,10 @@ export async function POST(req: Request) {
         fallbackModel
       );
       const requestBody = stringifyJsonAsciiSafe(
-        buildGeminiRestBody(prompt, images)
+        buildGeminiRestBody(prompt, images, documentAttachments)
       );
       const requestBodyAsciiLiteral = stringifyJsonAsciiSafe(
-        buildGeminiAsciiLiteralBody(prompt, images)
+        buildGeminiAsciiLiteralBody(prompt, images, documentAttachments)
       );
 
       console.log(
