@@ -17,6 +17,11 @@ import {
 } from "@/lib/built-in-api-service/db";
 import { isEncryptionConfigured } from "@/lib/built-in-api-service/encryption";
 import { makeUpstreamTimeout } from "@/lib/built-in-api-service/catalog-resolver";
+import {
+  getMinerURuntimeSettings,
+  sanitizeMinerURuntimeSettings,
+  saveMinerURuntimeSettings,
+} from "@/lib/built-in-api-service/mineru-settings";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -108,11 +113,13 @@ const sanitizeSubtaskPatch = (
   return out as Partial<Omit<BuiltInServiceSubtaskConfig, "id">>;
 };
 
-function buildResponseSettings(settings: Awaited<ReturnType<typeof getBuiltInRuntimeSettings>>) {
+async function buildResponseSettings(settings: Awaited<ReturnType<typeof getBuiltInRuntimeSettings>>) {
+  const mineru = await getMinerURuntimeSettings();
   return {
     ...settings,
     serviceCatalog: sanitizeServiceCatalog(settings.serviceCatalog, { includeKeyMask: true }),
     subtaskPresets: getSubtaskPresets(),
+    mineru: sanitizeMinerURuntimeSettings(mineru),
   };
 }
 
@@ -137,7 +144,7 @@ export async function GET() {
     const settings = await getBuiltInRuntimeSettings();
     return NextResponse.json(
       {
-        settings: buildResponseSettings(settings),
+        settings: await buildResponseSettings(settings),
         encryption: { configured: isEncryptionConfigured() },
       },
       { headers: noStoreHeaders() }
@@ -187,7 +194,7 @@ export async function POST(req: Request) {
       await clearBuiltInServiceCaches("update-service-subtask");
       const settings = await getBuiltInRuntimeSettings();
       return NextResponse.json(
-        { settings: buildResponseSettings(settings) },
+        { settings: await buildResponseSettings(settings) },
         { headers: noStoreHeaders() }
       );
     }
@@ -215,7 +222,7 @@ export async function POST(req: Request) {
       await clearBuiltInServiceCaches("delete-service-subtask");
       const settings = await getBuiltInRuntimeSettings();
       return NextResponse.json(
-        { settings: buildResponseSettings(settings) },
+        { settings: await buildResponseSettings(settings) },
         { headers: noStoreHeaders() }
       );
     }
@@ -243,7 +250,7 @@ export async function POST(req: Request) {
       await clearBuiltInServiceCaches("set-default-subtask");
       const settings = await getBuiltInRuntimeSettings();
       return NextResponse.json(
-        { settings: buildResponseSettings(settings) },
+        { settings: await buildResponseSettings(settings) },
         { headers: noStoreHeaders() }
       );
     }
@@ -585,7 +592,7 @@ export async function POST(req: Request) {
       await clearBuiltInServiceCaches("bulk-apply-credentials");
       const settings = await getBuiltInRuntimeSettings();
       return NextResponse.json(
-        { settings: buildResponseSettings(settings), applied },
+        { settings: await buildResponseSettings(settings), applied },
         { headers: noStoreHeaders() }
       );
     }
@@ -594,6 +601,10 @@ export async function POST(req: Request) {
      * 全量替换运行时设置（serviceGatewayUrl + updatePageUrl + downloadChannels）。
      * 不支持通过此接口批量更新 catalog（catalog 必须用 update-service-subtask）
      */
+    if (body?.mineru && typeof body.mineru === "object") {
+      await saveMinerURuntimeSettings(body.mineru);
+    }
+
     const serviceGatewayUrl = normalizeUrl(body?.serviceGatewayUrl || "");
     const updatePageUrl = normalizeUrl(body?.updatePageUrl || "");
     const downloadChannels = parseDownloadChannels(body?.downloadChannels);
@@ -619,7 +630,7 @@ export async function POST(req: Request) {
 
     await clearBuiltInServiceCaches("save-runtime-settings");
     return NextResponse.json(
-      { settings: buildResponseSettings(settings) },
+      { settings: await buildResponseSettings(settings) },
       { headers: noStoreHeaders() }
     );
   } catch (error) {

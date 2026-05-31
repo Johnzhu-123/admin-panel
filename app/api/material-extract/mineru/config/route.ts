@@ -8,7 +8,7 @@
  * 未授权用户也返回 200 + authorized=false，让客户端 UI 据此决定是否启用 built-in-cloud
  * 默认引擎。真正的请求转发在 `/api/material-extract/mineru/proxy/route.ts` 里做。
  *
- * 业务参数默认值通过环境变量配置（管理员在 Render/Zeabur 后台调整即可，无需发版）：
+ * 业务参数默认值由 admin-panel「系统设置」维护，并以环境变量作为初始兜底：
  *   MINERU_DEFAULT_MODEL_VERSION  — 默认 "vlm"
  *   MINERU_DEFAULT_LANGUAGE       — 默认 "ch"
  *   MINERU_DEFAULT_ENABLE_FORMULA — "true" / "false"，默认 true
@@ -21,6 +21,11 @@ import { NextRequest, NextResponse } from "next/server";
 import { currentUser } from "@clerk/nextjs/server";
 import { sql } from "@vercel/postgres";
 import { noStoreHeaders } from "@/lib/ai";
+import {
+  isMinerUServiceAllowed,
+  resolveMinerURequestIdentity,
+} from "@/lib/built-in-api-service/mineru-authorization";
+import { getMinerURuntimeSettings } from "@/lib/built-in-api-service/mineru-settings";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -28,27 +33,6 @@ export const maxDuration = 30;
 
 const json = (status: number, payload: Record<string, unknown>) =>
   NextResponse.json(payload, { status, headers: noStoreHeaders() });
-
-const envBool = (key: string, fallback: boolean): boolean => {
-  const v = (process.env[key] || "").trim().toLowerCase();
-  if (v === "true" || v === "1" || v === "yes" || v === "on") return true;
-  if (v === "false" || v === "0" || v === "no" || v === "off") return false;
-  return fallback;
-};
-
-const envString = (key: string, fallback: string): string => {
-  const v = (process.env[key] || "").trim();
-  return v || fallback;
-};
-
-const envCsv = (key: string): string[] => {
-  const v = (process.env[key] || "").trim();
-  if (!v) return [];
-  return v
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-};
 
 interface AuthorizationView {
   userId: string;
@@ -66,7 +50,7 @@ async function loadAuthorization(userId: string, email?: string): Promise<Author
       SELECT user_id, email, status, can_use_built_in_services, allowed_services,
              daily_requests, monthly_requests
       FROM authorized_users
-      WHERE user_id = ${userId} OR email = ${email || ""}
+      WHERE LOWER(user_id) = LOWER(${userId}) OR LOWER(email) = LOWER(${email || ""})
       LIMIT 1
     `;
     if (!rows.length) return null;
@@ -86,49 +70,41 @@ async function loadAuthorization(userId: string, email?: string): Promise<Author
   }
 }
 
-const defaultOptionsFromEnv = () => ({
-  modelVersion: envString("MINERU_DEFAULT_MODEL_VERSION", "vlm"),
-  language: envString("MINERU_DEFAULT_LANGUAGE", "ch"),
-  enableFormula: envBool("MINERU_DEFAULT_ENABLE_FORMULA", true),
-  enableTable: envBool("MINERU_DEFAULT_ENABLE_TABLE", true),
-  isOcr: envBool("MINERU_DEFAULT_IS_OCR", false),
-  extraFormats: envCsv("MINERU_DEFAULT_EXTRA_FORMATS"),
-});
+export async function GET(req: NextRequest) {
+  const settings = await getMinerURuntimeSettings();
+  const defaultOptions = settings.defaultOptions;
+  const baseUrl = settings.baseUrl;
 
-const baseUrlFromEnv = (): string =>
-  envString("MINERU_BUILT_IN_BASE_URL", "https://mineru.net");
-
-const tokenConfigured = (): boolean => {
-  const token = (process.env.MINERU_BUILT_IN_API_TOKEN || "").trim();
-  return token.length > 0;
-};
-
-export async function GET(_req: NextRequest) {
-  const defaultOptions = defaultOptionsFromEnv();
-  const baseUrl = baseUrlFromEnv();
-
-  if (!tokenConfigured()) {
+  if (!settings.enabled) {
     return json(200, {
       authorized: false,
-      reason: "服务端未配置 MINERU_BUILT_IN_API_TOKEN",
+      reason: "服务端未启用 MinerU 内置云端服务",
       baseUrl,
       defaultOptions,
     });
   }
 
-  let user;
+  if (!settings.apiToken) {
+    return json(200, {
+      authorized: false,
+      reason: "服务端未配置 MinerU API Token",
+      baseUrl,
+      defaultOptions,
+    });
+  }
+
+  let user: Awaited<ReturnType<typeof currentUser>> | null = null;
   try {
     user = await currentUser();
   } catch (err) {
-    return json(200, {
-      authorized: false,
-      reason: `Clerk 校验失败: ${err instanceof Error ? err.message : String(err)}`,
-      baseUrl,
-      defaultOptions,
-    });
+    console.warn(
+      "[mineru/config] Clerk 校验失败，尝试使用桌面端转发身份:",
+      err instanceof Error ? err.message : String(err)
+    );
   }
 
-  if (!user) {
+  const identity = resolveMinerURequestIdentity(user, req.headers);
+  if (!identity) {
     return json(200, {
       authorized: false,
       reason: "未登录",
@@ -137,13 +113,7 @@ export async function GET(_req: NextRequest) {
     });
   }
 
-  const userId = user.id;
-  const email =
-    user.primaryEmailAddress?.emailAddress ||
-    user.emailAddresses?.[0]?.emailAddress ||
-    "";
-
-  const authorization = await loadAuthorization(userId, email);
+  const authorization = await loadAuthorization(identity.userId, identity.email);
   if (!authorization) {
     return json(200, {
       authorized: false,
@@ -168,13 +138,7 @@ export async function GET(_req: NextRequest) {
       defaultOptions,
     });
   }
-  const allowedServices = authorization.allowedServices;
-  if (
-    allowedServices.length &&
-    !allowedServices.includes("mineru") &&
-    !allowedServices.includes("material-extract") &&
-    !allowedServices.includes("*")
-  ) {
+  if (!isMinerUServiceAllowed(authorization.allowedServices)) {
     return json(200, {
       authorized: false,
       reason: "账号未被授权使用 MinerU 服务",
@@ -187,6 +151,7 @@ export async function GET(_req: NextRequest) {
     authorized: true,
     baseUrl,
     defaultOptions,
+    identitySource: identity.source,
     quotaLimits: {
       dailyRequests: authorization.dailyRequests,
       monthlyRequests: authorization.monthlyRequests,

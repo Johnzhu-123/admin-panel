@@ -21,6 +21,7 @@ export type BuiltInUsageServiceStat = {
 
 const TRACKED_USAGE_SERVICES = [
   { service: 'image', label: '图像生成' },
+  { service: 'mineru', label: 'MinerU 文档解析' },
   { service: 'tts', label: '云端 TTS' },
   { service: 'video', label: '视频生成' },
 ] as const;
@@ -29,6 +30,9 @@ export const normalizeBuiltInUsageService = (serviceId: unknown) => {
   const raw = String(serviceId || '').trim().toLowerCase();
   if (raw.startsWith('tts')) return { service: 'tts', label: '云端 TTS' };
   if (raw.startsWith('video')) return { service: 'video', label: '视频生成' };
+  if (raw.startsWith('mineru') || raw === 'built-in-mineru') {
+    return { service: 'mineru', label: 'MinerU 文档解析' };
+  }
   if (raw.startsWith('image')) return { service: 'image', label: '图像生成' };
   if (
     raw === 'built-in-default' ||

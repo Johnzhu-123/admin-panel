@@ -46,7 +46,40 @@ interface RuntimeSystemSettings {
     name: string;
     url: string;
   }>;
+  mineru: MinerUAdminSettings;
 }
+
+interface MinerUAdminSettings {
+  enabled: boolean;
+  baseUrl: string;
+  apiToken: string;
+  apiTokenConfigured: boolean;
+  apiTokenMask: string;
+  defaultOptions: {
+    modelVersion: 'vlm' | 'pipeline' | 'MinerU-HTML' | 'auto';
+    language: string;
+    enableFormula: boolean;
+    enableTable: boolean;
+    isOcr: boolean;
+    extraFormats: Array<'docx' | 'html' | 'latex'>;
+  };
+}
+
+const DEFAULT_MINERU_ADMIN_SETTINGS: MinerUAdminSettings = {
+  enabled: true,
+  baseUrl: 'https://mineru.net',
+  apiToken: '',
+  apiTokenConfigured: false,
+  apiTokenMask: '',
+  defaultOptions: {
+    modelVersion: 'vlm',
+    language: 'ch',
+    enableFormula: true,
+    enableTable: true,
+    isOcr: false,
+    extraFormats: [],
+  },
+};
 
 const normalizeUrl = (value?: string) => (value || '').trim().replace(/\/+$/, '');
 const normalizeChannelId = (value?: string) =>
@@ -75,6 +108,54 @@ const parseDownloadChannelsInput = (raw: unknown) => {
   return channels;
 };
 
+const parseMinerUSettingsInput = (raw: unknown): MinerUAdminSettings => {
+  if (!raw || typeof raw !== 'object') return DEFAULT_MINERU_ADMIN_SETTINGS;
+  const record = raw as Partial<MinerUAdminSettings>;
+  const defaults = (record.defaultOptions || {}) as Partial<MinerUAdminSettings['defaultOptions']>;
+  const modelVersion =
+    defaults.modelVersion === 'pipeline' ||
+    defaults.modelVersion === 'MinerU-HTML' ||
+    defaults.modelVersion === 'auto' ||
+    defaults.modelVersion === 'vlm'
+      ? defaults.modelVersion
+      : DEFAULT_MINERU_ADMIN_SETTINGS.defaultOptions.modelVersion;
+  const extraFormats = Array.isArray(defaults.extraFormats)
+    ? defaults.extraFormats.filter((item): item is 'docx' | 'html' | 'latex' =>
+        item === 'docx' || item === 'html' || item === 'latex'
+      )
+    : [];
+  return {
+    enabled: record.enabled !== false,
+    baseUrl:
+      typeof record.baseUrl === 'string' && record.baseUrl.trim()
+        ? normalizeUrl(record.baseUrl)
+        : DEFAULT_MINERU_ADMIN_SETTINGS.baseUrl,
+    apiToken: '',
+    apiTokenConfigured: Boolean(record.apiTokenConfigured),
+    apiTokenMask: typeof record.apiTokenMask === 'string' ? record.apiTokenMask : '',
+    defaultOptions: {
+      modelVersion,
+      language:
+        typeof defaults.language === 'string' && defaults.language.trim()
+          ? defaults.language.trim()
+          : DEFAULT_MINERU_ADMIN_SETTINGS.defaultOptions.language,
+      enableFormula:
+        typeof defaults.enableFormula === 'boolean'
+          ? defaults.enableFormula
+          : DEFAULT_MINERU_ADMIN_SETTINGS.defaultOptions.enableFormula,
+      enableTable:
+        typeof defaults.enableTable === 'boolean'
+          ? defaults.enableTable
+          : DEFAULT_MINERU_ADMIN_SETTINGS.defaultOptions.enableTable,
+      isOcr:
+        typeof defaults.isOcr === 'boolean'
+          ? defaults.isOcr
+          : DEFAULT_MINERU_ADMIN_SETTINGS.defaultOptions.isOcr,
+      extraFormats: Array.from(new Set(extraFormats)),
+    },
+  };
+};
+
 export default function AdminDashboard() {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
   const [overview, setOverview] = useState<DashboardOverview | null>(null);
@@ -87,6 +168,7 @@ export default function AdminDashboard() {
     serviceGatewayUrl: '',
     updatePageUrl: '',
     downloadChannels: [],
+    mineru: DEFAULT_MINERU_ADMIN_SETTINGS,
   });
   const [settingsLoading, setSettingsLoading] = useState(false);
   const [settingsSaving, setSettingsSaving] = useState(false);
@@ -178,6 +260,7 @@ export default function AdminDashboard() {
             ? normalizeUrl(settings.updatePageUrl)
             : '',
         downloadChannels: parsedChannels,
+        mineru: parseMinerUSettingsInput(settings.mineru),
       };
       setSystemSettings(next);
       setSettingsMessage(null);
@@ -205,6 +288,38 @@ export default function AdminDashboard() {
   const getDownloadChannelUrl = (id: string) =>
     systemSettings.downloadChannels.find((item) => item.id === normalizeChannelId(id))?.url || '';
 
+  const updateMinerUSettings = (patch: Partial<MinerUAdminSettings>) => {
+    setSystemSettings((prev) => ({
+      ...prev,
+      mineru: {
+        ...prev.mineru,
+        ...patch,
+        defaultOptions: {
+          ...prev.mineru.defaultOptions,
+          ...(patch.defaultOptions || {}),
+        },
+      },
+    }));
+  };
+
+  const toggleMinerUExtraFormat = (format: 'docx' | 'html' | 'latex') => {
+    setSystemSettings((prev) => {
+      const existing = new Set(prev.mineru.defaultOptions.extraFormats);
+      if (existing.has(format)) existing.delete(format);
+      else existing.add(format);
+      return {
+        ...prev,
+        mineru: {
+          ...prev.mineru,
+          defaultOptions: {
+            ...prev.mineru.defaultOptions,
+            extraFormats: Array.from(existing),
+          },
+        },
+      };
+    });
+  };
+
   const handleSaveSystemSettings = async () => {
     try {
       setSettingsSaving(true);
@@ -218,6 +333,14 @@ export default function AdminDashboard() {
           downloadChannels: systemSettings.downloadChannels.filter((item) =>
             /^https?:\/\//i.test(item.url)
           ),
+          mineru: {
+            enabled: systemSettings.mineru.enabled,
+            baseUrl: normalizeUrl(systemSettings.mineru.baseUrl),
+            ...(systemSettings.mineru.apiToken.trim()
+              ? { apiToken: systemSettings.mineru.apiToken.trim() }
+              : {}),
+            defaultOptions: systemSettings.mineru.defaultOptions,
+          },
         }),
       });
       const data = await response.json().catch(() => ({}));
@@ -234,6 +357,7 @@ export default function AdminDashboard() {
             ? normalizeUrl(settings.updatePageUrl)
             : normalizeUrl(systemSettings.updatePageUrl),
         downloadChannels: parsedChannels,
+        mineru: parseMinerUSettingsInput(settings.mineru),
       });
       setSettingsMessage('系统设置已保存');
     } catch (err) {
@@ -457,6 +581,164 @@ export default function AdminDashboard() {
                     </CardHeader>
                     <CardContent className="space-y-6">
                       <div className="space-y-4">
+                        <div className="p-6 bg-slate-700/30 border border-slate-600 rounded-lg space-y-4">
+                          <div className="flex flex-wrap items-center justify-between gap-3">
+                            <div className="flex items-center gap-3">
+                              <div className="p-2 bg-emerald-500/20 rounded-lg">
+                                <Server className="h-5 w-5 text-emerald-400" />
+                              </div>
+                              <div>
+                                <h3 className="font-semibold text-white">MinerU 文档解析服务</h3>
+                                <p className="text-xs text-slate-400">
+                                  云端统一持有 MinerU Token，授权用户桌面端无需自行配置。
+                                </p>
+                              </div>
+                            </div>
+                            <label className="flex items-center gap-2 text-sm text-slate-300">
+                              <input
+                                type="checkbox"
+                                checked={systemSettings.mineru.enabled}
+                                onChange={(event) => updateMinerUSettings({ enabled: event.target.checked })}
+                                className="accent-emerald-500"
+                              />
+                              启用 MinerU 内置云端
+                            </label>
+                          </div>
+
+                          <div className="grid gap-4 md:grid-cols-2">
+                            <div className="space-y-2">
+                              <label className="text-sm text-slate-300">MinerU BaseURL</label>
+                              <input
+                                className="w-full bg-slate-900/70 border border-slate-600 rounded-md px-3 py-2 text-slate-100"
+                                value={systemSettings.mineru.baseUrl}
+                                onChange={(event) => updateMinerUSettings({ baseUrl: event.target.value })}
+                                placeholder="https://mineru.net"
+                              />
+                            </div>
+                            <div className="space-y-2">
+                              <label className="text-sm text-slate-300">MinerU Bearer Token</label>
+                              <input
+                                type="password"
+                                className="w-full bg-slate-900/70 border border-slate-600 rounded-md px-3 py-2 text-slate-100"
+                                value={systemSettings.mineru.apiToken}
+                                onChange={(event) => updateMinerUSettings({ apiToken: event.target.value })}
+                                placeholder={
+                                  systemSettings.mineru.apiTokenConfigured
+                                    ? systemSettings.mineru.apiTokenMask || '已配置，留空则保留'
+                                    : '粘贴 mineru.net API Token'
+                                }
+                              />
+                              {systemSettings.mineru.apiTokenConfigured && (
+                                <p className="text-xs text-slate-500">
+                                  已配置 Token：{systemSettings.mineru.apiTokenMask || '已隐藏'}。留空保存会保留原值。
+                                </p>
+                              )}
+                            </div>
+                            <div className="space-y-2">
+                              <label className="text-sm text-slate-300">默认模型版本</label>
+                              <select
+                                className="w-full bg-slate-900/70 border border-slate-600 rounded-md px-3 py-2 text-slate-100"
+                                value={systemSettings.mineru.defaultOptions.modelVersion}
+                                onChange={(event) =>
+                                  updateMinerUSettings({
+                                    defaultOptions: {
+                                      ...systemSettings.mineru.defaultOptions,
+                                      modelVersion: event.target.value as MinerUAdminSettings['defaultOptions']['modelVersion'],
+                                    },
+                                  })
+                                }
+                              >
+                                <option value="vlm">vlm</option>
+                                <option value="pipeline">pipeline</option>
+                                <option value="MinerU-HTML">MinerU-HTML</option>
+                                <option value="auto">auto</option>
+                              </select>
+                            </div>
+                            <div className="space-y-2">
+                              <label className="text-sm text-slate-300">默认语言</label>
+                              <input
+                                className="w-full bg-slate-900/70 border border-slate-600 rounded-md px-3 py-2 text-slate-100"
+                                value={systemSettings.mineru.defaultOptions.language}
+                                onChange={(event) =>
+                                  updateMinerUSettings({
+                                    defaultOptions: {
+                                      ...systemSettings.mineru.defaultOptions,
+                                      language: event.target.value,
+                                    },
+                                  })
+                                }
+                                placeholder="ch / en / japan / korean"
+                              />
+                            </div>
+                          </div>
+
+                          <div className="grid gap-3 md:grid-cols-2">
+                            <div className="flex flex-wrap gap-4 rounded-md border border-slate-600 bg-slate-900/40 p-3">
+                              <label className="flex items-center gap-2 text-sm text-slate-300">
+                                <input
+                                  type="checkbox"
+                                  checked={systemSettings.mineru.defaultOptions.enableFormula}
+                                  onChange={(event) =>
+                                    updateMinerUSettings({
+                                      defaultOptions: {
+                                        ...systemSettings.mineru.defaultOptions,
+                                        enableFormula: event.target.checked,
+                                      },
+                                    })
+                                  }
+                                  className="accent-emerald-500"
+                                />
+                                公式识别
+                              </label>
+                              <label className="flex items-center gap-2 text-sm text-slate-300">
+                                <input
+                                  type="checkbox"
+                                  checked={systemSettings.mineru.defaultOptions.enableTable}
+                                  onChange={(event) =>
+                                    updateMinerUSettings({
+                                      defaultOptions: {
+                                        ...systemSettings.mineru.defaultOptions,
+                                        enableTable: event.target.checked,
+                                      },
+                                    })
+                                  }
+                                  className="accent-emerald-500"
+                                />
+                                表格识别
+                              </label>
+                              <label className="flex items-center gap-2 text-sm text-slate-300">
+                                <input
+                                  type="checkbox"
+                                  checked={systemSettings.mineru.defaultOptions.isOcr}
+                                  onChange={(event) =>
+                                    updateMinerUSettings({
+                                      defaultOptions: {
+                                        ...systemSettings.mineru.defaultOptions,
+                                        isOcr: event.target.checked,
+                                      },
+                                    })
+                                  }
+                                  className="accent-emerald-500"
+                                />
+                                强制 OCR
+                              </label>
+                            </div>
+                            <div className="flex flex-wrap gap-4 rounded-md border border-slate-600 bg-slate-900/40 p-3">
+                              {(['docx', 'html', 'latex'] as const).map((format) => (
+                                <label key={format} className="flex items-center gap-2 text-sm text-slate-300">
+                                  <input
+                                    type="checkbox"
+                                    checked={systemSettings.mineru.defaultOptions.extraFormats.includes(format)}
+                                    onChange={() => toggleMinerUExtraFormat(format)}
+                                    className="accent-emerald-500"
+                                  />
+                                  导出 {format}
+                                </label>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+
                         <div className="p-6 bg-slate-700/30 border border-slate-600 rounded-lg space-y-4">
                           <div className="flex items-center gap-3">
                             <div className="p-2 bg-indigo-500/20 rounded-lg">

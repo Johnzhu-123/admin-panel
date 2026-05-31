@@ -4,13 +4,13 @@
  * 链路：md2pptWin 客户端 → md2pptWin /api/material-center/mineru/built-in/proxy
  *      → 本端点 → mineru.net
  *
- * 本端点是 token 注入点：从 env MINERU_BUILT_IN_API_TOKEN 取真实 token，注入
- * Authorization: Bearer ... 后转发到 mineru.net。客户端始终不持有 token。
+ * 本端点是 token 注入点：从 admin-panel 系统设置读取真实 token，注入
+ * Authorization: Bearer ... 后转发到 MinerU 上游。客户端始终不持有 token。
  *
  * 协议：与 md2pptWin 现有的 `/api/material-center/mineru/proxy` 对齐
  *   - 客户端通过 x-mineru-target-path header 指定 mineru.net 上的 path
  *     （例：/api/v4/file-urls/batch, /api/v4/extract-results/batch/<id>）
- *   - x-mineru-base-url 仅供白名单校验；最终拼出的 URL 由 MINERU_BUILT_IN_BASE_URL 决定
+ *   - x-mineru-base-url 仅供白名单校验；最终拼出的 URL 由系统设置的 MinerU BaseURL 决定
  *   - method / body 原样透传
  *
  * 注意：OSS PUT 不会经过本端点（客户端的 cloudFetch 已对 *.aliyuncs.com 强制
@@ -22,6 +22,11 @@ import { currentUser } from "@clerk/nextjs/server";
 import { sql } from "@vercel/postgres";
 import { randomUUID } from "crypto";
 import { noStoreHeaders } from "@/lib/ai";
+import {
+  isMinerUServiceAllowed,
+  resolveMinerURequestIdentity,
+} from "@/lib/built-in-api-service/mineru-authorization";
+import { getMinerURuntimeSettings } from "@/lib/built-in-api-service/mineru-settings";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -63,7 +68,7 @@ async function loadAuthorization(userId: string, email?: string): Promise<Author
       SELECT user_id, email, status, can_use_built_in_services, allowed_services,
              daily_requests, monthly_requests
       FROM authorized_users
-      WHERE user_id = ${userId} OR email = ${email || ""}
+      WHERE LOWER(user_id) = LOWER(${userId}) OR LOWER(email) = LOWER(${email || ""})
       LIMIT 1
     `;
     if (!rows.length) return null;
@@ -133,37 +138,39 @@ async function forward(req: NextRequest): Promise<NextResponse> {
     });
   }
 
-  // 2. 校验 token 已配置
-  const token = (process.env.MINERU_BUILT_IN_API_TOKEN || "").trim();
+  // 2. 读取 admin-panel 可维护的 MinerU 运行时配置
+  const settings = await getMinerURuntimeSettings();
+  if (!settings.enabled) {
+    return json(503, {
+      code: -1,
+      msg: "服务端未启用 MinerU 内置云端服务",
+    });
+  }
+  const token = settings.apiToken;
   if (!token) {
     return json(503, {
       code: -1,
-      msg: "服务端未配置 MINERU_BUILT_IN_API_TOKEN",
+      msg: "服务端未配置 MinerU API Token",
     });
   }
 
   // 3. Clerk 鉴权
-  let user;
+  let user: Awaited<ReturnType<typeof currentUser>> | null = null;
   try {
     user = await currentUser();
   } catch (err) {
-    return json(401, {
-      code: -1,
-      msg: `Clerk 校验失败: ${err instanceof Error ? err.message : String(err)}`,
-    });
+    console.warn(
+      "[mineru/proxy] Clerk 校验失败，尝试使用桌面端转发身份:",
+      err instanceof Error ? err.message : String(err)
+    );
   }
-  if (!user) {
+  const identity = resolveMinerURequestIdentity(user, req.headers);
+  if (!identity) {
     return json(401, { code: -1, msg: "未登录" });
   }
 
-  const userId = user.id;
-  const email =
-    user.primaryEmailAddress?.emailAddress ||
-    user.emailAddresses?.[0]?.emailAddress ||
-    "";
-
   // 4. 授权校验
-  const authorization = await loadAuthorization(userId, email);
+  const authorization = await loadAuthorization(identity.userId, identity.email);
   if (!authorization) {
     return json(403, { code: -1, msg: "用户未被加入授权名单" });
   }
@@ -173,12 +180,7 @@ async function forward(req: NextRequest): Promise<NextResponse> {
   if (!authorization.canUseBuiltInServices) {
     return json(403, { code: -1, msg: "账号未开启内置服务权限" });
   }
-  if (
-    authorization.allowedServices.length &&
-    !authorization.allowedServices.includes("mineru") &&
-    !authorization.allowedServices.includes("material-extract") &&
-    !authorization.allowedServices.includes("*")
-  ) {
+  if (!isMinerUServiceAllowed(authorization.allowedServices)) {
     return json(403, { code: -1, msg: "账号未被授权使用 MinerU 服务" });
   }
 
@@ -196,9 +198,7 @@ async function forward(req: NextRequest): Promise<NextResponse> {
   }
 
   // 6. 构造上游 URL
-  const baseUrl = stripTrailingSlash(
-    (process.env.MINERU_BUILT_IN_BASE_URL || "").trim() || "https://mineru.net"
-  );
+  const baseUrl = stripTrailingSlash(settings.baseUrl || "https://mineru.net");
   const upstreamUrl = `${baseUrl}${targetPath}`;
 
   // 7. 构造转发 header：注入 Authorization，剥不应外传的 header
