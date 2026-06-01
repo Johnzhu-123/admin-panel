@@ -20,6 +20,7 @@ import { APIProxyLayerImpl } from './components/api-proxy-layer';
 import { BuiltInAPIServiceManagerImpl } from './components/service-manager';
 import { ConfigurationStorageImpl } from './components/configuration-storage';
 import { isDatabaseAvailable, initializeDatabase } from './db';
+import { buildSystemHealthStatus, SystemHealthStatus } from './system-health';
 
 import {
   ServiceOption,
@@ -281,22 +282,23 @@ export class BuiltInAPIService {
   /**
    * Get system health status
    */
-  async getSystemHealthStatus(): Promise<{
-    isHealthy: boolean;
-    services: Record<string, boolean>;
-    permissions: boolean;
-    storage: boolean;
-    lastChecked: Date;
-  }> {
+  async getSystemHealthStatus(): Promise<SystemHealthStatus> {
     try {
-      await this.ensureInitialized();
+      try {
+        await this.ensureInitialized();
+      } catch (initError) {
+        console.error('Built-in service initialization failed during health check:', initError);
+      }
 
       // Check service health
-      const allServices = await this.configManager.getAllBuiltInServices();
       const serviceHealth: Record<string, boolean> = {};
-      
-      for (const service of allServices) {
-        serviceHealth[service.id] = await this.proxyLayer.checkServiceHealth(service.id);
+      try {
+        const allServices = await this.configManager.getAllBuiltInServices();
+        for (const service of allServices) {
+          serviceHealth[service.id] = await this.proxyLayer.checkServiceHealth(service.id);
+        }
+      } catch (serviceError) {
+        console.error('Error checking built-in service health:', serviceError);
       }
 
       // Check permissions system
@@ -305,20 +307,22 @@ export class BuiltInAPIService {
         .catch(() => false);
 
       // Check storage system
-      const storageHealthy = await this.configStorage.checkConfigurationFiles()
-        .then(() => true)
-        .catch(() => false);
+      const storageFiles = await this.configStorage.checkConfigurationFiles()
+        .catch((storageError) => {
+          console.error('Error checking local configuration files:', storageError);
+          return null;
+        });
+      const databaseAvailable = await isDatabaseAvailable().catch((dbError) => {
+        console.error('Error checking database-backed configuration storage:', dbError);
+        return false;
+      });
 
-      const allServicesHealthy = Object.values(serviceHealth).some(healthy => healthy);
-      const isHealthy = allServicesHealthy && permissionsHealthy && storageHealthy;
-
-      return {
-        isHealthy,
+      return buildSystemHealthStatus({
         services: serviceHealth,
         permissions: permissionsHealthy,
-        storage: storageHealthy,
-        lastChecked: new Date()
-      };
+        storageFiles,
+        databaseAvailable,
+      });
     } catch (error) {
       console.error('Error checking system health:', error);
       return {

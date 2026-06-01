@@ -23,7 +23,9 @@ import { sql } from "@vercel/postgres";
 import { randomUUID } from "crypto";
 import { noStoreHeaders } from "@/lib/ai";
 import {
+  getMinerUAuthorizationFromEnv,
   isMinerUServiceAllowed,
+  MinerUAuthorizationRecord,
   resolveMinerURequestIdentity,
 } from "@/lib/built-in-api-service/mineru-authorization";
 import { getMinerURuntimeSettings } from "@/lib/built-in-api-service/mineru-settings";
@@ -52,17 +54,7 @@ const HOP_BY_HOP_HEADERS = new Set([
   "x-mineru-content-type",
 ]);
 
-interface AuthorizationView {
-  userId: string;
-  email: string;
-  status: string;
-  canUseBuiltInServices: boolean;
-  allowedServices: string[];
-  dailyRequests: number;
-  monthlyRequests: number;
-}
-
-async function loadAuthorization(userId: string, email?: string): Promise<AuthorizationView | null> {
+async function loadAuthorization(userId: string, email?: string): Promise<MinerUAuthorizationRecord | null> {
   try {
     const { rows } = await sql`
       SELECT user_id, email, status, can_use_built_in_services, allowed_services,
@@ -71,7 +63,7 @@ async function loadAuthorization(userId: string, email?: string): Promise<Author
       WHERE LOWER(user_id) = LOWER(${userId}) OR LOWER(email) = LOWER(${email || ""})
       LIMIT 1
     `;
-    if (!rows.length) return null;
+    if (!rows.length) return getMinerUAuthorizationFromEnv(userId, email);
     const row = rows[0];
     return {
       userId: row.user_id,
@@ -84,8 +76,8 @@ async function loadAuthorization(userId: string, email?: string): Promise<Author
     };
   } catch (error) {
     console.error("[mineru/proxy] loadAuthorization 失败:", error);
-    return null;
   }
+  return getMinerUAuthorizationFromEnv(userId, email);
 }
 
 async function recordUsage(params: {

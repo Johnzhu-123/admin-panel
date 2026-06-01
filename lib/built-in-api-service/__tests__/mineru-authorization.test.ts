@@ -1,7 +1,9 @@
 import {
   getMinerUIdentityFromClerkUser,
   getMinerUIdentityFromRequestHeaders,
+  findMinerUAuthorizationRecord,
   isMinerUServiceAllowed,
+  parseMinerUAuthorizedUsersFromEnv,
 } from "../mineru-authorization";
 
 describe("MinerU authorization helpers", () => {
@@ -40,5 +42,39 @@ describe("MinerU authorization helpers", () => {
     expect(isMinerUServiceAllowed(["material-extract"])).toBe(true);
     expect(isMinerUServiceAllowed(["*"])).toBe(true);
     expect(isMinerUServiceAllowed(["video"])).toBe(false);
+  });
+
+  it("finds MinerU authorization from AUTHORIZED_USERS-style environment records by email", () => {
+    const users = parseMinerUAuthorizedUsersFromEnv(JSON.stringify([
+      {
+        userId: "user_other",
+        email: "other@example.com",
+        permissions: {
+          canUseBuiltInServices: true,
+          allowedServices: ["gemini-built-in"],
+          quotaLimits: { dailyRequests: 10, monthlyRequests: 100 },
+        },
+      },
+      {
+        userId: "user_env",
+        email: "Owner@Example.com",
+        status: "active",
+        permissions: {
+          canUseBuiltInServices: true,
+          allowedServices: ["gemini-built-in"],
+          quotaLimits: { dailyRequests: 50, monthlyRequests: 1000 },
+        },
+      },
+    ]));
+
+    expect(findMinerUAuthorizationRecord(users, "missing-user", "owner@example.com")).toMatchObject({
+      userId: "user_env",
+      email: "Owner@Example.com",
+      status: "active",
+      canUseBuiltInServices: true,
+      allowedServices: ["gemini-built-in"],
+      dailyRequests: 50,
+      monthlyRequests: 1000,
+    });
   });
 });
