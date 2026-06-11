@@ -162,31 +162,39 @@ describe('ResponseFormatAdapter Property Tests', () => {
         arbitraryProvider,
         (response, provider) => {
           const result = adapter.adaptResponseFormat(response, provider);
-          
+
           // Result should always have images array
           expect(Array.isArray(result.images)).toBe(true);
-          expect(result.images.length).toBeGreaterThan(0);
-          
-          // Number of images should match input array length
-          expect(result.images.length).toBe(response.length);
-          
+
+          // 🔧 FIX (2026-06-11 G3): 适配器按设计跳过不含图像数据的数组项（实现注释
+          // "Only add image if it has actual image data"），而 fc.option 可生成全 null
+          // 的对象项；原断言 images.length === response.length 在随机种子命中该项时
+          // 必然失败（本用例偶发红的根因）。期望数量改为"含图像数据的项数"，逐项
+          // 校验也按过滤后的列表做索引对齐。
+          const itemsWithImageData = response.filter(item =>
+            typeof item === 'string' ||
+            (typeof item === 'object' && item !== null &&
+              !!(item.url || item.image_url || item.b64_json || item.base64))
+          );
+          expect(result.images.length).toBe(itemsWithImageData.length);
+
           // Each image should have valid structure
           result.images.forEach((image, index) => {
             expect(typeof image).toBe('object');
             expect(image).not.toBeNull();
-            
-            const originalItem = response[index];
-            
+
+            const originalItem = itemsWithImageData[index];
+
             // If original was a string, should be converted to URL
             if (typeof originalItem === 'string') {
               expect(image.url).toBe(originalItem);
             }
-            
+
             // Should have at least one image property
             const hasImageData = image.url || image.b64_json;
             expect(hasImageData).toBeTruthy();
           });
-          
+
           return true;
         }
       ), { numRuns: 100 });
@@ -199,7 +207,8 @@ describe('ResponseFormatAdapter Property Tests', () => {
         (response, provider) => {
           // Skip if response has no image data
           const hasImageData = response.url || response.image_url || response.b64_json || response.base64;
-          fc.pre(hasImageData);
+          // 🔧 FIX (2026-06-11 类型门禁): fc.pre 需要 boolean，truthy 字符串显式转布尔（行为不变）
+          fc.pre(!!hasImageData);
           
           const result = adapter.adaptResponseFormat(response, provider);
           
@@ -260,8 +269,9 @@ describe('ResponseFormatAdapter Property Tests', () => {
         arbitraryProvider,
         (provider) => {
           // Test with different request formats to ensure provider name extraction is consistent
-          const request1 = { prompt: 'test1', response_format: 'url' as const };
-          const request2 = { prompt: 'test2', response_format: 'b64_json' as const };
+          // 🔧 FIX (2026-06-11 类型门禁): 标注 ImageGenerationRequest，使下方可选 model 属性访问合法
+          const request1: ImageGenerationRequest = { prompt: 'test1', response_format: 'url' as const };
+          const request2: ImageGenerationRequest = { prompt: 'test2', response_format: 'b64_json' as const };
           
           const result1 = adapter.adaptRequestFormat(request1, provider);
           const result2 = adapter.adaptRequestFormat(request2, provider);

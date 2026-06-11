@@ -37,7 +37,8 @@ describe('ContentPolicyHandler Property Tests', () => {
   });
 
   const arbitraryNonContentPolicyError = fc.record({
-    type: fc.constantFrom('path_error', 'auth_error', 'format_error', 'network_error', 'rate_limit', 'unknown'),
+    // 🔧 FIX (2026-06-11 类型门禁): 显式声明字面量联合，constantFrom 默认推断为 string
+    type: fc.constantFrom<ErrorType>('path_error', 'auth_error', 'format_error', 'network_error', 'rate_limit', 'unknown'),
     code: fc.string({ minLength: 1, maxLength: 50 }),
     message: fc.string({ minLength: 1, maxLength: 200 }),
     provider: fc.string({ minLength: 1, maxLength: 100 }),

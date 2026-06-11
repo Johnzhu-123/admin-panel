@@ -124,7 +124,8 @@ describe('Mask Optimization Properties', () => {
           coordinates: arbitraryBrushCoordinates(),
           canvasSize: arbitraryImageSize(),
           opacity: arbitraryOpacity(),
-          format: fc.constantFrom('png', 'base64')
+          // 🔧 FIX (2026-06-11 类型门禁): 显式字面量联合，constantFrom 默认推断为 string
+          format: fc.constantFrom<'png' | 'base64'>('png', 'base64')
         }),
         ({ id, coordinates, canvasSize, opacity, format }) => {
           const mask = maskProcessor.createMask(
@@ -168,7 +169,11 @@ describe('Mask Optimization Properties', () => {
       fc.property(
         fc.record({
           coordinates: fc.array(arbitraryPoint(), { minLength: 5, maxLength: 100 }),
-          tolerance: fc.float({ min: Math.fround(0.1), max: Math.fround(5.0) })
+          // 🔧 FIX (2026-06-11 G3): fast-check v3 的 fc.float 即使给了 min/max，默认
+          // noNaN:false 仍会偶发生成 NaN（随机种子命中时 Math.max(NaN,1)=NaN，
+          // toBeLessThanOrEqual(NaN) 恒假——本套件偶发红的根因）。容差语义本就
+          // 不含 NaN，显式排除。
+          tolerance: fc.float({ min: Math.fround(0.1), max: Math.fround(5.0), noNaN: true })
         }),
         ({ coordinates, tolerance }) => {
           const originalMask = maskProcessor.createMask(

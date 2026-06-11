@@ -39,10 +39,12 @@ describe('Feature: third-party-api-compatibility, Property 1: 路径规范化一
     fc.assert(
       fc.property(urlWithDuplicateV1, (url) => {
         const normalized = normalizer.normalizePath(url, '');
-        
-        // Count occurrences of /v1 in the normalized URL
-        const v1Count = (normalized.match(/\/v1(?![a-z])/gi) || []).length;
-        
+
+        // 🔧 FIX (2026-06-11 G3): 属性声明的是"/v1 路径段"数量，统计范围应为
+        // pathname；原实现对完整 URL 计数，fc.webUrl 随机生成 v1 开头的主机名
+        // （如 v1.a.aa）时把主机名误计入，规范化正确也会偶发误报。
+        const v1Count = (new URL(normalized).pathname.match(/\/v1(?![a-z])/gi) || []).length;
+
         return v1Count === 1;
       }),
       { numRuns: 100 }

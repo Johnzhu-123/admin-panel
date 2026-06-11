@@ -1,6 +1,12 @@
 /**
+ * @jest-environment node
+ *
  * Unit tests for Image Generation Status API
  * Tests the GET /api/ai/image/status endpoint
+ *
+ * 🔧 FIX (2026-06-11): 全局 jest 环境为 jsdom，但 jsdom 无 Web fetch 全局
+ * （Request/Response），import next/server 即抛 "Request is not defined"，
+ * 套件从未跑起来。API 路由测试本就该跑 node 环境（Node≥18 自带 fetch 全局）。
  */
 
 import { describe, it, expect, jest, beforeEach } from '@jest/globals';
@@ -168,7 +174,7 @@ describe('GET /api/ai/image/status', () => {
 
     it('should include error details in development mode', async () => {
       const originalEnv = process.env.NODE_ENV;
-      process.env.NODE_ENV = 'development';
+      (process.env as any).NODE_ENV = 'development'; // 🔧 类型门禁: NODE_ENV 类型只读，测试内强写
 
       const taskId = '550e8400-e29b-41d4-a716-446655440000';
       const mockGetTaskStatus = taskManager.getTaskStatus as jest.MockedFunction<typeof taskManager.getTaskStatus>;
@@ -181,12 +187,12 @@ describe('GET /api/ai/image/status', () => {
       expect(response.status).toBe(500);
       expect(data.details).toBe('Database connection failed');
 
-      process.env.NODE_ENV = originalEnv;
+      (process.env as any).NODE_ENV = originalEnv;
     });
 
     it('should not include error details in production mode', async () => {
       const originalEnv = process.env.NODE_ENV;
-      process.env.NODE_ENV = 'production';
+      (process.env as any).NODE_ENV = 'production'; // 🔧 类型门禁: NODE_ENV 类型只读，测试内强写
 
       const taskId = '550e8400-e29b-41d4-a716-446655440000';
       const mockGetTaskStatus = taskManager.getTaskStatus as jest.MockedFunction<typeof taskManager.getTaskStatus>;
@@ -199,7 +205,7 @@ describe('GET /api/ai/image/status', () => {
       expect(response.status).toBe(500);
       expect(data.details).toBeUndefined();
 
-      process.env.NODE_ENV = originalEnv;
+      (process.env as any).NODE_ENV = originalEnv;
     });
   });
 

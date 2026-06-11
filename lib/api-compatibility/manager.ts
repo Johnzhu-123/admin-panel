@@ -39,6 +39,24 @@ import {
 import { ContentPolicyHandler } from './components/content-policy-handler';
 import { queuedFetch } from '../request-queue-manager'; // 🔧 NEW: 导入请求队列管理器
 
+const IMAGE_OPERATION_TIMEOUT_MS = 600000;
+
+/**
+ * 🔧 FIX (2026-06-11 BUG-A20/C13): handleAPIError 的联合返回类型。
+ * 安全提示词重试成功时返回 { recovered }，调用方直接把成功响应返回给上层，
+ * 不再把成功结果包进 APIErrorImpl 然后 throw（旧实现导致成功图随异常被吞、
+ * route 层再次生成造成双倍计费）。
+ */
+type HandleAPIErrorResult = APIErrorImpl | { recovered: ImageGenerationResponse };
+
+const isRecoveredResult = (
+  value: HandleAPIErrorResult
+): value is { recovered: ImageGenerationResponse } =>
+  !!value &&
+  typeof value === 'object' &&
+  !(value instanceof APIErrorImpl) &&
+  'recovered' in value;
+
 export class APICompatibilityManager implements IAPICompatibilityManager {
   private pathNormalizer: PathNormalizer;
   private authHandler: AuthenticationHandler;
@@ -95,7 +113,7 @@ export class APICompatibilityManager implements IAPICompatibilityManager {
       // 🔧 FIX (2026-05 #13 root cause of "An unexpected error occurred" 第 2 层):
       //   旧实现一律调 createAPIError(error, ...) 重建 APIError，结果把
       //   handleAPIError 已经塞进去的 status/statusText/bodyPreview/data 全部丢失，
-      //   message 也被覆盖成 "Unknown error occurred"（因为 createAPIError 默认值）。
+      //   message 也被覆盖成 "Unknown error occurred"。
       //   只要 attemptImageGeneration 抛出的本身就是 APIErrorImpl，就直接保留结构。
       const apiError = error instanceof APIErrorImpl
         ? error
@@ -249,7 +267,10 @@ export class APICompatibilityManager implements IAPICompatibilityManager {
         backoffMs: 1000,
         retryableErrors: ['network_error', 'rate_limit']
       },
-      timeoutMs: 30000,
+      // 🔧 FIX (2026-06-11 BUG-C5): 默认 30s 超时对图像生成完全不够（慢供应商
+      // 常态 1-5 分钟），导致"客户端超时放弃 → 上层重试 → 上游仍在生成"的
+      // 重复计费风暴。图像操作统一用文件内既有 IMAGE_OPERATION_TIMEOUT_MS（600s）。
+      timeoutMs: IMAGE_OPERATION_TIMEOUT_MS,
       rateLimits: {
         requestsPerMinute: 60,
         requestsPerHour: 1000,
@@ -300,13 +321,15 @@ export class APICompatibilityManager implements IAPICompatibilityManager {
 
     try {
       // 🔧 UPDATED: 使用队列化的fetch来避免429错误
+      // 🔧 FIX (2026-06-11 BUG-C5): 不再预创建 AbortSignal.timeout——排队等待会消耗
+      // 超时额度。改传 timeoutMs，由队列在"实际执行"时创建 timeout signal。
       const response = await queuedFetch(
         authenticatedRequest.url,
         {
           method: authenticatedRequest.method,
           headers: authenticatedRequest.headers,
           body: JSON.stringify(authenticatedRequest.body),
-          signal: AbortSignal.timeout(config.timeoutMs)
+          timeoutMs: config.timeoutMs
         },
         'normal', // priority
         context.userId // 用于去重和统计
@@ -323,8 +346,13 @@ export class APICompatibilityManager implements IAPICompatibilityManager {
 
       if (!response.ok) {
         // Handle specific error types
-        const error = await this.handleAPIError(response, responseData, provider, request, context);
-        throw error;
+        const errorOrRecovered = await this.handleAPIError(response, responseData, provider, request, context);
+        // 🔧 FIX (2026-06-11 BUG-A20/C13): 安全提示词重试已成功时直接返回成功响应，
+        // 不再 throw 把成功图吞掉。
+        if (isRecoveredResult(errorOrRecovered)) {
+          return errorOrRecovered.recovered;
+        }
+        throw errorOrRecovered;
       }
 
       // Adapt the response format
@@ -383,13 +411,14 @@ export class APICompatibilityManager implements IAPICompatibilityManager {
 
     try {
       // 🔧 UPDATED: 使用队列化的fetch来避免429错误
+      // 🔧 FIX (2026-06-11 BUG-C5): timeout signal 改由队列在实际执行时创建（排队不计时）
       const response = await queuedFetch(
         authenticatedRequest.url,
         {
           method: authenticatedRequest.method,
           headers: authenticatedRequest.headers,
           body: JSON.stringify(authenticatedRequest.body),
-          signal: AbortSignal.timeout(300000) // 5 minutes for Gemini
+          timeoutMs: IMAGE_OPERATION_TIMEOUT_MS // 10 minutes for Gemini image requests
         },
         'normal', // priority
         context.userId // 用于去重和统计
@@ -479,6 +508,10 @@ export class APICompatibilityManager implements IAPICompatibilityManager {
   /**
    * Handles API errors with intelligent error detection and recovery
    * Private method for error processing
+   * 🔧 FIX (2026-06-11 BUG-A20/C13): 返回联合类型——安全提示词重试成功时返回
+   * { recovered: ImageGenerationResponse }，由调用方直接作为成功响应返回；
+   * 旧实现把成功结果包进 code='content_policy_resolved' 的 APIErrorImpl，
+   * 调用方一律 throw → 成功图被异常链吞掉，route 再跑原逻辑重复生成计费。
    */
   private async handleAPIError(
     response: Response,
@@ -486,7 +519,7 @@ export class APICompatibilityManager implements IAPICompatibilityManager {
     provider: APIProvider,
     request: ImageGenerationRequest,
     context: RequestContext
-  ): Promise<APIErrorImpl> {
+  ): Promise<HandleAPIErrorResult> {
     // 🔧 FIX (2026-05 #12 root cause of "An unexpected error occurred"):
     //   旧实现只调用 extractErrorMessage(responseData)，对没有标准 error 字段的
     //   上游响应（HTML 错误页、网关返回 plain text、502 短文本等）一律返回
@@ -523,23 +556,18 @@ export class APICompatibilityManager implements IAPICompatibilityManager {
         
         if (analysis.modifiedPrompt) {
           const safeRequest = { ...request, prompt: analysis.modifiedPrompt };
-          
+
           // Retry with safe prompt
           const result = await this.attemptImageGeneration(safeRequest, provider, this.getProviderConfig(provider.id), {
             ...context,
             attemptCount: 0 // Reset attempt count for safe prompt retry
           });
-          
-          // If successful, return the result wrapped in a response
-          return new APIErrorImpl(
-            'content_policy' as ErrorType,
-            'content_policy_resolved',
-            `Content policy error resolved using safe prompt: "${analysis.modifiedPrompt}"`,
-            provider.id,
-            new Date(),
-            request,
-            result
-          );
+
+          // 🔧 FIX (2026-06-11 BUG-A20/C13): 安全提示词重试成功 → 返回 recovered
+          // 联合类型，让调用方直接返回成功响应（不再包成 content_policy_resolved
+          // 伪错误被 throw 丢图）。
+          console.log(`Content policy error resolved using safe prompt: "${analysis.modifiedPrompt}"`);
+          return { recovered: result };
         }
       } catch (retryError) {
         // If retry fails, continue with original error
@@ -653,8 +681,8 @@ export class APICompatibilityManager implements IAPICompatibilityManager {
     startTime: Date
   ): APIError {
     // 🔧 FIX (2026-05 #13): 防御式：如果传进来的就已经是结构化 APIError-like 对象
-    //   （有 type/code/message 三件套，或来自 handleAPIError 的旧 plain 对象），
-    //   直接保留，避免被 createAPIError 的默认值覆盖成 "Unknown error occurred"。
+    //   （有 type/code/message 三件套），直接保留，避免被默认值覆盖成
+    //   "Unknown error occurred"。
     if (error && typeof error === 'object'
         && typeof error.type === 'string'
         && typeof error.message === 'string') {
@@ -689,14 +717,11 @@ export class APICompatibilityManager implements IAPICompatibilityManager {
     let message = 'Unknown error occurred';
     let code = 'unknown';
 
-    // 🔧 FIX (2026-05 #15): 不再依赖 instanceof Error（undici 在 worker 边界经常
-    //   把 error 抹成 plain object）。改成 duck typing：只要有可读的 message/cause
-    //   就尽量提取。
+    // 🔧 FIX (2026-05 #15+#16): 不再依赖 instanceof Error；duck typing 提取 message/cause/name
     const errMessage = typeof error?.message === 'string' ? error.message : '';
     if (errMessage) {
       message = errMessage;
     }
-    // undici / fetch 失败时真实 reason 在 error.cause 上，拼到 message。
     const cause: any = (error as any)?.cause;
     if (cause && typeof cause === 'object') {
       const causeMsg = typeof cause.message === 'string' ? cause.message : '';
@@ -705,7 +730,6 @@ export class APICompatibilityManager implements IAPICompatibilityManager {
         message = `${message} | cause=${[causeCode, causeMsg].filter(Boolean).join(' ')}`;
       }
     }
-    // error.name 也有诊断价值（AbortError / TypeError / FetchError）
     const errName = typeof error?.name === 'string' ? error.name : '';
     if (errName && errName !== 'Error' && !message.includes(errName)) {
       message = `${errName}: ${message}`;
@@ -725,9 +749,8 @@ export class APICompatibilityManager implements IAPICompatibilityManager {
       message = error;
     }
 
-    // 🔧 FIX (2026-05 #16): 当上面所有 duck typing 都没能榨出真消息时（即仍是
-    //   "Unknown error occurred" 默认值），把诊断 dump 直接拼进 message，让前端
-    //   响应里就能看到原始 error 的形态，免去 Render 日志依赖。
+    // 🔧 FIX (2026-05 #16): 当上面所有 duck typing 都没能榨出真消息时，把诊断 dump
+    //   直接拼进 message，让前端响应里就能看到原始 error 形态，免去日志依赖。
     if (message === 'Unknown error occurred' && error) {
       try {
         const ctor = (error as any)?.constructor?.name;
@@ -764,7 +787,7 @@ export class APICompatibilityManager implements IAPICompatibilityManager {
       provider.id,
       new Date(),
       request,
-      error  // 原始 error 放到 response 字段
+      error
     );
   }
 

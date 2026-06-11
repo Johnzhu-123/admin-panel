@@ -7,15 +7,22 @@
 interface QueuedRequest {
   id: string;
   url: string;
-  options: RequestInit;
+  options: QueuedRequestInit;
   resolve: (value: Response) => void;
   reject: (reason: any) => void;
   timestamp: number;
   retryCount: number;
+  rateLimitRetryCount: number;   // 🔧 FIX (2026-06-11 BUG-A19): 429 在本层的独立重试计数
   priority: 'high' | 'normal' | 'low';
   userId?: string;              // 用户ID，用于去重和统计
   requestHash?: string;         // 请求哈希，用于去重
 }
+
+/**
+ * 🔧 FIX (2026-06-11 BUG-C5): 扩展 RequestInit，允许调用方传 timeoutMs 而不是
+ * 预创建的 AbortSignal.timeout——超时计时改在请求"实际执行"时启动（排队不计时）。
+ */
+export type QueuedRequestInit = RequestInit & { timeoutMs?: number };
 
 interface RateLimitConfig {
   maxConcurrent: number;        // 最大并发请求数
@@ -27,6 +34,28 @@ interface RateLimitConfig {
   maxRetries: number;           // 最大重试次数
   backoffMultiplier: number;    // 退避倍数
 }
+
+// 🔧 FIX (2026-06-11 BUG-A7): 非幂等请求（生成类 POST）禁用响应缓存与去重——
+// 同 prompt 的两次图片/对话生成是两次独立计费操作，缓存/去重会让用户拿到旧图，
+// 或让并发的两个不同业务请求错误共享同一个上游响应。
+const NON_IDEMPOTENT_URL_PATTERNS = [
+  "/api/ai/image",
+  "/images/",
+  "/chat/completions",
+  "/api/ai/video",
+  "/api/ai/tts",
+];
+
+const isNonIdempotentRequest = (url: string, options: RequestInit): boolean => {
+  const method = (options.method || "GET").toUpperCase();
+  if (method !== "POST") return false;
+  const lowerUrl = (url || "").toLowerCase();
+  return NON_IDEMPOTENT_URL_PATTERNS.some((pattern) => lowerUrl.includes(pattern));
+};
+
+const CACHE_TTL_MS = 60_000;            // 响应缓存 1 分钟
+const CACHE_CLEANUP_INTERVAL_MS = 5 * 60_000; // 🔧 FIX (2026-06-11 BUG-C4): 定期清理过期缓存
+const RATE_LIMIT_MAX_RETRIES = 2;        // 🔧 FIX (2026-06-11 BUG-A19): 429 本层最多重试 2 次
 
 class RequestQueueManager {
   private queue: QueuedRequest[] = [];
@@ -41,6 +70,7 @@ class RequestQueueManager {
   private adaptiveMinInterval: number;         // 动态调整的最小间隔
   private requestCache = new Map<string, { response: Response; timestamp: number }>();  // 请求缓存
   private pendingRequests = new Map<string, Promise<Response>>();  // 进行中的请求（去重用）
+  private cacheCleanupTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(config: Partial<RateLimitConfig> = {}) {
     this.config = {
@@ -55,6 +85,26 @@ class RequestQueueManager {
       ...config
     };
     this.adaptiveMinInterval = this.config.minInterval;
+    this.startCacheCleanup();
+  }
+
+  /**
+   * 🔧 FIX (2026-06-11 BUG-C4): 缓存的 Response 之前只在"恰好命中同 hash"时才被
+   * 惰性清掉，长进程里没人再发同样请求的过期条目永远滞留。这里加 5 分钟一次的
+   * 定期清理，并 unref() 避免阻止进程退出。
+   */
+  private startCacheCleanup(): void {
+    if (this.cacheCleanupTimer) return;
+    if (typeof setInterval !== "function") return;
+    this.cacheCleanupTimer = setInterval(() => {
+      const now = Date.now();
+      for (const [key, entry] of this.requestCache) {
+        if (now - entry.timestamp >= CACHE_TTL_MS) {
+          this.requestCache.delete(key);
+        }
+      }
+    }, CACHE_CLEANUP_INTERVAL_MS);
+    (this.cacheCleanupTimer as unknown as { unref?: () => void })?.unref?.();
   }
 
   /**
@@ -63,25 +113,33 @@ class RequestQueueManager {
    */
   async enqueue(
     url: string,
-    options: RequestInit = {},
+    options: QueuedRequestInit = {},
     priority: 'high' | 'normal' | 'low' = 'normal',
     userId?: string
   ): Promise<Response> {
+    // 🔧 FIX (2026-06-11 BUG-A7): 非幂等的生成类 POST 请求禁用缓存与去重，
+    // 每次调用都必须真实打到上游。
+    const nonIdempotent = isNonIdempotentRequest(url, options);
+
     // 🔧 NEW: 生成请求哈希用于去重
-    const requestHash = this.generateRequestHash(url, options);
+    const requestHash = nonIdempotent ? undefined : this.generateRequestHash(url, options);
 
-    // 🔧 NEW: 检查缓存
-    const cached = this.requestCache.get(requestHash);
-    if (cached && Date.now() - cached.timestamp < 60000) { // 1分钟缓存
-      console.log(`✅ Cache hit for request: ${requestHash.substring(0, 8)}`);
-      return cached.response.clone();
-    }
+    if (requestHash) {
+      // 🔧 NEW: 检查缓存
+      const cached = this.requestCache.get(requestHash);
+      if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+        console.log(`✅ Cache hit for request: ${requestHash.substring(0, 8)}`);
+        return cached.response.clone();
+      }
 
-    // 🔧 NEW: 检查是否有相同的请求正在进行（去重）
-    const pending = this.pendingRequests.get(requestHash);
-    if (pending) {
-      console.log(`⏳ Deduplicating request: ${requestHash.substring(0, 8)}`);
-      return pending;
+      // 🔧 NEW: 检查是否有相同的请求正在进行（去重）
+      const pending = this.pendingRequests.get(requestHash);
+      if (pending) {
+        console.log(`⏳ Deduplicating request: ${requestHash.substring(0, 8)}`);
+        // 🔧 FIX (2026-06-11 BUG-C4): 去重命中返回 clone——旧实现把同一个 Response
+        // 对象交给多个调用方，第一个读完 body 后其余调用方全部 "body used already"。
+        return pending.then((response) => response.clone());
+      }
     }
 
     // 创建新的请求Promise
@@ -94,6 +152,7 @@ class RequestQueueManager {
         reject,
         timestamp: Date.now(),
         retryCount: 0,
+        rateLimitRetryCount: 0,
         priority,
         userId,
         requestHash
@@ -112,13 +171,22 @@ class RequestQueueManager {
       this.processQueue();
     });
 
-    // 记录进行中的请求
-    this.pendingRequests.set(requestHash, requestPromise);
+    if (requestHash) {
+      // 记录进行中的请求
+      this.pendingRequests.set(requestHash, requestPromise);
 
-    // 请求完成后清理
-    requestPromise.finally(() => {
-      this.pendingRequests.delete(requestHash);
-    });
+      // 请求完成后清理
+      requestPromise.finally(() => {
+        this.pendingRequests.delete(requestHash);
+      }).catch(() => {
+        // finally 衍生的 promise 链兜底，避免 unhandled rejection
+      });
+
+      // 🔧 FIX (2026-06-11 BUG-C4): 首个调用方也拿 clone——原始 Response 只作为
+      // "克隆母本"保存在 pending promise 里。若把原始对象直接交给首个调用方，
+      // 它一读 body 就锁流，后续去重命中的 clone() 全部抛 "body already used"。
+      return requestPromise.then((response) => response.clone());
+    }
 
     return requestPromise;
   }
@@ -169,12 +237,29 @@ class RequestQueueManager {
 
     console.log(`🚀 Executing request: ${request.id} - Active: ${this.activeRequests.size}`);
 
+    // 🔧 FIX (2026-06-11 BUG-C5): timeoutMs 在"实际执行"时才换成 AbortSignal，
+    // 排队等待时间不计入超时。
+    const { timeoutMs, ...fetchOptions } = request.options;
+    let executionSignal: AbortSignal | undefined = fetchOptions.signal || undefined;
+    if (
+      !executionSignal &&
+      typeof timeoutMs === "number" &&
+      timeoutMs > 0 &&
+      typeof AbortSignal !== "undefined" &&
+      typeof AbortSignal.timeout === "function"
+    ) {
+      executionSignal = AbortSignal.timeout(timeoutMs);
+    }
+
     try {
-      const response = await fetch(request.url, request.options);
+      const response = await fetch(request.url, {
+        ...fetchOptions,
+        ...(executionSignal ? { signal: executionSignal } : {}),
+      });
 
       // 🔧 NEW: 检查429错误并自适应调整
       if (response.status === 429) {
-        this.handle429Error(request);
+        this.handle429Error(request, response);
         return;
       }
 
@@ -185,9 +270,11 @@ class RequestQueueManager {
 
       // 检查是否需要重试
       if (this.shouldRetry(response, request)) {
+        // 🔧 FIX (2026-06-11 BUG-C19): 被重试丢弃的 Response 取消 body，释放连接
+        void response.body?.cancel().catch(() => {});
         await this.retryRequest(request);
       } else {
-        // 🔧 NEW: 缓存成功的响应
+        // 🔧 NEW: 缓存成功的响应（非幂等请求 requestHash 为空，天然不会被缓存）
         if (response.ok && request.requestHash) {
           this.requestCache.set(request.requestHash, {
             response: response.clone(),
@@ -197,6 +284,12 @@ class RequestQueueManager {
         request.resolve(response);
       }
     } catch (error) {
+      // 🔧 FIX (2026-06-11 BUG-C4): 用户已 abort 的请求不得重试——立即 reject，
+      // 否则取消的图片生成会在后台继续重发并计费。
+      if (request.options?.signal?.aborted || executionSignal?.aborted) {
+        request.reject(error);
+        return;
+      }
       // 网络错误重试
       if (request.retryCount < this.config.maxRetries) {
         await this.retryRequest(request);
@@ -230,8 +323,11 @@ class RequestQueueManager {
 
   /**
    * 🔧 NEW: 处理429错误
+   * 🔧 FIX (2026-06-11 BUG-A19): 429 只在本层做 ≤RATE_LIMIT_MAX_RETRIES 次退避重试，
+   * 超限后 reject 并在错误信息里注明"已重试"，错误带上游 Retry-After（若有）——
+   * 上层（fetchWithRetry / api-compatibility）看到该错误不应再叠加自己的 429 重试。
    */
-  private handle429Error(request: QueuedRequest): void {
+  private handle429Error(request: QueuedRequest, response?: Response): void {
     const now = Date.now();
     this.rateLimitErrors.push(now);
 
@@ -256,13 +352,44 @@ class RequestQueueManager {
       console.log(`🔧 Adaptive rate limit adjusted: minInterval=${this.adaptiveMinInterval}ms, maxConcurrent=${this.config.maxConcurrent}`);
     }
 
-    // 重试请求
-    if (request.retryCount < this.config.maxRetries) {
-      this.retryRequest(request);
-    } else {
-      console.error(`❌ Request ${request.id} exceeded max retries after 429 errors`);
-      request.reject(new Error('Rate limit exceeded after maximum retries'));
+    // 读取上游 Retry-After（秒或 HTTP-date；只处理秒数形式）
+    const retryAfterRaw = response?.headers?.get?.("retry-after") || "";
+    const retryAfterSeconds = /^\d+$/.test(retryAfterRaw.trim())
+      ? Number(retryAfterRaw.trim())
+      : null;
+
+    // 🔧 FIX (2026-06-11 BUG-C19): 丢弃的 429 响应取消 body
+    void response?.body?.cancel().catch(() => {});
+
+    if (request.rateLimitRetryCount < RATE_LIMIT_MAX_RETRIES) {
+      request.rateLimitRetryCount++;
+      const backoff = Math.min(
+        this.config.minInterval *
+          Math.pow(this.config.backoffMultiplier, request.rateLimitRetryCount),
+        30000
+      );
+      const delay = retryAfterSeconds !== null
+        ? Math.min(Math.max(retryAfterSeconds * 1000, backoff), 60000)
+        : backoff;
+      console.log(`🔄 429 retry ${request.rateLimitRetryCount}/${RATE_LIMIT_MAX_RETRIES} for ${request.id} after ${delay}ms`);
+      setTimeout(() => {
+        this.queue.unshift(request);
+        this.processQueue();
+      }, delay);
+      return;
     }
+
+    console.error(`❌ Request ${request.id} exceeded 429 retry budget (${RATE_LIMIT_MAX_RETRIES})`);
+    const retryAfterNote = retryAfterSeconds !== null
+      ? `；上游 Retry-After=${retryAfterSeconds}s`
+      : "";
+    const error = new Error(
+      `Rate limit exceeded (HTTP 429)：队列层已重试 ${RATE_LIMIT_MAX_RETRIES} 次仍被限流，请稍后再试${retryAfterNote}。[已重试，请勿在上层叠加重试]`
+    ) as Error & { status?: number; retryAfterSeconds?: number | null; alreadyRetried?: boolean };
+    error.status = 429;
+    error.retryAfterSeconds = retryAfterSeconds;
+    error.alreadyRetried = true;
+    request.reject(error);
   }
 
   /**
@@ -299,6 +426,10 @@ class RequestQueueManager {
    */
   private shouldRetry(response: Response, request: QueuedRequest): boolean {
     if (request.retryCount >= this.config.maxRetries) return false;
+
+    // 🔧 FIX (2026-06-11 BUG-A6): 服务端明确标记"不可重试"的响应（如 image route
+    // 对"HTTP 200 但无图"返回的 502）直接放行给调用方，避免重试经济学灾难。
+    if (response.headers?.get?.("x-md2ppt-no-retry") === "1") return false;
 
     // 429 (Too Many Requests) 应该重试（但由handle429Error处理）
     if (response.status === 429) return false; // 已在executeRequest中处理
@@ -477,12 +608,34 @@ const globalRequestQueue = new RequestQueueManager({
 });
 
 // 导出便捷函数
+const isLoopbackRequest = (url: string): boolean => {
+  try {
+    const parsed = new URL(url);
+    const host = (parsed.hostname || "").toLowerCase();
+    return host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "0.0.0.0";
+  } catch {
+    return false;
+  }
+};
+
 export const queuedFetch = (
   url: string,
-  options: RequestInit = {},
+  options: QueuedRequestInit = {},
   priority: 'high' | 'normal' | 'low' = 'normal',
   userId?: string
 ): Promise<Response> => {
+  // Avoid queue throttling for loopback services (e.g. local built-in API on localhost).
+  if (isLoopbackRequest(url)) {
+    // 🔧 FIX (2026-06-11 BUG-C5): loopback 直连路径同样支持 timeoutMs（立即执行，
+    // 此时创建 timeout signal 没有排队误差）。
+    const { timeoutMs, ...rest } = options;
+    const signal =
+      rest.signal ||
+      (typeof timeoutMs === "number" && timeoutMs > 0
+        ? AbortSignal.timeout(timeoutMs)
+        : undefined);
+    return fetch(url, { ...rest, ...(signal ? { signal } : {}) });
+  }
   return globalRequestQueue.enqueue(url, options, priority, userId);
 };
 

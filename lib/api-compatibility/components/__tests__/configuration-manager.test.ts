@@ -141,7 +141,7 @@ describe('ConfigurationManagerImpl', () => {
         id: 'test',
         name: 'Test',
         baseUrl: 'https://api.test.com',
-        authType: 'bearer',
+        authType: 'bearer' as const, // 🔧 类型门禁: 避免 widen 成 string
         supportedFormats: [],
         pathMappings: {},
         customHeaders: {},

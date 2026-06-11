@@ -201,7 +201,7 @@ describe('Error Handler', () => {
 
     it('should include details in development mode', async () => {
       const originalEnv = process.env.NODE_ENV;
-      process.env.NODE_ENV = 'development';
+      (process.env as any).NODE_ENV = 'development'; // 🔧 类型门禁: NODE_ENV 类型只读，测试内强写
 
       const error = new Error('Detailed error message');
       const context: ErrorContext = {
@@ -212,12 +212,12 @@ describe('Error Handler', () => {
 
       expect(response.details).toBe('Detailed error message');
 
-      process.env.NODE_ENV = originalEnv;
+      (process.env as any).NODE_ENV = originalEnv;
     });
 
     it('should not include details in production mode', async () => {
       const originalEnv = process.env.NODE_ENV;
-      process.env.NODE_ENV = 'production';
+      (process.env as any).NODE_ENV = 'production'; // 🔧 类型门禁: NODE_ENV 类型只读，测试内强写
 
       const error = new Error('Detailed error message');
       const context: ErrorContext = {
@@ -228,7 +228,7 @@ describe('Error Handler', () => {
 
       expect(response.details).toBeUndefined();
 
-      process.env.NODE_ENV = originalEnv;
+      (process.env as any).NODE_ENV = originalEnv;
     });
 
     it('should handle task status update failure gracefully', async () => {

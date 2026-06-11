@@ -2,7 +2,7 @@
 
 import * as fc from 'fast-check';
 import { NetworkDiagnostics } from '../network-diagnostics';
-import { APIProvider } from '../../types';
+import { APIProvider, NetworkErrorType } from '../../types';
 
 // Mock fetch for testing
 global.fetch = jest.fn();
@@ -370,7 +370,8 @@ describe('NetworkDiagnostics Property Tests', () => {
     it('should provide meaningful suggestions for any error pattern', () => {
       fc.assert(fc.property(
         fc.array(fc.record({
-          type: fc.constantFrom('TLS', 'DNS', 'PORT', 'TIMEOUT', 'CONNECTION'),
+          // 🔧 FIX (2026-06-11 类型门禁): 显式字面量联合，constantFrom 默认推断为 string
+          type: fc.constantFrom<NetworkErrorType>('TLS', 'DNS', 'PORT', 'TIMEOUT', 'CONNECTION'),
           message: fc.string({ minLength: 1 }),
           details: fc.anything()
         }), { minLength: 1, maxLength: 5 }),

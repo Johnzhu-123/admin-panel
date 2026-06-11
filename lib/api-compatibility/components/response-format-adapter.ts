@@ -26,6 +26,18 @@ export class ResponseFormatAdapter implements IResponseFormatAdapter {
   };
 
   /**
+   * 🔧 FIX (2026-06-11 G3): 自有属性安全查表。extractProviderName 对未知 provider 会
+   * 原样返回其 id/name，用它直接索引对象字面量会沿原型链命中 'constructor' /
+   * 'toString' / 'valueOf' 等键（property 测试随机种子命中 id="constructor" 时，
+   * knownProviderFormats['constructor'] 拿到 Object 构造函数 → supportedFormats.includes
+   * is not a function，这就是 response-format-adapter.property 偶发红的真实根因，并非
+   * 超时抖动）。本文件所有以外部可控字符串为键的字典读取统一走本方法。
+   */
+  private static ownEntry<T>(map: Record<string, T>, key: string): T | undefined {
+    return Object.prototype.hasOwnProperty.call(map, key) ? map[key] : undefined;
+  }
+
+  /**
    * Adapts request format based on provider capabilities
    * Validates: Requirements 3.1, 3.2, 3.3, 3.4
    */
@@ -129,8 +141,10 @@ export class ResponseFormatAdapter implements IResponseFormatAdapter {
 
     // Check if we have cached knowledge about this provider
     const providerName = this.extractProviderName(provider);
-    if (this.knownProviderFormats[providerName]) {
-      return [...this.knownProviderFormats[providerName]];
+    // 🔧 FIX (2026-06-11 G3): 改走 ownEntry，防原型链键（见 ownEntry 注释）
+    const cachedFormats = ResponseFormatAdapter.ownEntry(this.knownProviderFormats, providerName);
+    if (cachedFormats) {
+      return [...cachedFormats];
     }
 
     // Test different formats to detect support
@@ -154,7 +168,14 @@ export class ResponseFormatAdapter implements IResponseFormatAdapter {
     }
 
     // Cache the result for future use
-    this.knownProviderFormats[providerName] = supportedFormats;
+    // 🔧 FIX (2026-06-11 G3): 普通赋值遇到 providerName='__proto__' 会改写字典原型而非
+    // 落键，用 defineProperty 强制按自有属性写入。
+    Object.defineProperty(this.knownProviderFormats, providerName, {
+      value: supportedFormats,
+      writable: true,
+      enumerable: true,
+      configurable: true
+    });
 
     return supportedFormats;
   }
@@ -165,7 +186,8 @@ export class ResponseFormatAdapter implements IResponseFormatAdapter {
    */
   private getProviderSupportedFormats(provider: APIProvider): string[] {
     const providerName = this.extractProviderName(provider);
-    return this.knownProviderFormats[providerName] || ['url', 'b64_json'];
+    // 🔧 FIX (2026-06-11 G3): 改走 ownEntry，防原型链键（见 ownEntry 注释）
+    return ResponseFormatAdapter.ownEntry(this.knownProviderFormats, providerName) || ['url', 'b64_json'];
   }
 
   /**
@@ -238,9 +260,14 @@ export class ResponseFormatAdapter implements IResponseFormatAdapter {
       }
     };
 
-    const providerMappings = modelMappings[providerName];
-    if (providerMappings && providerMappings[model.toLowerCase()]) {
-      return providerMappings[model.toLowerCase()];
+    // 🔧 FIX (2026-06-11 G3): 两级查表均改走 ownEntry——providerName 与 model 都是
+    // 外部可控字符串，原型链键（如 model='constructor'）会取出函数当映射结果。
+    const providerMappings = ResponseFormatAdapter.ownEntry(modelMappings, providerName);
+    const mappedModel = providerMappings
+      ? ResponseFormatAdapter.ownEntry(providerMappings, model.toLowerCase())
+      : undefined;
+    if (mappedModel) {
+      return mappedModel;
     }
 
     return model;
@@ -273,9 +300,13 @@ export class ResponseFormatAdapter implements IResponseFormatAdapter {
       }
     };
 
-    const providerMappings = sizeMappings[providerName];
-    if (providerMappings && providerMappings[size]) {
-      return providerMappings[size];
+    // 🔧 FIX (2026-06-11 G3): 两级查表均改走 ownEntry，防原型链键（见 ownEntry 注释）
+    const providerMappings = ResponseFormatAdapter.ownEntry(sizeMappings, providerName);
+    const mappedSize = providerMappings
+      ? ResponseFormatAdapter.ownEntry(providerMappings, size)
+      : undefined;
+    if (mappedSize) {
+      return mappedSize;
     }
 
     return size;
@@ -321,7 +352,9 @@ export class ResponseFormatAdapter implements IResponseFormatAdapter {
       'huggingface': 4
     };
 
-    const maxCount = countLimits[providerName] || 10;
+    // 🔧 FIX (2026-06-11 G3): 改走 ownEntry，防原型链键（如 providerName='constructor'
+    // 时 Math.min(n, Object 构造函数) 会得到 NaN）
+    const maxCount = ResponseFormatAdapter.ownEntry(countLimits, providerName) || 10;
     
     return Math.min(n, maxCount);
   }
@@ -338,14 +371,14 @@ export class ResponseFormatAdapter implements IResponseFormatAdapter {
       if (response.data && Array.isArray(response.data)) {
         for (const item of response.data) {
           const imageData: ImageData = {};
-
+          
           // Try different property names for URL
           if (item.url || item.image_url || item.link) {
             imageData.url = item.url || item.image_url || item.link;
           }
-
+          
           // Try different property names for base64 data
-          // 🔧 FIX (2026-05 #6): 补 `image` / `image_data` / `imageData` / `b64`
+          // 🔧 FIX (2026-05 #6，云端保留): 补 `image` / `image_data` / `imageData` / `b64`
           // 字段。第三方 OpenAI-compatible 网关返回字段名各异（gpt-image-2 实测有
           // 出现仅 image 字段的形态），漏接就会触发上层 "No image data in response"。
           if (
@@ -358,11 +391,11 @@ export class ResponseFormatAdapter implements IResponseFormatAdapter {
               item.image || item.image_data || item.imageData ||
               item.data;
           }
-
+          
           if (item.revised_prompt) {
             imageData.revised_prompt = item.revised_prompt;
           }
-
+          
           // Only add image if it has actual image data
           if (imageData.url || imageData.b64_json) {
             images.push(imageData);
@@ -606,7 +639,8 @@ export class ResponseFormatAdapter implements IResponseFormatAdapter {
       // This would typically make a test request to the provider
       // For now, we'll use heuristics based on provider type
       const providerName = this.extractProviderName(provider);
-      const knownFormats = this.knownProviderFormats[providerName];
+      // 🔧 FIX (2026-06-11 G3): 改走 ownEntry，防原型链键（见 ownEntry 注释）
+      const knownFormats = ResponseFormatAdapter.ownEntry(this.knownProviderFormats, providerName);
       
       if (knownFormats) {
         return knownFormats.includes(format);

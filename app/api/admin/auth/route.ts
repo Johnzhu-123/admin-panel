@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { cookies } from 'next/headers';
 import { randomBytes, createHash } from 'crypto';
+// 🔧 FIX (2026-06-11 类型门禁): 会话存储移至 ../_auth.ts（路由文件不允许导出非 handler）
+import { activeSessions } from '../_auth';
 
-// Server-side session store (in-memory, resets on restart)
-const activeSessions = new Map<string, { createdAt: number; expiresAt: number }>();
 const SESSION_MAX_AGE = 7 * 24 * 60 * 60 * 1000; // 7 days in ms
 
 // Rate limiting for login attempts
@@ -144,6 +144,3 @@ export async function DELETE(request: NextRequest) {
     );
   }
 }
-
-// Exported for use by other admin API routes
-export { activeSessions };

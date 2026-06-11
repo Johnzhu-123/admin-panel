@@ -33,6 +33,21 @@ export class FallbackStrategyImpl implements FallbackStrategy {
     originalRequest: ImageGenerationRequest,
     error: APIError
   ): Promise<FallbackResult> {
+    // 🔧 FIX (2026-06-11 BUG-A20/C13): 识别"安全提示词重试已成功"的 recovered 错误
+    // （code=content_policy_resolved 且 response 里带成功的 images）。这类对象本质是
+    // 成功结果，直接作为成功 FallbackResult 返回，不再丢图走降级链。
+    // （manager.handleAPIError 已改为返回 { recovered }，此处是对历史路径/外部
+    // 构造的同类错误的兜底。）
+    const recoveredResponse = this.extractRecoveredResponse(error);
+    if (recoveredResponse) {
+      return {
+        success: true,
+        result: recoveredResponse,
+        fallbackUsed: 'content_policy_recovered',
+        originalError: error,
+      };
+    }
+
     const fallbackOptions = this.getFallbackOptionsForError(error);
     
     // Try fallback options in priority order
@@ -156,6 +171,23 @@ export class FallbackStrategyImpl implements FallbackStrategy {
    */
   clearStats(): void {
     this.fallbackStats.clear();
+  }
+
+  /**
+   * 🔧 FIX (2026-06-11 BUG-A20/C13): 从 recovered 形态的错误对象中提取成功响应。
+   */
+  private extractRecoveredResponse(error: APIError): ImageGenerationResponse | null {
+    if (!error || error.code !== 'content_policy_resolved') return null;
+    const candidate = error.response as ImageGenerationResponse | undefined;
+    if (
+      candidate &&
+      typeof candidate === 'object' &&
+      Array.isArray(candidate.images) &&
+      candidate.images.length > 0
+    ) {
+      return candidate;
+    }
+    return null;
   }
 
   private initializeDefaultHandlers(): void {

@@ -640,7 +640,27 @@ const isMultimodalModel = (model: string): boolean => {
 };
 
 // 从聊天响应中提取图片
-const extractImagesFromChatResponse = async (data: any): Promise<string> => {
+// 🔧 FIX (2026-06-11 类型门禁): isFromStableApi 此前未定义——方法5 的"稳定 API 宽松检测"
+// 分支一旦命中纯 base64 内容就抛 ReferenceError（真实运行时缺陷，而非单纯类型债）。
+// 本意是"按 baseUrl 判定已知稳定 API"：对这类来源返回的纯 base64 聊天响应放宽截断
+// 检测。名单参考同文件既有判定：mg.aid.pub（isModelGate 同源）、zeabur.app
+// （方法0 已特判其图片 URL 格式）、官方 OpenAI / Google 端点。
+const STABLE_API_HOST_PATTERNS = [
+  "api.openai.com",
+  "mg.aid.pub",
+  "zeabur.app",
+  "generativelanguage.googleapis.com",
+];
+
+const isStableApiBaseUrl = (baseUrl: string): boolean => {
+  const normalized = (baseUrl || "").toLowerCase();
+  if (!normalized) return false;
+  return STABLE_API_HOST_PATTERNS.some((host) => normalized.includes(host));
+};
+
+const extractImagesFromChatResponse = async (data: any, sourceBaseUrl = ''): Promise<string> => {
+  // 🔧 FIX (2026-06-11): 稳定来源判定由调用方传入 baseUrl 计算（见上方说明）
+  const isFromStableApi = isStableApiBaseUrl(sourceBaseUrl);
   console.log("Extracting images from chat response:", {
     hasChoices: !!data?.choices,
     choicesLength: Array.isArray(data?.choices) ? data.choices.length : 0,
@@ -1990,7 +2010,7 @@ Please generate the image now and return it in one of the supported formats abov
 
           // 如果没有找到，尝试从聊天响应中提取图片
           if (!b64) {
-            b64 = await extractImagesFromChatResponse(data);
+            b64 = await extractImagesFromChatResponse(data, baseUrl);
           }
 
           if (b64) {

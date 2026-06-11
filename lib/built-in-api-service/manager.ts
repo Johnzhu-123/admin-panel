@@ -30,8 +30,21 @@ import {
   CustomAPIConfig,
   ProxyImageRequest,
   BuiltInServiceError,
-  BuiltInServiceErrorCodes
+  BuiltInServiceErrorCodes,
+  ErrorRecoveryStrategy
 } from './types';
+
+// 🔧 FIX (2026-06-11 类型门禁): serviceManager 字段原声明为窄接口
+// BuiltInAPIServiceManager，但实际构造的是 BuiltInAPIServiceManagerImpl——
+// 它同时实现 ErrorRecoveryStrategy（recover/fallbackToCustomAPI/checkServiceHealth）
+// 并附带 getErrorRecoveryStats/resetErrorRecovery 扩展方法，下方各转发方法的
+// 属性访问全部 TS2339。按"运行时可选能力"建模（Partial），保留既有 if 探测分支
+// 语义；仅类型层修正，运行时行为不变。
+type ServiceManagerWithRecovery = BuiltInAPIServiceManager &
+  Partial<ErrorRecoveryStrategy> & {
+    getErrorRecoveryStats?: () => any;
+    resetErrorRecovery?: (userId: string, serviceId?: string) => void;
+  };
 
 /**
  * Main Built-in API Service Manager
@@ -45,7 +58,7 @@ export class BuiltInAPIService {
   private permissionManager: PermissionManager;
   private configManager: BuiltInServiceConfigManager;
   private proxyLayer: APIProxyLayer;
-  private serviceManager: BuiltInAPIServiceManager;
+  private serviceManager: ServiceManagerWithRecovery;
   
   private initialized = false;
 

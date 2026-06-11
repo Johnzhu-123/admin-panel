@@ -10,7 +10,8 @@ describe('ConfigurationManagerImpl Property Tests', () => {
   });
 
   // Generators for property tests
-  const arbitraryAuthType = fc.constantFrom('bearer', 'api_key', 'custom_header');
+  // 🔧 FIX (2026-06-11 类型门禁): 显式声明字面量联合，constantFrom 默认推断为 string
+  const arbitraryAuthType = fc.constantFrom<AuthenticationType>('bearer', 'api_key', 'custom_header');
   
   const arbitraryRetryConfig = fc.record({
     maxRetries: fc.integer({ min: 0, max: 10 }),

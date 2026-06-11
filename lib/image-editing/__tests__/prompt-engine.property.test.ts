@@ -139,7 +139,8 @@ describe('Prompt Engineering Properties', () => {
       fc.property(
         fc.record({
           instruction: arbitraryInstruction(),
-          level: fc.constantFrom('strict', 'moderate')
+          // 🔧 FIX (2026-06-11 类型门禁): 显式字面量联合，constantFrom 默认推断为 string
+          level: fc.constantFrom<'strict' | 'moderate'>('strict', 'moderate')
         }),
         ({ instruction, level }) => {
           const prompt = promptEngine.addStylePreservation(instruction, level);

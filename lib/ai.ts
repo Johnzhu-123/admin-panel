@@ -25,9 +25,14 @@ export const normalizeOpenAiBaseUrl = (raw?: string) => {
   // 检查是否已经包含 /v1 路径
   const v1Match = trimmed.match(/\/v1(?:beta|alpha)?(?:\/|$)/i);
   if (v1Match && v1Match.index !== undefined) {
-    // 如果已经包含 /v1，移除末尾的斜杠并返回
     const end = v1Match.index + v1Match[0].length;
     const sliceEnd = v1Match[0].endsWith("/") ? end - 1 : end;
+    // 🔧 FIX (2026-06-11 BUG-CS2): /v1 为非末段（如 https://relay.example/v1/openai）
+    // 时保留完整路径——旧实现会把 /v1 之后的真实网关前缀截掉，导致请求打错端点。
+    // v1/v1beta/v1alpha 为末段时维持现有行为（去掉末尾斜杠后原样返回）。
+    if (sliceEnd < trimmed.length) {
+      return trimmed;
+    }
     return trimmed.slice(0, sliceEnd);
   }
 
@@ -127,8 +132,8 @@ export const parseJsonFromText = (text: string) => {
   try {
     return JSON.parse(trimmed);
   } catch {
-    // 🔧 FIX (2026-06-11 BUG-D3): 与桌面端 BUG-A1 同款——原正则把 \s 写成 \\s（双重转义），
-    // ```json 围栏提取分支 100% 失效；且顶层数组无兜底。两仓同步修复（镜像 lib 陷阱）。
+    // 🔧 FIX (2026-06-11 BUG-A1): 原正则把 \s 写成 \\s（regex 字面量双重转义），
+    // ```json 围栏提取分支 100% 失效；且顶层数组无兜底。现修复围栏匹配并补数组提取。
     const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
     if (fenced?.[1]) {
       try {
@@ -241,7 +246,7 @@ export const formatAsciiCodecCompatMessage = (message?: string) => {
     return normalized;
   }
   if (
-    /(openai\s*兼容请求失败|gemini\s*rest\s*回退|素材分析未返回可用文本|已尝试模型)/i.test(
+    /(openai\s*兼容请求失败|gemini\s*(?:rest\s*)?(?:回退|兼容接口失败)|素材分析未返回可用文本|已尝试模型)/i.test(
       normalized
     )
   ) {

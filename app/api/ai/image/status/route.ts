@@ -8,6 +8,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getTaskStatus } from '@/lib/async-image-generation/task-manager';
 import { generateAsync } from '@/lib/async-image-generation/image-generator';
+import type { GenerationParams } from '@/lib/async-image-generation/image-generator';
 
 const normalizeRemoteBase = (base?: string) =>
   (base || "").trim().replace(/\/+$/, "");
@@ -122,7 +123,10 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       console.log('[StatusAPI] Task is pending, triggering background processing:', taskId);
       
       // Extract generation params from request_params
-      const generationParams = taskRecord.requestParams;
+      // 🔧 FIX (2026-06-11 类型门禁): requestParams 建任务时即由 image route 持久化
+      // 原始生成请求 body（含 prompt/provider），DB 层类型宽为 Record<string, any>，
+      // 此处收窄回 GenerationParams（仅类型层断言，运行时行为不变）。
+      const generationParams = taskRecord.requestParams as GenerationParams;
       
       // Trigger async generation (fire and forget)
       generateAsync(taskId, generationParams).catch((error) => {

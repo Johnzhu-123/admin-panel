@@ -1,6 +1,6 @@
 import * as fc from 'fast-check';
 import { FallbackStrategyImpl } from '../fallback-strategy';
-import { APIError, ImageGenerationRequest, ErrorType } from '../../types';
+import { APIError, ImageGenerationRequest, ErrorType, AuthenticationType } from '../../types';
 
 describe('FallbackStrategyImpl Property Tests', () => {
   let fallbackStrategy: FallbackStrategyImpl;
@@ -10,7 +10,8 @@ describe('FallbackStrategyImpl Property Tests', () => {
   });
 
   // Generators for property tests
-  const arbitraryErrorType = fc.constantFrom(
+  // 🔧 FIX (2026-06-11 类型门禁): 显式声明字面量联合，constantFrom 默认推断为 string
+  const arbitraryErrorType = fc.constantFrom<ErrorType>(
     'path_error',
     'auth_error',
     'format_error',
@@ -43,7 +44,7 @@ describe('FallbackStrategyImpl Property Tests', () => {
     name: fc.string({ minLength: 1, maxLength: 100 }),
     baseUrl: fc.webUrl(),
     apiKey: fc.string({ minLength: 1, maxLength: 200 }),
-    authType: fc.constantFrom('bearer', 'api_key', 'custom_header'),
+    authType: fc.constantFrom<AuthenticationType>('bearer', 'api_key', 'custom_header'),
   });
 
   /**

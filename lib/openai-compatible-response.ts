@@ -131,12 +131,68 @@ const mergeOpenAiCompatibleChunks = (chunks: any[]) => {
   if (!chunks.length) return {};
 
   const contentParts: any[] = [];
+  // 🔧 FIX (2026-06-11 BUG-CS1): 聚合流式 tool_calls——按 index 拼接 function.arguments
+  const toolCallsByIndex = new Map<number, any>();
+
+  const mergeToolCallFragment = (fragment: any, fallbackIndex: number, replace: boolean) => {
+    if (!fragment || typeof fragment !== "object") return;
+    const index = typeof fragment.index === "number" ? fragment.index : fallbackIndex;
+    const args =
+      typeof fragment?.function?.arguments === "string"
+        ? fragment.function.arguments
+        : "";
+    const existing = toolCallsByIndex.get(index);
+    if (!existing || replace) {
+      toolCallsByIndex.set(index, {
+        ...(fragment.id ? { id: fragment.id } : existing?.id ? { id: existing.id } : {}),
+        type: fragment.type || existing?.type || "function",
+        function: {
+          ...(existing?.function || {}),
+          ...(fragment.function || {}),
+          arguments: replace ? args : `${existing?.function?.arguments || ""}${args}`,
+        },
+      });
+      return;
+    }
+    if (fragment.id) existing.id = fragment.id;
+    if (fragment.type) existing.type = fragment.type;
+    if (typeof fragment?.function?.name === "string" && fragment.function.name) {
+      existing.function.name = fragment.function.name;
+    }
+    if (args) {
+      existing.function.arguments = `${existing.function.arguments || ""}${args}`;
+    }
+  };
+
   for (const chunk of chunks) {
     const choices = Array.isArray(chunk?.choices) ? chunk.choices : [];
     for (const choice of choices) {
-      appendTextPiece(contentParts, choice?.message?.content);
-      appendTextPiece(contentParts, choice?.delta?.content);
-      appendTextPiece(contentParts, choice?.text);
+      // 🔧 FIX (2026-06-11 BUG-CS1): 同一 choice 内 delta.content 与 message.content
+      // 并存时只取 delta（部分网关在每个 chunk 同时回填两处，旧实现两份都拼，
+      // 文本被整体重复一遍）。choice.text 仅作为两者皆缺时的兜底。
+      const deltaContent = choice?.delta?.content;
+      const messageContent = choice?.message?.content;
+      if (deltaContent !== null && deltaContent !== undefined) {
+        appendTextPiece(contentParts, deltaContent);
+      } else if (messageContent !== null && messageContent !== undefined) {
+        appendTextPiece(contentParts, messageContent);
+      } else {
+        appendTextPiece(contentParts, choice?.text);
+      }
+
+      const deltaToolCalls = choice?.delta?.tool_calls;
+      if (Array.isArray(deltaToolCalls)) {
+        deltaToolCalls.forEach((fragment: any, fragmentIndex: number) =>
+          mergeToolCallFragment(fragment, fragmentIndex, false)
+        );
+      }
+      // message.tool_calls 为完整形态：整体覆盖对应 index 的聚合结果
+      const messageToolCalls = choice?.message?.tool_calls;
+      if (Array.isArray(messageToolCalls)) {
+        messageToolCalls.forEach((fragment: any, fragmentIndex: number) =>
+          mergeToolCallFragment(fragment, fragmentIndex, true)
+        );
+      }
     }
     appendTextPiece(contentParts, chunk?.output_text);
     appendTextPiece(contentParts, chunk?.response?.output_text);
@@ -144,14 +200,21 @@ const mergeOpenAiCompatibleChunks = (chunks: any[]) => {
     appendTextPiece(contentParts, chunk?.text);
   }
 
-  if (!contentParts.length) {
+  const mergedToolCalls = toolCallsByIndex.size
+    ? Array.from(toolCallsByIndex.entries())
+        .sort((a, b) => a[0] - b[0])
+        .map(([, call]) => call)
+    : null;
+
+  if (!contentParts.length && !mergedToolCalls) {
     return chunks[chunks.length - 1] || {};
   }
 
   const stringParts = contentParts.filter((part) => typeof part === "string");
   const objectParts = contentParts.filter((part) => typeof part !== "string");
-  const mergedContent =
-    objectParts.length === 0
+  const mergedContent = !contentParts.length
+    ? null // tool_calls-only 流：content 置 null（OpenAI 语义）
+    : objectParts.length === 0
       ? stringParts.join("")
       : stringParts.length
         ? [stringParts.join(""), ...objectParts]
@@ -175,10 +238,12 @@ const mergeOpenAiCompatibleChunks = (chunks: any[]) => {
         message: {
           ...(lastChoice?.message || {}),
           content: mergedContent,
+          ...(mergedToolCalls ? { tool_calls: mergedToolCalls } : {}),
         },
         delta: {
           ...(lastChoice?.delta || {}),
           content: mergedContent,
+          ...(mergedToolCalls ? { tool_calls: mergedToolCalls } : {}),
         },
       },
     ],
@@ -258,6 +323,48 @@ export const extractOpenAiCompatibleText = (payload: any) => {
     if (text) return text;
   }
   return "";
+};
+
+/**
+ * P0 (2026-05-24)：扩展版 extract，同时返回 finish_reason / usage 元信息，
+ * 让调用方能识别"看似成功但实质有问题"的响应（特别是 length 截断）。
+ */
+export interface OpenAiCompatibleExtractionResult {
+  text: string;
+  finishReason?: string;
+  truncated?: boolean;
+  refusal?: string;
+  usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+}
+
+export const extractOpenAiCompatibleResult = (
+  payload: any
+): OpenAiCompatibleExtractionResult => {
+  const text = extractOpenAiCompatibleText(payload);
+  const choice = payload?.choices?.[0];
+  const finishReason =
+    typeof choice?.finish_reason === "string"
+      ? choice.finish_reason.toLowerCase()
+      : undefined;
+  const refusal =
+    typeof choice?.message?.refusal === "string" && choice.message.refusal.trim()
+      ? choice.message.refusal.trim()
+      : undefined;
+  const usage = payload?.usage;
+  return {
+    text,
+    finishReason,
+    truncated: finishReason === "length",
+    refusal,
+    usage:
+      usage && typeof usage === "object"
+        ? {
+            prompt_tokens: Number(usage.prompt_tokens) || undefined,
+            completion_tokens: Number(usage.completion_tokens) || undefined,
+            total_tokens: Number(usage.total_tokens) || undefined,
+          }
+        : undefined,
+  };
 };
 
 export const extractOpenAiCompatibleError = (payload: any) => {

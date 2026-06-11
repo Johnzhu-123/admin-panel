@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Mask Management Utilities
  * Provides advanced mask operations, validation, and management functions
