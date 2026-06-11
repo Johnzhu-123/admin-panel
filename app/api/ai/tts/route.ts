@@ -159,7 +159,12 @@ export async function POST(request: NextRequest) {
     if (body?.useBuiltInService === true) {
       const { body: enriched, applied } = await injectBuiltInCategoryConfig(
         body as Record<string, unknown>,
-        "tts"
+        "tts",
+        {
+          // 🔧 FIX (2026-06-11 BUG-D2): 透传用户所选 TTS 模型（本路由 body 字段为 model），
+          //   命中 subtask.model/models[] 时生效，否则回退默认模型。
+          requestedModel: typeof body?.model === "string" ? body.model : "",
+        }
       );
       if (applied) {
         body = enriched;

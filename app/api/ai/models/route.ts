@@ -319,10 +319,15 @@ export async function POST(req: Request) {
       );
       const baseUrl = baseConfig.baseUrl;
       const apiVersion = baseConfig.apiVersion;
-      const url = `${baseUrl}/${apiVersion}/models?key=${encodeURIComponent(apiKey)}`;
+      // 🔧 FIX (2026-06-11 BUG-C9): apiKey 不再放进 URL query（?key=...），改走
+      //   x-goog-api-key header，避免 key 泄漏到失败日志/代理访问日志。
+      const url = `${baseUrl}/${apiVersion}/models`;
       const res = await fetch(url, {
         method: "GET",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": apiKey,
+        },
       });
 
       if (!res.ok) {

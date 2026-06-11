@@ -15,6 +15,8 @@ import {
 } from '../types';
 import { ConfigurationStorage } from '../interfaces';
 import { CONFIG_PATHS, ENV_KEYS } from '../config';
+// 🔧 FIX (2026-06-11 BUG-C20): 占位 key 识别（env 兜底 key 可能是模板残留）
+import { isPlaceholderApiKey } from '../placeholder-key';
 import {
   isDatabaseAvailable,
   loadUsersFromDatabase,
@@ -760,11 +762,19 @@ export class ConfigurationStorageImpl implements ConfigurationStorage {
 
   /**
    * Get API key from environment variables
+   *
+   * 🔧 FIX (2026-06-11 BUG-C20): 所有 env 兜底 key 统一过占位 key 闸——
+   * 模板残留（sk-test/sk-demo/your-api-key/placeholder 等）视同未配置。
    */
   private getApiKeyFromEnvironment(provider: string, serviceId: string): string {
+    const usable = (key: string | undefined): string => {
+      const trimmed = (key || '').trim();
+      return trimmed && !isPlaceholderApiKey(trimmed) ? trimmed : '';
+    };
+
     // Try service-specific environment variable first
     const serviceSpecificKey = `${serviceId.toUpperCase().replace(/-/g, '_')}_API_KEY`;
-    let apiKey = process.env[serviceSpecificKey];
+    const apiKey = usable(process.env[serviceSpecificKey]);
 
     if (apiKey) {
       return apiKey;
@@ -773,27 +783,27 @@ export class ConfigurationStorageImpl implements ConfigurationStorage {
     // 🔧 FIX (2026-05 #10): 增加跨厂商 fallback。用户上游可能是 OpenAI 兼容模式，
     // 即便 serviceId 历史名为 `gemini-built-in`，实际只有 OPENAI_BUILT_IN_API_KEY
     // 或通用 BUILT_IN_API_KEY 配置。
-    const genericKey = process.env.BUILT_IN_API_KEY || '';
+    const genericKey = usable(process.env.BUILT_IN_API_KEY);
 
     // Fall back to provider-specific environment variables, with cross-provider fallback
     switch (provider.toLowerCase()) {
       case 'gemini':
         return (
-          process.env[ENV_KEYS.GEMINI_BUILT_IN_API_KEY] ||
-          process.env[ENV_KEYS.OPENAI_BUILT_IN_API_KEY] ||
+          usable(process.env[ENV_KEYS.GEMINI_BUILT_IN_API_KEY]) ||
+          usable(process.env[ENV_KEYS.OPENAI_BUILT_IN_API_KEY]) ||
           genericKey ||
           ''
         );
       case 'openai':
         return (
-          process.env[ENV_KEYS.OPENAI_BUILT_IN_API_KEY] ||
-          process.env[ENV_KEYS.GEMINI_BUILT_IN_API_KEY] ||
+          usable(process.env[ENV_KEYS.OPENAI_BUILT_IN_API_KEY]) ||
+          usable(process.env[ENV_KEYS.GEMINI_BUILT_IN_API_KEY]) ||
           genericKey ||
           ''
         );
       case 'claude':
         return (
-          process.env[ENV_KEYS.CLAUDE_BUILT_IN_API_KEY] ||
+          usable(process.env[ENV_KEYS.CLAUDE_BUILT_IN_API_KEY]) ||
           genericKey ||
           ''
         );

@@ -5,6 +5,8 @@
  */
 
 import { BuiltInServiceConfig, UserPermissions, QuotaLimits, RateLimitConfig } from './types';
+// 🔧 FIX (2026-06-11 BUG-C20): 占位 key 识别（env 兜底 key 可能是模板残留）
+import { isPlaceholderApiKey } from './placeholder-key';
 
 // Default quota limits for new users
 export const DEFAULT_QUOTA_LIMITS: QuotaLimits = {
@@ -228,11 +230,14 @@ export function getBuiltInServiceConfig(serviceId: string): BuiltInServiceConfig
       break;
   }
 
-  if (!apiKey) {
+  // 🔧 FIX (2026-06-11 BUG-C20): env 里残留的占位 key（sk-test/sk-demo/your-api-key 等）
+  // 视同未配置，避免拿模板值打上游产生 401 噪音。
+  if (!apiKey || isPlaceholderApiKey(apiKey)) {
     console.warn(
-      `No API key found for built-in service: ${serviceId} ` +
+      `No usable API key found for built-in service: ${serviceId} ` +
       `(tried ${baseConfig.provider.toUpperCase()}_BUILT_IN_API_KEY, ` +
-      `OPENAI_BUILT_IN_API_KEY, GEMINI_BUILT_IN_API_KEY, BUILT_IN_API_KEY — all empty)`
+      `OPENAI_BUILT_IN_API_KEY, GEMINI_BUILT_IN_API_KEY, BUILT_IN_API_KEY — ` +
+      `all empty or placeholder)`
     );
     return null;
   }

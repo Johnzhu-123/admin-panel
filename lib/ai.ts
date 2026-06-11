@@ -127,23 +127,32 @@ export const parseJsonFromText = (text: string) => {
   try {
     return JSON.parse(trimmed);
   } catch {
-    const fenced = trimmed.match(/```(?:json)?\\s*([\\s\\S]*?)```/i);
+    // 🔧 FIX (2026-06-11 BUG-D3): 与桌面端 BUG-A1 同款——原正则把 \s 写成 \\s（双重转义），
+    // ```json 围栏提取分支 100% 失效；且顶层数组无兜底。两仓同步修复（镜像 lib 陷阱）。
+    const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
     if (fenced?.[1]) {
       try {
-        return JSON.parse(fenced[1]);
+        return JSON.parse(fenced[1].trim());
       } catch {
         // Fall through to substring parsing.
       }
     }
-    const start = trimmed.indexOf("{");
-    const end = trimmed.lastIndexOf("}");
-    if (start !== -1 && end !== -1 && end > start) {
-      try {
-        return JSON.parse(trimmed.slice(start, end + 1));
-      } catch {
-        return {};
+    const tryParseSlice = (open: string, close: string) => {
+      const start = trimmed.indexOf(open);
+      const end = trimmed.lastIndexOf(close);
+      if (start !== -1 && end !== -1 && end > start) {
+        try {
+          return JSON.parse(trimmed.slice(start, end + 1));
+        } catch {
+          return undefined;
+        }
       }
-    }
+      return undefined;
+    };
+    const objectResult = tryParseSlice("{", "}");
+    if (objectResult !== undefined) return objectResult;
+    const arrayResult = tryParseSlice("[", "]");
+    if (arrayResult !== undefined) return arrayResult;
     return {};
   }
 };

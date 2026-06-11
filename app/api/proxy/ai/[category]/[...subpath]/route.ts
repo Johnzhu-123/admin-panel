@@ -99,11 +99,16 @@ async function recordUsage(params: {
 async function checkDailyQuota(userId: string, dailyLimit: number): Promise<boolean> {
   if (!dailyLimit || dailyLimit <= 0) return true;
   try {
+    // 🔧 FIX (2026-06-11 BUG-D6): "今日"按 Asia/Shanghai 计算（与 db.ts 用量统计
+    //   口径一致——旧 CURRENT_DATE 用 UTC，北京时间 8 点前后配额窗口错位 8 小时），
+    //   且只统计 success = true 的请求：上游失败不应吃掉用户配额。
     const { rows } = await sql`
       SELECT COUNT(*)::int AS used
       FROM api_usage_records
       WHERE user_id = ${userId}
-        AND created_at >= CURRENT_DATE
+        AND success = true
+        AND (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Shanghai')::date
+            = (NOW() AT TIME ZONE 'Asia/Shanghai')::date
     `;
     const used = rows[0]?.used ?? 0;
     return used < dailyLimit;
@@ -112,12 +117,25 @@ async function checkDailyQuota(userId: string, dailyLimit: number): Promise<bool
   }
 }
 
+// 🔧 FIX (2026-06-11 BUG-C10): 旧正则 /\/v1\b/ 既不命中 /v1beta、/v1alpha（\b 在
+//   字母之间不成立 → 给 Gemini 风格 base 多追加一层 /v1），也不识别 /v4 这类已带
+//   版本的 base。改为按"路径段恰为版本段"精确判断：base 任一路径段或 subpath 任一
+//   段恰为 v1 / v1beta / v1alpha / v4 等版本段时，不再追加 /v1。
+const VERSION_SEGMENT_RE = /^v\d+(?:beta|alpha)?$/i;
+
 function buildUpstreamUrl(baseUrl: string, subpathSegments: string[]): string {
   const trimmed = baseUrl.replace(/\/+$/, "");
   const path = "/" + subpathSegments.map((s) => encodeURIComponent(s)).join("/");
-  return /\/v1\b/i.test(trimmed) || /\/v1\b/i.test(path)
-    ? `${trimmed}${path}`
-    : `${trimmed}/v1${path}`;
+  let baseSegments: string[];
+  try {
+    baseSegments = new URL(trimmed).pathname.split("/").filter(Boolean);
+  } catch {
+    baseSegments = trimmed.split("/").filter(Boolean);
+  }
+  const hasVersionSegment =
+    baseSegments.some((segment) => VERSION_SEGMENT_RE.test(segment)) ||
+    subpathSegments.some((segment) => VERSION_SEGMENT_RE.test(segment));
+  return hasVersionSegment ? `${trimmed}${path}` : `${trimmed}/v1${path}`;
 }
 
 async function handleProxy(
@@ -193,6 +211,9 @@ async function handleProxy(
     const init: RequestInit = {
       method: req.method,
       headers: incomingHeaders,
+      // 🔧 FIX (2026-06-11 BUG-C10): 上游 fetch 无超时会一直挂到 Render 平台杀连接，
+      //   显式 120s 上限，超时走 catch 返回 500 并记失败。
+      signal: AbortSignal.timeout(120_000),
     };
     if (req.method !== "GET" && req.method !== "HEAD") {
       init.body = req.body as unknown as BodyInit;
@@ -215,6 +236,9 @@ async function handleProxy(
     const respHeaders = new Headers(upstreamResp.headers);
     respHeaders.delete("content-length");
     respHeaders.delete("transfer-encoding");
+    // 🔧 FIX (2026-06-11 BUG-C10): undici 已自动解压响应体，透传 content-encoding
+    //   会让客户端对明文再做一次 gzip/br 解压 → 解码失败/乱码。
+    respHeaders.delete("content-encoding");
     respHeaders.set("x-builtin-request-id", requestId);
     respHeaders.set("x-builtin-category", category);
     respHeaders.set("x-builtin-subtask", subtask.id);

@@ -14,10 +14,20 @@ import {
 import { resolveBuiltInWithCatalog, rewriteUpstreamError } from "@/lib/built-in-api-service/catalog-resolver";
 import { recordFailureLog } from "@/lib/diagnostics";
 import { enhanceOpenAICompatibility } from "@/lib/api-compatibility/integration";
+// 🔧 FIX (2026-06-11 S-2/BUG-D1): reasoning 模型防护执行器（三件套 + 兼容回退）
+import { executeOpenAiChatWithCompatRetries } from "@/lib/network/openai-chat-attempt";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-export const maxDuration = 60;
+// 🔧 FIX (2026-06-11 maxDuration): 60 → 300。Render 忽略该字段；Vercel 形态下
+//   reasoning 模型/长 deck 生成常超 60s，避免被平台截断。
+export const maxDuration = 300;
+
+// 🔧 FIX (2026-06-11 BUG-D7): [DEBUG] 日志包进 DEBUG_AI_ROUTES=1 开关，
+//   生产环境默认静默，避免刷屏并泄漏请求元数据。
+const debugLog = (...args: unknown[]) => {
+  if (process.env.DEBUG_AI_ROUTES === "1") console.log(...args);
+};
 
 const shouldUseGeminiAlpha = (model: string) =>
   /preview|exp|experimental|alpha/i.test(model);
@@ -47,8 +57,10 @@ const generateGeminiJson = async (
   }
 };
 
-const resolveBuiltInTextConfig = (userId: string) =>
-  resolveBuiltInWithCatalog(userId, "text");
+// 🔧 FIX (2026-06-11 BUG-D2): 把用户请求的文本模型透传给 catalog 解析器，
+//   命中 subtask.model/models[] 时不再被默认模型覆盖。
+const resolveBuiltInTextConfig = (userId: string, requestedModel?: string) =>
+  resolveBuiltInWithCatalog(userId, "text", requestedModel);
 
 export async function POST(req: Request) {
   try {
@@ -64,8 +76,8 @@ export async function POST(req: Request) {
     const userId = (body.userId || "").trim();
     const prompt = (body.prompt || "").trim();
 
-    // Debug logging
-    console.log("[DEBUG /api/ai/plan] Request received:", {
+    // Debug logging（🔧 FIX 2026-06-11 BUG-D7: 仅 DEBUG_AI_ROUTES=1 时输出）
+    debugLog("[DEBUG /api/ai/plan] Request received:", {
       provider,
       apiKey: apiKey ? `***${apiKey.slice(-4)}` : "EMPTY",
       useBuiltInService,
@@ -81,10 +93,14 @@ export async function POST(req: Request) {
 
     const builtInConfig =
       !apiKey && useBuiltInService && userId
-        ? await resolveBuiltInTextConfig(userId)
+        ? await resolveBuiltInTextConfig(
+            userId,
+            // 🔧 FIX (2026-06-11 BUG-D2): 透传用户所选模型
+            String(body.openAiTextModel || body.model || "").trim()
+          )
         : null;
 
-    console.log("[DEBUG /api/ai/plan] Built-in config resolved:", {
+    debugLog("[DEBUG /api/ai/plan] Built-in config resolved:", {
       hasConfig: !!builtInConfig,
       configApiKey: builtInConfig?.apiKey ? `***${builtInConfig.apiKey.slice(-4)}` : "NONE",
       configBaseUrl: builtInConfig?.baseUrl,
@@ -94,17 +110,17 @@ export async function POST(req: Request) {
     if (builtInConfig) {
       apiKey = builtInConfig.apiKey;
       provider = "openai";
-      console.log("[DEBUG /api/ai/plan] Using built-in config, provider set to:", provider);
+      debugLog("[DEBUG /api/ai/plan] Using built-in config, provider set to:", provider);
     }
 
-    console.log("[DEBUG /api/ai/plan] Final validation:", {
+    debugLog("[DEBUG /api/ai/plan] Final validation:", {
       hasApiKey: !!apiKey,
       hasPrompt: !!prompt,
       willPass: !!(apiKey && prompt)
     });
 
     if (!apiKey || !prompt) {
-      console.error("[DEBUG /api/ai/plan] Validation failed! Returning 400 error");
+      debugLog("[DEBUG /api/ai/plan] Validation failed! Returning 400 error");
       return NextResponse.json(
         { error: "Missing apiKey or prompt." },
         { status: 400, headers: noStoreHeaders() }
@@ -144,41 +160,42 @@ export async function POST(req: Request) {
       (builtInConfig?.model || body.openAiTextModel || "").trim() ||
       defaultOpenAiTextModel;
 
-    // Enhanced request with compatibility handling
-    const requestConfig = {
+    // 🔧 FIX (2026-06-11 S-2/BUG-D1): 原实现硬编码 temperature:0.6、无输出上限、非流式、裸 fetch。
+    // 改走统一执行器：reasoning 模型自动 max_completion_tokens / 跳过 temperature / 流式防 524，
+    // 并显式输出预算（缺省 reasoning 16000 / 普通 8192）防长 deck JSON 截断。
+    const result = await executeOpenAiChatWithCompatRetries({
       url: `${baseUrl}/chat/completions`,
-      method: "POST",
       headers: {
         ...buildOpenAiHeaders(apiKey, true, openAiAuthHeader),
       },
-      body: {
-        model,
-        temperature: 0.6,
-        messages: [
-          {
-            role: "system",
-            content: "You are a helpful assistant that creates presentation outlines. Return only valid JSON that matches the requested schema. Do not include any markdown formatting or additional text outside the JSON.",
-          },
-          { role: "user", content: prompt },
-        ],
+      model,
+      temperature: 0.6,
+      maxOutputTokens: Number(body.maxTokens) > 0 ? Number(body.maxTokens) : undefined,
+      messages: [
+        {
+          role: "system",
+          content: "You are a helpful assistant that creates presentation outlines. Return only valid JSON that matches the requested schema. Do not include any markdown formatting or additional text outside the JSON.",
+        },
+        { role: "user", content: prompt },
+      ],
+      enhance: async (config) => {
+        const enhanced = await enhanceOpenAICompatibility(config, {
+          provider: provider,
+          baseUrl: baseUrl,
+          operation: 'chat/completions'
+        });
+        return {
+          url: enhanced.url,
+          method: enhanced.method,
+          headers: enhanced.headers as Record<string, string>,
+          body: enhanced.body as Record<string, unknown>,
+        };
       },
-    };
-
-    // Apply compatibility enhancements
-    const enhancedConfig = await enhanceOpenAICompatibility(requestConfig, {
-      provider: provider,
-      baseUrl: baseUrl,
-      operation: 'chat/completions'
     });
-
-    const res = await fetch(enhancedConfig.url, {
-      method: enhancedConfig.method,
-      headers: enhancedConfig.headers,
-      body: JSON.stringify(enhancedConfig.body),
-    });
+    const res = result.res;
 
     if (!res.ok) {
-      const detail = await res.text().catch(() => "");
+      const detail = result.rawText;
       
       // Enhanced error handling for common third-party API issues
       let errorMessage = detail;
@@ -204,12 +221,13 @@ export async function POST(req: Request) {
 
       recordFailureLog({
         provider,
-        operation: "chat/completions",
-        url: enhancedConfig.url,
+        operation: result.operation,
+        url: result.url,
         status: res.status,
         requestBody: {
           model,
-          temperature: 0.6,
+          maxOutputTokens: result.maxOutputTokens,
+          reasoningLike: result.reasoningLike,
           messages: "text",
         },
         responseBody: detail,
@@ -221,8 +239,7 @@ export async function POST(req: Request) {
       );
     }
 
-    const data = await res.json();
-    const text = data?.choices?.[0]?.message?.content || "";
+    const text = result.text;
     
     if (!text.trim()) {
       return NextResponse.json(

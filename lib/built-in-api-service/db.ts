@@ -27,15 +27,20 @@ const TRACKED_USAGE_SERVICES = [
 ] as const;
 
 export const normalizeBuiltInUsageService = (serviceId: unknown) => {
-  const raw = String(serviceId || '').trim().toLowerCase();
+  let raw = String(serviceId || '').trim().toLowerCase();
+  // 🔧 FIX (2026-06-11 BUG-D6): 代理路由写库的 service_id 形如 built-in-tts-default，
+  //   旧实现直接 startsWith('tts') 永远不命中 → 全部归到"其它服务"。先剥掉
+  //   built-in- 前缀再走分类链。
+  raw = raw.replace(/^built-in-/, '');
   if (raw.startsWith('tts')) return { service: 'tts', label: '云端 TTS' };
   if (raw.startsWith('video')) return { service: 'video', label: '视频生成' };
-  if (raw.startsWith('mineru') || raw === 'built-in-mineru') {
+  if (raw.startsWith('mineru')) {
     return { service: 'mineru', label: 'MinerU 文档解析' };
   }
   if (raw.startsWith('image')) return { service: 'image', label: '图像生成' };
   if (
-    raw === 'built-in-default' ||
+    // 🔧 FIX (2026-06-11 BUG-D6): 旧值 built-in-default 剥前缀后是 default
+    raw === 'default' ||
     raw === 'gemini-built-in' ||
     raw.includes('image') ||
     raw.includes('gemini')

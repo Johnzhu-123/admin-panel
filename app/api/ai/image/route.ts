@@ -125,8 +125,10 @@ const shouldUseGeminiPreviewModel = (model: string) =>
 const shouldUseGeminiAlpha = (model: string) =>
   /preview|exp|experimental|alpha/i.test(model);
 
-const resolveBuiltInImageConfig = (userId: string) =>
-  resolveBuiltInWithCatalog(userId, "image");
+// 🔧 FIX (2026-06-11 BUG-D2): 把用户请求的图像模型透传给 catalog 解析器，
+//   命中 subtask.model/models[] 时不再被默认模型覆盖。
+const resolveBuiltInImageConfig = (userId: string, requestedModel?: string) =>
+  resolveBuiltInWithCatalog(userId, "image", requestedModel);
 
 const describeGeminiStyle = async (
   ai: GoogleGenAI,
@@ -1247,19 +1249,10 @@ Important: The mask indicates where to make changes. All other areas should rema
 
             if (builtInResponse && builtInResponse.imageBase64) {
 
-              // 🔧 NEW: 记录用量到数据库
-              try {
-                const { recordUsageToDatabase } = await import('@/lib/built-in-api-service/db');
-                await recordUsageToDatabase(
-                  `img_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
-                  userId,
-                  serviceStatus.currentService.id,
-                  true,
-                  getElapsedMs(),
-                );
-              } catch (usageError) {
-                // 不影响主流程
-              }
+              // 🔧 FIX (2026-06-11 BUG-D4): 删除此处的 recordUsageToDatabase 重复记账。
+              // proxyImageGeneration 内部（api-proxy-layer.ts recordUsage）已用真实
+              // requestId 记录过一次；这里再记一次会导致每张内置图片在
+              // api_usage_records 插 2 行，配额以 2 倍速耗尽、提前误报 429。
 
               return NextResponse.json(
                 {
@@ -1377,7 +1370,11 @@ Important: The mask indicates where to make changes. All other areas should rema
 
     let builtInFallbackConfig: Awaited<ReturnType<typeof resolveBuiltInImageConfig>> = null;
     if (!apiKey && useBuiltInService && userId) {
-      builtInFallbackConfig = await resolveBuiltInImageConfig(userId);
+      // 🔧 FIX (2026-06-11 BUG-D2): 透传用户所选图像模型（按本路由实际 body 字段）
+      builtInFallbackConfig = await resolveBuiltInImageConfig(
+        userId,
+        String(body.openAiImageModel || body.geminiImageModel || body.model || "").trim()
+      );
       if (builtInFallbackConfig) {
         apiKey = builtInFallbackConfig.apiKey;
         provider = "openai";

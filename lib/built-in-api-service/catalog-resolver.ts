@@ -21,11 +21,18 @@ import {
   getInternalServiceConfig,
   type BuiltInServiceCategory,
 } from "./db";
+// 🔧 FIX (2026-06-11 BUG-C20): 占位 key 识别（模板残留/演示 key 不得当真实凭据用）
+import { isPlaceholderApiKey } from "./placeholder-key";
+// 🔧 FIX (2026-06-11 BUG-D2): 模型校验逻辑与 apply-cloud-config（tts/video 等价调用点）共用一份
+import { pickAllowedModel } from "./apply-cloud-config";
 
 export type ResolvedBuiltInConfig = BuiltInServiceConfig & {
   source: "catalog" | "env";
   category: BuiltInServiceCategory;
   subtaskId?: string;
+  // 🔧 FIX (2026-06-11 BUG-D2): 用户请求的模型不在该 subtask 允许列表（model/models[]）
+  //   时回退到 subtask.model，并用该标记告知调用方发生了回退。
+  modelFallback?: boolean;
 };
 
 const ZERO_QUOTA = {
@@ -47,11 +54,16 @@ const ZERO_RATE = {
  * 1. 鉴权（authorized_users + can_use_built_in_services）
  * 2. 直接从 catalog 取 baseUrl/apiKey/model（catalog 优先）
  *
+ * 🔧 FIX (2026-06-11 BUG-D2): 新增第三参 requestedModel。原实现永远返回
+ *   subtask.model，用户在桌面端「分类模型」下拉里选的模型被静默忽略。
+ *   现在 requestedModel 命中 subtask.model/models[] 时按用户所选返回。
+ *
  * @returns 失败时返回 null（未授权 / catalog 未配 baseUrl+apiKey）
  */
 export async function resolveBuiltInWithCatalog(
   userId: string,
   category: BuiltInServiceCategory,
+  requestedModel?: string,
   subtaskId?: string
 ): Promise<ResolvedBuiltInConfig | null> {
   if (!userId) return null;
@@ -69,6 +81,11 @@ export async function resolveBuiltInWithCatalog(
     const baseUrl = (subtask.baseUrl || "").trim();
     const apiKey = (subtask.apiKey || "").trim();
     if (!baseUrl || !apiKey) return null;
+    // 🔧 FIX (2026-06-11 BUG-C20): 占位 key（模板残留/演示 key）视同未配置
+    if (isPlaceholderApiKey(apiKey)) return null;
+
+    // 🔧 FIX (2026-06-11 BUG-D2): 尊重用户请求的模型（需在允许列表内）
+    const { model, modelFallback } = pickAllowedModel(subtask, requestedModel);
 
     return {
       id: `built-in-${category}-${subtask.id}`,
@@ -77,7 +94,7 @@ export async function resolveBuiltInWithCatalog(
       isEnabled: subtask.isEnabled !== false,
       apiKey,
       baseUrl,
-      model: (subtask.model || "").trim(),
+      model,
       quotaLimits: { ...ZERO_QUOTA },
       rateLimits: { ...ZERO_RATE },
       createdAt: new Date(),
@@ -85,6 +102,7 @@ export async function resolveBuiltInWithCatalog(
       source: "catalog",
       category,
       subtaskId: subtask.id,
+      ...(modelFallback ? { modelFallback: true } : {}),
     };
   } catch {
     return null;

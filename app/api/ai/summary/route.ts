@@ -13,12 +13,22 @@ import {
 } from "@/lib/ai";
 import { resolveBuiltInWithCatalog, rewriteUpstreamError } from "@/lib/built-in-api-service/catalog-resolver";
 import { recordFailureLog } from "@/lib/diagnostics";
+// 🔧 FIX (2026-06-11 S-2/BUG-D1): reasoning 模型防护执行器（三件套 + 兼容回退）
+import { executeOpenAiChatWithCompatRetries } from "@/lib/network/openai-chat-attempt";
 import type { InlineImage } from "@/lib/ai";
 import type { BuiltInServiceCategory } from "@/lib/built-in-api-service/db";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-export const maxDuration = 60;
+// 🔧 FIX (2026-06-11 maxDuration): 60 → 300。Render 忽略该字段；Vercel 形态下
+//   reasoning 模型/带图理解常超 60s，避免被平台截断。
+export const maxDuration = 300;
+
+// 🔧 FIX (2026-06-11 BUG-D7): [DEBUG] 日志包进 DEBUG_AI_ROUTES=1 开关，
+//   生产环境默认静默，避免刷屏并泄漏请求元数据。
+const debugLog = (...args: unknown[]) => {
+  if (process.env.DEBUG_AI_ROUTES === "1") console.log(...args);
+};
 
 const shouldUseGeminiAlpha = (model: string) =>
   /preview|exp|experimental|alpha/i.test(model);
@@ -74,8 +84,16 @@ const resolveBuiltInConfigForSummary = async (
       : primaryCategory === "multimodal"
         ? ["multimodal", "vision"]
         : [primaryCategory];
+  // 🔧 FIX (2026-06-11 BUG-D2): 把用户所选模型透传给 catalog 解析器。
+  //   带图请求走 vision 模型字段，纯文本走 text 模型字段（与下游 model 选择逻辑一致）。
+  const hasImages = Array.isArray(body?.images) && body.images.length > 0;
+  const requestedModel = (
+    (hasImages ? body?.openAiVisionModel : body?.openAiTextModel) || ""
+  )
+    .toString()
+    .trim();
   for (const category of fallbackOrder) {
-    const resolved = await resolveBuiltInWithCatalog(userId, category);
+    const resolved = await resolveBuiltInWithCatalog(userId, category, requestedModel);
     if (resolved && resolved.apiKey && resolved.baseUrl) {
       return { config: resolved, category };
     }
@@ -100,8 +118,8 @@ export async function POST(req: Request) {
       ? (body.images as InlineImage[])
       : [];
 
-    // Debug logging
-    console.log("[DEBUG /api/ai/summary] Request received:", {
+    // Debug logging（🔧 FIX 2026-06-11 BUG-D7: 仅 DEBUG_AI_ROUTES=1 时输出）
+    debugLog("[DEBUG /api/ai/summary] Request received:", {
       provider,
       apiKey: apiKey ? `***${apiKey.slice(-4)}` : "EMPTY",
       useBuiltInService,
@@ -123,7 +141,7 @@ export async function POST(req: Request) {
     const builtInConfig = builtInResolution.config;
     const resolvedCategory = builtInResolution.category;
 
-    console.log("[DEBUG /api/ai/summary] Built-in config resolved:", {
+    debugLog("[DEBUG /api/ai/summary] Built-in config resolved:", {
       hasConfig: !!builtInConfig,
       configApiKey: builtInConfig?.apiKey ? `***${builtInConfig.apiKey.slice(-4)}` : "NONE",
       configBaseUrl: builtInConfig?.baseUrl,
@@ -138,17 +156,17 @@ export async function POST(req: Request) {
     if (builtInConfig) {
       apiKey = builtInConfig.apiKey;
       provider = "openai";
-      console.log("[DEBUG /api/ai/summary] Using built-in config, provider set to:", provider);
+      debugLog("[DEBUG /api/ai/summary] Using built-in config, provider set to:", provider);
     }
 
-    console.log("[DEBUG /api/ai/summary] Final validation:", {
+    debugLog("[DEBUG /api/ai/summary] Final validation:", {
       hasApiKey: !!apiKey,
       hasPrompt: !!prompt,
       willPass: !!(apiKey && prompt)
     });
 
     if (!apiKey || !prompt) {
-      console.error("[DEBUG /api/ai/summary] Validation failed! Returning 400 error");
+      debugLog("[DEBUG /api/ai/summary] Validation failed! Returning 400 error");
       return NextResponse.json(
         { error: "Missing apiKey or prompt." },
         { status: 400, headers: noStoreHeaders() }
@@ -201,56 +219,57 @@ export async function POST(req: Request) {
       ? builtInModel
       : (body.openAiVisionModel || "").trim() || model || defaultOpenAiVisionModel;
 
-    const res = await fetch(`${baseUrl}/chat/completions`, {
-      method: "POST",
+    // 🔧 FIX (2026-06-11 S-2/BUG-D1): 原实现裸 fetch + temperature:0.6 + 无输出上限 + 非流式，
+    // reasoning 模型（gpt-5.x/o系列/gemini-3.x）必踩 400 或 CF 524。改走统一执行器：
+    // 自动选 max_completion_tokens / 跳过 temperature / 流式优先 + 三类兼容回退。
+    const result = await executeOpenAiChatWithCompatRetries({
+      url: `${baseUrl}/chat/completions`,
       headers: {
         ...buildOpenAiHeaders(apiKey, true, openAiAuthHeader),
       },
-      body: JSON.stringify({
-        model: images.length ? visionModel : model,
-        temperature: 0.6,
-        messages: [
-          { role: "system", content: "Answer plainly without extra markup." },
-          images.length
-            ? {
-                role: "user",
-                content: [
-                  { type: "text", text: prompt },
-                  ...images.map((img) => ({
-                    type: "image_url",
-                    image_url: {
-                      url: `data:${img.mimeType};base64,${img.data}`,
-                    },
-                  })),
-                ],
-              }
-            : { role: "user", content: prompt },
-        ],
-      }),
+      model: images.length ? visionModel : model,
+      temperature: 0.6,
+      maxOutputTokens: Number(body.maxTokens) > 0 ? Number(body.maxTokens) : undefined,
+      messages: [
+        { role: "system", content: "Answer plainly without extra markup." },
+        images.length
+          ? {
+              role: "user",
+              content: [
+                { type: "text", text: prompt },
+                ...images.map((img) => ({
+                  type: "image_url",
+                  image_url: {
+                    url: `data:${img.mimeType};base64,${img.data}`,
+                  },
+                })),
+              ],
+            }
+          : { role: "user", content: prompt },
+      ],
     });
 
-    if (!res.ok) {
-      const detail = await res.text().catch(() => "");
+    if (!result.res.ok) {
       recordFailureLog({
         provider,
-        operation: "chat/completions",
-        url: `${baseUrl}/chat/completions`,
-        status: res.status,
+        operation: result.operation,
+        url: result.url,
+        status: result.res.status,
         requestBody: {
           model: images.length ? visionModel : model,
-          temperature: 0.6,
+          maxOutputTokens: result.maxOutputTokens,
+          reasoningLike: result.reasoningLike,
           messages: images.length ? "[image+text]" : "text",
         },
-        responseBody: detail,
+        responseBody: result.rawText,
       });
       return NextResponse.json(
-        { error: rewriteUpstreamError(res.status, detail || "OpenAI-compatible request failed.", resolvedCategory) },
-        { status: res.status, headers: noStoreHeaders() }
+        { error: rewriteUpstreamError(result.res.status, result.rawText || "OpenAI-compatible request failed.", resolvedCategory) },
+        { status: result.res.status, headers: noStoreHeaders() }
       );
     }
 
-    const data = await res.json();
-    const text = data?.choices?.[0]?.message?.content || "";
+    const text = result.text;
     return NextResponse.json({ text }, { headers: noStoreHeaders() });
   } catch (error) {
     const message =

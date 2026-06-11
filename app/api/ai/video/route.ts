@@ -195,10 +195,25 @@ export async function POST(request: Request) {
     if (body?.useBuiltInService === true) {
       const { body: enriched, applied, config } = await injectBuiltInCategoryConfig(
         body as unknown as Record<string, unknown>,
-        "video"
+        "video",
+        {
+          // 🔧 FIX (2026-06-11 BUG-D2): 透传用户所选视频模型（本路由模型在 payload.model），
+          //   命中 subtask.model/models[] 时生效，否则回退默认模型。
+          requestedModel:
+            typeof body?.payload?.model === "string" ? body.payload.model : "",
+        }
       );
       if (applied && config) {
         const merged = enriched as unknown as VideoProxyRequest;
+        // 🔧 FIX (2026-06-11 BUG-D2): 请求的模型未通过允许列表校验时，把 payload.model
+        //   覆写为回退后的默认模型，避免无效模型原样发往上游。
+        if (
+          config.modelFallback === true &&
+          merged.payload &&
+          typeof merged.payload.model === "string"
+        ) {
+          merged.payload = { ...merged.payload, model: config.model };
+        }
         const currentEndpoint =
           typeof merged.endpointUrl === "string" ? merged.endpointUrl.trim() : "";
         const replacedEndpoint =
