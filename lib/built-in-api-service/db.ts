@@ -971,14 +971,45 @@ export async function getInternalServiceConfig(
   return { subtask, categoryDefaultSubtaskId: cfg.defaultSubtaskId };
 }
 
+import { looksLikeUpstreamAiBaseUrl, normalizeBuiltInProxyUrl } from './proxy-url';
+
+// 🔧 MERGE (2026-07-03 R3 db.ts 统一): 桌面侧网关消歧防护并入统一版——
+//   serviceGatewayUrl 的语义是「上游 AI 网关」(如 api.seeyjys.eu.org)，
+//   绝不能是 admin-panel 自身地址（会形成自我转发环）。历史配置/env 里
+//   两个概念曾被混用，这里在所有出口做一次过滤。
+const isKnownAdminPanelUrl = (value?: string) => {
+  const normalized = normalizeBuiltInProxyUrl(value);
+  if (!normalized) return false;
+  try {
+    const hostname = new URL(normalized).hostname.toLowerCase();
+    return hostname === 'ppt2admin.onrender.com' || hostname === 'ppt2admin.zeabur.app';
+  } catch {
+    return false;
+  }
+};
+const normalizeUpstreamGatewayUrl = (value?: string) => {
+  const normalized = normalizeUrl(value);
+  if (!normalized || isKnownAdminPanelUrl(normalized)) return '';
+  return normalized;
+};
+
 export async function getBuiltInRuntimeSettings(): Promise<BuiltInRuntimeSettings> {
   // 🔧 FIX (2026-05 #19): envGateway 用于填充 serviceGatewayUrl，是「上游 AI
   //   网关」(api.seeyjys.eu.org) 的 URL，不是 admin-panel 自身 URL。旧默认
   //   'https://ppt2admin.onrender.com' 是 admin-panel URL，把两个概念搞混了。
   //   改为空字符串：必须显式通过 env 或 DB 配置，避免误用。
-  const envGateway = normalizeUrl(
+  const legacyServiceServerUrl = normalizeUrl(
     process.env.BUILT_IN_SERVICE_SERVER_URL ||
       process.env.NEXT_PUBLIC_BUILT_IN_SERVICE_SERVER_URL ||
+      ''
+  );
+  const envGateway = normalizeUpstreamGatewayUrl(
+    process.env.BUILT_IN_SERVICE_GATEWAY_URL ||
+      process.env.NEXT_PUBLIC_BUILT_IN_SERVICE_GATEWAY_URL ||
+      process.env.GEMINI_BUILT_IN_BASE_URL ||
+      (looksLikeUpstreamAiBaseUrl(legacyServiceServerUrl)
+        ? legacyServiceServerUrl
+        : '') ||
       ''
   );
   const envUpdatePageUrl = normalizeUrl(
@@ -1016,7 +1047,7 @@ export async function getBuiltInRuntimeSettings(): Promise<BuiltInRuntimeSetting
     }
 
     return {
-      serviceGatewayUrl: normalizeUrl(gatewayValue || envGateway),
+      serviceGatewayUrl: normalizeUpstreamGatewayUrl(gatewayValue) || envGateway,
       updatePageUrl,
       downloadChannels,
       serviceCatalog,
@@ -1075,7 +1106,9 @@ export async function saveBuiltInRuntimeSettings(input: Partial<BuiltInRuntimeSe
   }
 
   const merged: BuiltInRuntimeSettings = {
-    serviceGatewayUrl: normalizeUrl(input.serviceGatewayUrl || current.serviceGatewayUrl),
+    serviceGatewayUrl: normalizeUpstreamGatewayUrl(
+      input.serviceGatewayUrl || current.serviceGatewayUrl
+    ),
     updatePageUrl:
       typeof input.updatePageUrl === 'string'
         ? (() => {
