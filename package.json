@@ -1,8 +1,7 @@
 {
-  "name": "md2ppt",
+  "name": "md2ppt-admin-panel",
   "private": true,
-  "version": "0.0.0",
-  "main": "electron/main.cjs",
+  "version": "1.0.0",
   "type": "module",
   "engines": {
     "node": "20.x"
@@ -14,13 +13,7 @@
     "lint": "next lint",
     "test": "jest",
     "test:watch": "jest --watch",
-    "electron:dev": "cross-env ELECTRON_DEV_URL=http://localhost:3000 ELECTRON_DESKTOP=1 concurrently \"npm run dev\" \"wait-on http://localhost:3000 && electron .\"",
-    "electron:pack": "npm run build && electron-builder --dir",
-    "electron:build": "npm run build && electron-builder --win",
-    "db:init": "node scripts/init-database.mjs",
-    "db:check": "node scripts/check-terms-acceptance.mjs",
-    "test:terms": "node scripts/test-terms-acceptance.mjs",
-    "test:usage": "node scripts/test-usage-tracking.mjs"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@clerk/backend": "^2.29.5",
@@ -37,14 +30,8 @@
     "@vercel/postgres": "^0.10.0",
     "class-variance-authority": "^0.7.0",
     "clsx": "^2.0.0",
-    "electron-updater": "^6.3.0",
-    "jspdf": "^4.0.0",
-    "jszip": "3.10.1",
     "lucide-react": "^0.563.0",
-    "mammoth": "^1.11.0",
     "next": "^15.3.1",
-    "pdfjs-dist": "^5.4.530",
-    "pptxgenjs": "3.12.0",
     "react": "^19.2.3",
     "react-dom": "^19.2.3",
     "recharts": "^2.8.0",
@@ -61,10 +48,6 @@
     "@types/react": "^19.1.0",
     "@types/react-dom": "^19.1.0",
     "autoprefixer": "^10.4.16",
-    "concurrently": "^9.1.0",
-    "cross-env": "^7.0.3",
-    "electron": "^34.1.1",
-    "electron-builder": "^25.1.8",
     "eslint": "^9.24.0",
     "eslint-config-next": "^15.3.1",
     "fast-check": "^3.23.2",
@@ -74,44 +57,6 @@
     "tailwindcss": "^3.3.5",
     "tailwindcss-animate": "^1.0.7",
     "ts-jest": "^29.1.2",
-    "typescript": "~5.8.2",
-    "wait-on": "^8.0.1"
-  },
-  "build": {
-    "appId": "com.md2ppt.desktop",
-    "productName": "md2ppt",
-    "npmRebuild": false,
-    "files": [
-      "electron/**",
-      "python/**",
-      "app/**",
-      "components/**",
-      "lib/**",
-      "public/**",
-      ".next/**",
-      "middleware.ts",
-      "next.config.mjs",
-      "package.json",
-      "node_modules/**"
-    ],
-    "asar": true,
-    "asarUnpack": [
-      "python/**"
-    ],
-    "directories": {
-      "output": "dist"
-    },
-    "win": {
-      "target": [
-        "nsis",
-        "portable"
-      ],
-      "signAndEditExecutable": false
-    },
-    "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true,
-      "perMachine": false
-    }
+    "typescript": "~5.8.2"
   }
 }

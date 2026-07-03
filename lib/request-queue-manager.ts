@@ -595,17 +595,51 @@ class RequestQueueManager {
   }
 }
 
-// 全局单例实例 - 🔧 UPDATED: 优化配置减少 429/502/504 错误
-const globalRequestQueue = new RequestQueueManager({
-  maxConcurrent: 2,           // 🔧 INCREASED: 允许2个并发请求
-  requestsPerMinute: 25,      // 🔧 INCREASED: 每分钟25个请求
-  requestsPerSecond: 2,       // 🔧 INCREASED: 每秒2个请求
-  minInterval: 1200,          // 🔧 REDUCED: 1.2秒间隔
-  burstLimit: 4,              // 🔧 INCREASED: 突发最多4个请求
+// 🔧 REDESIGN (2026-06-12 Phase 3)：全局单例 → per-provider（按上游 hostname）桶池。
+// 旧实现所有 provider 共享一个 maxConcurrent=2 / 1.2s 间隔的桶：用户配置了
+// 不限速的自建网关，也会被另一家正在退避的 provider 连坐串行。
+// 现在每个上游 host 一个独立桶（同 host 内仍保留全部 429 防护与自适应限速），
+// 跨 provider 互不阻塞。桶数量有上限，溢出回落到共享缺省桶。
+const DEFAULT_QUEUE_CONFIG: Partial<RateLimitConfig> = {
+  maxConcurrent: 2,           // 允许2个并发请求（每个上游 host 独立计算）
+  requestsPerMinute: 25,      // 每分钟25个请求
+  requestsPerSecond: 2,       // 每秒2个请求
+  minInterval: 1200,          // 1.2秒间隔
+  burstLimit: 4,              // 突发最多4个请求
   adaptiveMode: true,         // 保持自适应模式
-  maxRetries: 3,              // 🔧 REDUCED: 减少重试次数避免阻塞
-  backoffMultiplier: 1.5      // 🔧 REDUCED: 更平滑的退避策略
-});
+  maxRetries: 3,              // 减少重试次数避免阻塞
+  backoffMultiplier: 1.5      // 更平滑的退避策略
+};
+
+const MAX_QUEUE_BUCKETS = 16;
+const FALLBACK_BUCKET_KEY = "__shared__";
+const queueBuckets = new Map<string, RequestQueueManager>();
+let queueConfigOverride: Partial<RateLimitConfig> = {};
+
+const resolveQueueBucketKey = (url: string): string => {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host || FALLBACK_BUCKET_KEY;
+  } catch {
+    return FALLBACK_BUCKET_KEY;
+  }
+};
+
+const getQueueForUrl = (url: string): RequestQueueManager => {
+  let key = resolveQueueBucketKey(url);
+  if (!queueBuckets.has(key) && queueBuckets.size >= MAX_QUEUE_BUCKETS) {
+    key = FALLBACK_BUCKET_KEY;
+  }
+  let bucket = queueBuckets.get(key);
+  if (!bucket) {
+    bucket = new RequestQueueManager({
+      ...DEFAULT_QUEUE_CONFIG,
+      ...queueConfigOverride,
+    });
+    queueBuckets.set(key, bucket);
+  }
+  return bucket;
+};
 
 // 导出便捷函数
 const isLoopbackRequest = (url: string): boolean => {
@@ -636,13 +670,32 @@ export const queuedFetch = (
         : undefined);
     return fetch(url, { ...rest, ...(signal ? { signal } : {}) });
   }
-  return globalRequestQueue.enqueue(url, options, priority, userId);
+  return getQueueForUrl(url).enqueue(url, options, priority, userId);
 };
 
-export const getQueueStatus = () => globalRequestQueue.getStatus();
-export const clearRequestQueue = () => globalRequestQueue.clearQueue();
-export const updateQueueConfig = (config: Partial<RateLimitConfig>) =>
-  globalRequestQueue.updateConfig(config);
+/** 聚合全部桶的状态（per-host 桶池后状态按 host 分组返回） */
+export const getQueueStatus = () => {
+  const buckets: Record<string, ReturnType<RequestQueueManager["getStatus"]>> = {};
+  for (const [key, bucket] of queueBuckets) {
+    buckets[key] = bucket.getStatus();
+  }
+  const totals = Object.values(buckets).reduce(
+    (acc, status) => ({
+      queueSize: acc.queueSize + status.queueSize,
+      activeRequests: acc.activeRequests + status.activeRequests,
+      rateLimitErrors: acc.rateLimitErrors + status.rateLimitErrors,
+    }),
+    { queueSize: 0, activeRequests: 0, rateLimitErrors: 0 }
+  );
+  return { ...totals, bucketCount: queueBuckets.size, buckets };
+};
+export const clearRequestQueue = () => {
+  for (const bucket of queueBuckets.values()) bucket.clearQueue();
+};
+export const updateQueueConfig = (config: Partial<RateLimitConfig>) => {
+  queueConfigOverride = { ...queueConfigOverride, ...config };
+  for (const bucket of queueBuckets.values()) bucket.updateConfig(config);
+};
 
 export { RequestQueueManager };
 export type { RateLimitConfig };

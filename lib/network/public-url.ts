@@ -25,6 +25,29 @@ const hostValidationCache = new Map<
   { expiresAt: number; errorMessage?: string }
 >();
 
+/**
+ * 🔧 FIX (2026-06-11 BUG-B11/AS6): 私网封禁误杀桌面场景的统一判定。
+ *
+ * 背景：Electron 桌面端本就运行在用户本机，代理 127.0.0.1 / 192.168.x 的自建模型
+ * （IndexTTS、LM Studio、本地视频服务等）是合法刚需；但 SSRF 防护默认拒绝私网，
+ * 且 MD2PPT_ALLOW_PRIVATE_API_PROXY 没有任何设置入口，桌面用户被一刀切误杀。
+ *
+ * 语义（显式 env 优先）：
+ * - MD2PPT_ALLOW_PRIVATE_API_PROXY 显式设置时以它为准（兼容 '1'/'true'/'yes'/'on'，
+ *   显式 '0'/'false' 即使在桌面端也维持封禁）；
+ * - 未显式设置时，ELECTRON_DESKTOP === '1'（桌面运行时标记）默认放行私网；
+ * - Web/服务器部署两者皆无 → 维持封禁（SSRF 防护不变）。
+ */
+export const shouldAllowPrivateNetworkAccess = (): boolean => {
+  const explicit = String(
+    process.env.MD2PPT_ALLOW_PRIVATE_API_PROXY || ""
+  ).trim();
+  if (explicit) {
+    return /^(1|true|yes|on)$/i.test(explicit);
+  }
+  return process.env.ELECTRON_DESKTOP === "1";
+};
+
 const IPV4_BLOCKED_CIDRS = [
   "0.0.0.0/8",
   "10.0.0.0/8",
