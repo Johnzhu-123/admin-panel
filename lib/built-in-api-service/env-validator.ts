@@ -42,6 +42,9 @@ export function validateEnvironmentVariables(): EnvValidationResult {
   const optional: Record<string, { description: string; defaultValue: string }> = {
     'GEMINI_BUILT_IN_BASE_URL': {
       description: 'API基础URL',
+      // 🔧 FIX (2026-05 #19): seeyjys.zeabur.app 是已下线的旧网关。当前生产
+      //   网关是 api.seeyjys.eu.org（部署在 Render）。本文件目前没有 import
+      //   方调用（dead code），但默认值仍要修对避免误导。
       defaultValue: 'https://api.seeyjys.eu.org/v1'
     },
     'BUILT_IN_SERVICE_NAME': {

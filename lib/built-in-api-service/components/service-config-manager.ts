@@ -19,6 +19,34 @@ import {
   maskApiKey
 } from '../config';
 
+// 🔧 FIX (2026-05-07): seeyjys.zeabur.app 已下线（旧 Render 转 Zeabur 的过渡网关），
+//   当前生产网关是 api.seeyjys.eu.org。但管理面板写入的 catalog（数据库）以及残留
+//   的 .env.local 都可能仍然带有旧地址，导致 desktop 端拿到错误 baseUrl 后调用失败
+//   出现 502 Bad Gateway。这里在所有 baseUrl 出口加一道运行时迁移：命中旧主机时
+//   自动改写到新主机，并在 console 留 warn 让运维知道源头还需要修。
+const LEGACY_BUILT_IN_BASE_HOSTS: Record<string, string> = {
+  'seeyjys.zeabur.app': 'api.seeyjys.eu.org',
+};
+
+const migrateLegacyBuiltInBaseUrl = (baseUrl: string): string => {
+  const trimmed = (baseUrl || '').trim();
+  if (!trimmed) return trimmed;
+  try {
+    const parsed = new URL(trimmed);
+    const replacement = LEGACY_BUILT_IN_BASE_HOSTS[parsed.hostname.toLowerCase()];
+    if (!replacement) return trimmed;
+    const original = trimmed.replace(/\/+$/, '');
+    parsed.hostname = replacement;
+    const rewritten = parsed.toString().replace(/\/+$/, '');
+    console.warn(
+      `[built-in-api-service] Detected legacy gateway "${original}"; auto-rewriting to "${rewritten}". 请在管理面板/.env 中更新 catalog baseUrl 以彻底消除该警告。`
+    );
+    return rewritten;
+  } catch {
+    return trimmed;
+  }
+};
+
 export class BuiltInServiceConfigManagerImpl implements BuiltInServiceConfigManager {
   private configCache = new Map<string, { config: BuiltInServiceConfig; timestamp: number }>();
   private availabilityCache = new Map<string, { available: boolean; timestamp: number }>();
@@ -28,28 +56,43 @@ export class BuiltInServiceConfigManagerImpl implements BuiltInServiceConfigMana
   /**
    * Get built-in service configuration
    *
-   * 🔧 FIX (2026-05 #11): catalog fallback。env 缺失时从管理面板 UI 配置（catalog）
-   *   合成一个可用的 BuiltInServiceConfig，避免下游 proxyImageGeneration 看到 null
-   *   后报 "Service not found"。优先 image 类，其他类按 multimodal/text 顺序兜底。
+   * 🔧 FIX (2026-05-07): 新增可选参数 preferredCategory。视频脚本生成走的是图像
+   *   理解（vision/multimodal），但旧实现只取 catalog 第一个 enabled subtask（按
+   *   类别迭代顺序），可能拿到 text 分类的 key/baseUrl/model，导致跨分类错配 →
+   *   `public API key required`。preferredCategory 设置后，会先尝试该分类的默认
+   *   subtask，未命中再退到原顺序。
    */
-  async getBuiltInServiceConfig(serviceId: string): Promise<BuiltInServiceConfig | null> {
+  async getBuiltInServiceConfig(
+    serviceId: string,
+    preferredCategory?: string
+  ): Promise<BuiltInServiceConfig | null> {
     try {
       // Check cache first
-      const cached = this.configCache.get(serviceId);
+      const cacheKey = preferredCategory
+        ? `${serviceId}::${preferredCategory}`
+        : serviceId;
+      const cached = this.configCache.get(cacheKey);
       if (cached && Date.now() - cached.timestamp < CACHE_TTL.SERVICE_CONFIG) {
         return { ...cached.config };
       }
 
-      // 1. 新路径：catalog（管理面板 UI 配置）优先
+      // 1. catalog（管理面板 UI 配置）优先
       try {
         const { getServiceCatalog } = await import('../db');
         const catalog = await getServiceCatalog();
-        // 优先级：image > multimodal > text > tts > video（图片生成路径优先）
-        const priority: Array<keyof typeof catalog> = ['image', 'multimodal', 'text', 'tts', 'video'] as any;
-        for (const cat of priority) {
-          const category = catalog[cat as keyof typeof catalog];
+        // 🔧 FIX (2026-05-07): 按 preferredCategory 重排迭代顺序，让脚本/视觉
+        //   类请求优先拿到 vision/multimodal 分类，避免误用 text 分类的 key。
+        const allCategoryEntries = Object.entries(catalog) as Array<
+          [string, (typeof catalog)[keyof typeof catalog]]
+        >;
+        const orderedCategoryEntries = preferredCategory
+          ? [
+              ...allCategoryEntries.filter(([key]) => key === preferredCategory),
+              ...allCategoryEntries.filter(([key]) => key !== preferredCategory),
+            ]
+          : allCategoryEntries;
+        for (const [, category] of orderedCategoryEntries) {
           if (!category || !category.subtasks) continue;
-          // 优先用 defaultSubtaskId 指向的子任务，没配齐再轮询其他
           const orderedIds = [
             category.defaultSubtaskId,
             ...Object.keys(category.subtasks).filter(id => id !== category.defaultSubtaskId)
@@ -57,14 +100,16 @@ export class BuiltInServiceConfigManagerImpl implements BuiltInServiceConfigMana
           for (const subId of orderedIds) {
             const subtask = category.subtasks[subId];
             if (!subtask) continue;
-            const baseUrl = (subtask.baseUrl || '').trim();
+            const baseUrl = migrateLegacyBuiltInBaseUrl(
+              (subtask.baseUrl || '').trim()
+            );
             const apiKey = (subtask.apiKey || '').trim();
             const enabled = subtask.isEnabled !== false;
             if (enabled && baseUrl && apiKey) {
               const synthesized: BuiltInServiceConfig = {
                 id: serviceId,
                 name: process.env.BUILT_IN_SERVICE_NAME || '内置服务',
-                provider: 'openai', // catalog 模式默认按 OpenAI 兼容协议处理
+                provider: 'openai',
                 baseUrl,
                 model: (subtask.model || '').trim() || 'gpt-image-2',
                 apiKey,
@@ -82,7 +127,7 @@ export class BuiltInServiceConfigManagerImpl implements BuiltInServiceConfigMana
                 createdAt: new Date(),
                 updatedAt: new Date()
               };
-              this.configCache.set(serviceId, {
+              this.configCache.set(cacheKey, {
                 config: { ...synthesized },
                 timestamp: Date.now()
               });
@@ -98,13 +143,17 @@ export class BuiltInServiceConfigManagerImpl implements BuiltInServiceConfigMana
       }
 
       // 2. 旧路径：环境变量 fallback
-      const envConfig = getBuiltInServiceConfig(serviceId);
-      if (envConfig) {
-        this.configCache.set(serviceId, {
-          config: { ...envConfig },
+      const config = getBuiltInServiceConfig(serviceId);
+      if (config) {
+        const healed: BuiltInServiceConfig = {
+          ...config,
+          baseUrl: migrateLegacyBuiltInBaseUrl(config.baseUrl),
+        };
+        this.configCache.set(cacheKey, {
+          config: { ...healed },
           timestamp: Date.now()
         });
-        return { ...envConfig };
+        return { ...healed };
       }
 
       return null;
@@ -182,15 +231,10 @@ export class BuiltInServiceConfigManagerImpl implements BuiltInServiceConfigMana
       const storedConfigs = await this.configStorage.loadServiceConfigs();
       const mergedById = new Map<string, BuiltInServiceConfig>();
 
-      // Keep any non-default stored service configs, but allow default built-in IDs
-      // to be overwritten by the current async resolver below.
       for (const stored of storedConfigs) {
         mergedById.set(stored.id, stored);
       }
 
-      // Resolve default service IDs through the async resolver. This keeps service
-      // enumeration catalog-aware when Render env API keys are intentionally absent,
-      // and prevents stale file configs from hiding catalog updates.
       for (const serviceId of Object.keys(BUILT_IN_SERVICES)) {
         const resolved = await this.getBuiltInServiceConfig(serviceId);
         if (resolved) {
@@ -201,7 +245,6 @@ export class BuiltInServiceConfigManagerImpl implements BuiltInServiceConfigMana
       return Array.from(mergedById.values());
     } catch (error) {
       console.error('Error getting all built-in services:', error);
-      // Fallback to async default service resolution so catalog-only setups still work.
       const fallbackConfigs: BuiltInServiceConfig[] = [];
       for (const serviceId of Object.keys(BUILT_IN_SERVICES)) {
         const resolved = await this.getBuiltInServiceConfig(serviceId);
@@ -335,15 +378,6 @@ export class BuiltInServiceConfigManagerImpl implements BuiltInServiceConfigMana
 
   /**
    * Check if service is available
-   *
-   * 🔧 FIX (2026-05 #11): 新增 catalog-fallback。
-   *   背景：admin-panel 有两套并存的配置体系 ——
-   *     (A) 旧路径：环境变量 GEMINI_BUILT_IN_API_KEY / GEMINI_BUILT_IN_BASE_URL；
-   *     (B) 新路径：管理面板 UI → catalog（DB），按 5 大类 × N 子任务存 baseUrl+apiKey。
-   *   `getAvailableServices` 内部循环调本方法，本方法此前只看 env，UI 配置完全无效。
-   *   用户删掉 env 后，桌面端切换内置服务直接报"没有可用的内置服务"。
-   *   修复：env 没配时改用 catalog —— 任一 category 有至少一个 enabled 子任务且
-   *   配齐 baseUrl+apiKey，就视为该服务可用。
    */
   async isServiceAvailable(serviceId: string): Promise<boolean> {
     try {
@@ -355,13 +389,21 @@ export class BuiltInServiceConfigManagerImpl implements BuiltInServiceConfigMana
 
       const config = await this.getBuiltInServiceConfig(serviceId);
       if (!config || !config.isEnabled) {
-        this.availabilityCache.set(serviceId, { available: false, timestamp: Date.now() });
+        this.availabilityCache.set(serviceId, {
+          available: false,
+          timestamp: Date.now()
+        });
         return false;
       }
 
       const validation = await this.validateServiceConfig(config);
       const available = validation.isValid;
-      this.availabilityCache.set(serviceId, { available, timestamp: Date.now() });
+
+      this.availabilityCache.set(serviceId, {
+        available,
+        timestamp: Date.now()
+      });
+
       return available;
     } catch (error) {
       console.error(`Error checking service availability for ${serviceId}:`, error);

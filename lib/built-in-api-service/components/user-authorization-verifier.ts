@@ -313,12 +313,19 @@ export class UserAuthorizationVerifierImpl implements UserAuthorizationVerifier 
         return { hasQuota: false, dailyRemaining: 0, monthlyRemaining: 0 };
       }
 
-      // For now, return the configured limits
-      // In a full implementation, this would check actual usage
+      // 🔧 MERGE (2026-07-03 镜像合并): 桌面侧的真实配额检查取代占位实现——
+      //   对照 api_usage_records 实际用量计算剩余额度，两仓统一。
+      const { getUserUsageStats } = await import('../db');
+      const usageStats = await getUserUsageStats(userId);
+      const dailyLimit = Math.max(0, permissions.quotaLimits.dailyRequests || 0);
+      const monthlyLimit = Math.max(0, permissions.quotaLimits.monthlyRequests || 0);
+      const dailyRemaining = Math.max(0, dailyLimit - usageStats.dailyUsage);
+      const monthlyRemaining = Math.max(0, monthlyLimit - usageStats.monthlyUsage);
+
       return {
-        hasQuota: true,
-        dailyRemaining: permissions.quotaLimits.dailyRequests,
-        monthlyRemaining: permissions.quotaLimits.monthlyRequests
+        hasQuota: dailyRemaining > 0 && monthlyRemaining > 0,
+        dailyRemaining,
+        monthlyRemaining
       };
     } catch (error) {
       console.error('Error checking user quota:', error);

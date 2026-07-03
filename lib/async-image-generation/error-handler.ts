@@ -303,14 +303,14 @@ export async function handleTimeoutError(
   taskId: string,
   context: ErrorContext
 ): Promise<ErrorResponse> {
-  const error = new Error('Task timeout after 60 seconds');
+  const error = new Error('Task timeout after 600 seconds');
   const enhancedContext: ErrorContext = {
     ...context,
     taskId,
     additionalInfo: {
       ...context.additionalInfo,
       errorType: 'timeout',
-      timeoutDuration: '60s',
+      timeoutDuration: '600s',
     },
   };
 

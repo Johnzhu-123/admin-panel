@@ -44,11 +44,8 @@ jest.mock('../task-manager', () => ({
 
 import { generateAsync, isTaskExpired } from '../image-generator';
 import { generateImageWithCompatibility } from '@/lib/api-compatibility/integration';
+import { GoogleGenAI } from '@google/genai';
 
-// 🔧 FIX (2026-06-11，与桌面仓同款): shared-utils 的 coerceImageValueToBase64 现在做
-// magic-byte + 最小长度(≥256 字符)校验，旧的 1x1 PNG / 'test-base64' 桩字符串会被
-// 判为非法图片 → 走直连 fallback → 命中未实现的 queuedFetch mock 而失败。
-// 构造 PNG 魔数开头、长度达标的合法桩数据。
 const makeValidPngLikeBase64 = () =>
   Buffer.concat([
     Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
@@ -154,17 +151,129 @@ describe('Image Generator', () => {
       );
     });
 
+    it('should not auto-force chat generation for multimodal-looking OpenAI-compatible models', async () => {
+      const mockBase64 = makeValidPngLikeBase64();
+      (generateImageWithCompatibility as jest.Mock).mockResolvedValue({
+        images: [{ b64_json: mockBase64 }]
+      });
+
+      const taskId = 'test-task-multimodal-openai-image';
+      const params = {
+        prompt: 'A clean product hero image',
+        provider: 'openai' as const,
+        apiKey: 'test-key',
+        baseUrl: 'https://api.openai.com/v1',
+        openAiImageModel: 'gemini-3.1-pro-preview',
+      };
+
+      await generateAsync(taskId, params);
+
+      expect(generateImageWithCompatibility).toHaveBeenCalledWith(
+        params.prompt,
+        params.apiKey,
+        params.baseUrl,
+        expect.objectContaining({
+          model: params.openAiImageModel,
+        })
+      );
+      expect(mockUpdateTaskStatus).toHaveBeenCalledWith(
+        taskId,
+        'completed',
+        expect.objectContaining({
+          resultImage: mockBase64,
+        })
+      );
+    });
+
+    it('routes non-Google gemini_compat image generation through OpenAI-compatible transport', async () => {
+      const mockBase64 = makeValidPngLikeBase64();
+      (generateImageWithCompatibility as jest.Mock).mockResolvedValue({
+        images: [{ b64_json: mockBase64 }]
+      });
+
+      const taskId = 'test-task-gemini-compat-openai-transport';
+      const params = {
+        prompt: 'A clean chalkboard style slide',
+        provider: 'gemini_compat' as const,
+        apiKey: 'test-key',
+        geminiApiKey: 'test-key',
+        baseUrl: 'https://api.example.com/v1',
+        geminiBaseUrl: 'https://api.example.com/v1',
+        geminiImageModel: 'gemini-3.1-pro-preview',
+      };
+
+      await generateAsync(taskId, params);
+
+      expect(GoogleGenAI).not.toHaveBeenCalled();
+      expect(generateImageWithCompatibility).toHaveBeenCalledWith(
+        params.prompt,
+        params.apiKey,
+        params.baseUrl,
+        expect.objectContaining({
+          model: params.geminiImageModel,
+        })
+      );
+      expect(mockUpdateTaskStatus).toHaveBeenCalledWith(
+        taskId,
+        'completed',
+        expect.objectContaining({
+          resultImage: mockBase64,
+        })
+      );
+    });
+
+    it('keeps image-only OpenAI-compatible models on the image endpoint and retries direct payload variants', async () => {
+      const mockBase64 = makeValidPngLikeBase64();
+
+      (generateImageWithCompatibility as jest.Mock).mockRejectedValue(new Error('response_format is not supported'));
+      const { queuedFetch } = require('@/lib/request-queue-manager');
+      (queuedFetch as jest.Mock)
+        .mockResolvedValue({
+          ok: true,
+          status: 200,
+          text: jest.fn().mockResolvedValue(JSON.stringify({
+            data: [{ b64_json: mockBase64 }],
+          })),
+        })
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 400,
+          text: jest.fn().mockResolvedValue(JSON.stringify({
+            error: { message: 'response_format is not supported' },
+          })),
+        });
+
+      const taskId = 'test-task-image-only-direct-retry';
+      const params = {
+        prompt: 'A clean product hero image',
+        provider: 'openai' as const,
+        apiKey: 'test-key',
+        baseUrl: 'https://api.example.com/v1',
+        openAiImageModel: 'gpt-image-2',
+      };
+
+      await generateAsync(taskId, params);
+
+      const calledUrls = (queuedFetch as jest.Mock).mock.calls.map((call: any[]) => call[0]);
+      expect(calledUrls.length).toBeGreaterThanOrEqual(2);
+      expect(calledUrls.every((url: string) => !String(url).includes('/chat/completions'))).toBe(true);
+      expect(mockUpdateTaskStatus).toHaveBeenCalledWith(
+        taskId,
+        'completed',
+        expect.objectContaining({
+          resultImage: mockBase64,
+        })
+      );
+    });
+
     it('should update status to failed on generation error', async () => {
       const errorMessage = 'API key is invalid';
       
       // Mock the compatibility system to throw an error
       (generateImageWithCompatibility as jest.Mock).mockRejectedValue(new Error(errorMessage));
-      // 🔧 FIX (2026-06-11，与桌面仓同款): 直连 fallback 的 queuedFetch 也按同错误拒绝，
-      // 否则 ESM 模式下 require 取到的 mock 实例可能与实现侧不一致，canRetry 仍为
-      // true 时会走 fallback 命中"未实现的 queuedFetch"产生无关错误信息。
       const { queuedFetch } = require('@/lib/request-queue-manager');
       (queuedFetch as jest.Mock).mockRejectedValue(new Error(errorMessage));
-
+      
       // Also mock handleCompatibilityError to return non-retryable
       const { handleCompatibilityError } = require('@/lib/api-compatibility/integration');
       (handleCompatibilityError as jest.Mock).mockReturnValue({

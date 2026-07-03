@@ -71,7 +71,7 @@ export interface UserAuthorizationVerifier {
  */
 export interface BuiltInServiceConfigManager {
   // Service configuration
-  getBuiltInServiceConfig(serviceId: string): Promise<BuiltInServiceConfig | null>;
+  getBuiltInServiceConfig(serviceId: string, preferredCategory?: string): Promise<BuiltInServiceConfig | null>;
   updateBuiltInServiceConfig(serviceId: string, config: BuiltInServiceConfig): Promise<void>;
   getAllBuiltInServices(): Promise<BuiltInServiceConfig[]>;
   

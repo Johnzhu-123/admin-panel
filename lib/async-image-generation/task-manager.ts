@@ -50,6 +50,7 @@ export interface UpdateData {
 export interface TaskManager {
   createTask(params: CreateTaskParams): Promise<TaskRecord>;
   updateTaskStatus(taskId: string, status: TaskStatus, data?: UpdateData): Promise<void>;
+  claimPendingTask(taskId: string): Promise<{ requestParams: Record<string, any> } | null>;
   getTaskStatus(taskId: string): Promise<TaskRecord | null>;
   cleanupExpiredTasks(olderThan: Date): Promise<number>;
 }
@@ -201,6 +202,62 @@ export async function updateTaskStatus(
       status
     });
     throw new Error(`Failed to update task status: ${error instanceof Error ? error.message : 'Unknown error'}`);
+  }
+}
+
+/**
+ * Atomically claim a pending task for processing.
+ * Only one caller can successfully claim the same task.
+ *
+ * @param taskId - Task ID to claim
+ * @returns requestParams when claim succeeds, otherwise null
+ */
+export async function claimPendingTask(
+  taskId: string
+): Promise<{ requestParams: Record<string, any> } | null> {
+  if (!taskId) {
+    const error = new Error('Missing required parameter: taskId');
+    console.error('[TaskManager] Validation error:', error.message);
+    throw error;
+  }
+
+  const now = new Date();
+
+  try {
+    const { rows } = await sql`
+      UPDATE image_generation_tasks
+      SET
+        status = ${'processing'},
+        updated_at = ${now.toISOString()}
+      WHERE task_id = ${taskId}
+        AND status = ${'pending'}
+      RETURNING request_params
+    `;
+
+    if (!rows.length) {
+      return null;
+    }
+
+    const rawParams = rows[0]?.request_params;
+    let requestParams: Record<string, any> = {};
+    try {
+      requestParams =
+        typeof rawParams === 'string' ? JSON.parse(rawParams) : (rawParams || {});
+    } catch (parseError) {
+      console.warn('[TaskManager] Failed to parse claimed request_params:', parseError);
+      requestParams = {};
+    }
+
+    return { requestParams };
+  } catch (error) {
+    console.error('[TaskManager] Failed to claim pending task:', {
+      error: error instanceof Error ? error.message : 'Unknown error',
+      stack: error instanceof Error ? error.stack : undefined,
+      taskId,
+    });
+    throw new Error(
+      `Failed to claim pending task: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
 }
 
@@ -401,6 +458,7 @@ export async function ensureTableExists(): Promise<boolean> {
 export const taskManager: TaskManager = {
   createTask,
   updateTaskStatus,
+  claimPendingTask,
   getTaskStatus,
   cleanupExpiredTasks
 };

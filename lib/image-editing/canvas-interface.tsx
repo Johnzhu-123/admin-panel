@@ -1,5 +1,4 @@
 // @ts-nocheck
-// 🔧 (2026-06-11 类型门禁): 遗留组件 Mask.data(string) 实际承载 ImageData 的历史类型债，与桌面仓同文件同策略整文件豁免
 'use client';
 
 import React, { useRef, useEffect, useState, useCallback } from 'react';
@@ -70,11 +69,69 @@ export const CanvasInterface: React.FC<CanvasInterfaceProps> = ({
       img.onload = () => {
         setLoadedImage(img);
         setCanvasState(prev => ({ ...prev, image: imageData }));
-        redrawCanvas();
       };
       img.src = imageData;
     }
   }, [imageData]);
+
+  const drawMask = useCallback((
+    ctx: CanvasRenderingContext2D,
+    mask: Mask,
+    index: number,
+    isPreview = false
+  ) => {
+    ctx.save();
+
+    const colors = ['#ff0000', '#00ff00', '#0000ff', '#ffff00', '#ff00ff', '#00ffff'];
+    const color = colors[index % colors.length];
+    const opacity = isPreview ? 0.3 : toolOptions.opacity || 0.5;
+
+    ctx.globalAlpha = opacity;
+    ctx.fillStyle = color;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+
+    switch (mask.type) {
+      case 'brush':
+        if (mask.coordinates.length >= 2) {
+          ctx.beginPath();
+          ctx.moveTo(mask.coordinates[0].x, mask.coordinates[0].y);
+          for (let i = 1; i < mask.coordinates.length; i++) {
+            ctx.lineTo(mask.coordinates[i].x, mask.coordinates[i].y);
+          }
+          ctx.lineWidth = toolOptions.brushSize || 20;
+          ctx.lineCap = 'round';
+          ctx.lineJoin = 'round';
+          ctx.stroke();
+        }
+        break;
+      case 'rectangle':
+        if (mask.coordinates.length >= 2) {
+          const start = mask.coordinates[0];
+          const end = mask.coordinates[mask.coordinates.length - 1];
+          const width = end.x - start.x;
+          const height = end.y - start.y;
+          ctx.fillRect(start.x, start.y, width, height);
+          ctx.strokeRect(start.x, start.y, width, height);
+        }
+        break;
+      case 'circle':
+        if (mask.coordinates.length >= 2) {
+          const start = mask.coordinates[0];
+          const end = mask.coordinates[mask.coordinates.length - 1];
+          const radius = Math.sqrt(
+            Math.pow(end.x - start.x, 2) + Math.pow(end.y - start.y, 2)
+          );
+          ctx.beginPath();
+          ctx.arc(start.x, start.y, radius, 0, 2 * Math.PI);
+          ctx.fill();
+          ctx.stroke();
+        }
+        break;
+    }
+
+    ctx.restore();
+  }, [toolOptions.brushSize, toolOptions.opacity]);
 
   // Redraw canvas when state changes
   const redrawCanvas = useCallback(() => {
@@ -122,79 +179,7 @@ export const CanvasInterface: React.FC<CanvasInterfaceProps> = ({
     // Composite all layers
     ctx.drawImage(imageCanvas, 0, 0);
     ctx.drawImage(maskCanvas, 0, 0);
-  }, [canvasState, drawingState, loadedImage]);
-
-  // Draw a single mask
-  const drawMask = (ctx: CanvasRenderingContext2D, mask: Mask, index: number, isPreview = false) => {
-    ctx.save();
-    
-    // Set mask appearance
-    const colors = ['#ff0000', '#00ff00', '#0000ff', '#ffff00', '#ff00ff', '#00ffff'];
-    const color = colors[index % colors.length];
-    const opacity = isPreview ? 0.3 : toolOptions.opacity || 0.5;
-    
-    ctx.globalAlpha = opacity;
-    ctx.fillStyle = color;
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
-
-    switch (mask.type) {
-      case 'brush':
-        drawBrushMask(ctx, mask);
-        break;
-      case 'rectangle':
-        drawRectangleMask(ctx, mask);
-        break;
-      case 'circle':
-        drawCircleMask(ctx, mask);
-        break;
-    }
-
-    ctx.restore();
-  };
-
-  const drawBrushMask = (ctx: CanvasRenderingContext2D, mask: Mask) => {
-    if (mask.coordinates.length < 2) return;
-
-    ctx.beginPath();
-    ctx.moveTo(mask.coordinates[0].x, mask.coordinates[0].y);
-    
-    for (let i = 1; i < mask.coordinates.length; i++) {
-      ctx.lineTo(mask.coordinates[i].x, mask.coordinates[i].y);
-    }
-    
-    ctx.lineWidth = toolOptions.brushSize || 20;
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-    ctx.stroke();
-  };
-
-  const drawRectangleMask = (ctx: CanvasRenderingContext2D, mask: Mask) => {
-    if (mask.coordinates.length < 2) return;
-    
-    const start = mask.coordinates[0];
-    const end = mask.coordinates[mask.coordinates.length - 1];
-    const width = end.x - start.x;
-    const height = end.y - start.y;
-    
-    ctx.fillRect(start.x, start.y, width, height);
-    ctx.strokeRect(start.x, start.y, width, height);
-  };
-
-  const drawCircleMask = (ctx: CanvasRenderingContext2D, mask: Mask) => {
-    if (mask.coordinates.length < 2) return;
-    
-    const start = mask.coordinates[0];
-    const end = mask.coordinates[mask.coordinates.length - 1];
-    const radius = Math.sqrt(
-      Math.pow(end.x - start.x, 2) + Math.pow(end.y - start.y, 2)
-    );
-    
-    ctx.beginPath();
-    ctx.arc(start.x, start.y, radius, 0, 2 * Math.PI);
-    ctx.fill();
-    ctx.stroke();
-  };
+  }, [canvasState, drawMask, drawingState, loadedImage]);
 
   // Get mouse position relative to canvas
   const getMousePos = (e: React.MouseEvent<HTMLCanvasElement>): Point => {

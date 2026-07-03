@@ -1,7 +1,8 @@
 'use client';
+/* eslint-disable @next/next/no-img-element */
 
 import React, { useState, useRef, useEffect } from 'react';
-import { Mask, Point } from './types';
+import { Mask } from './types';
 
 /**
  * Enhanced mask visualization and management component
@@ -29,6 +30,11 @@ interface MaskDisplaySettings {
 
 type MaskSettings = Record<string, MaskDisplaySettings>;
 
+const DEFAULT_MASK_COLORS = [
+  '#ff0000', '#00ff00', '#0000ff', '#ffff00',
+  '#ff00ff', '#00ffff', '#ff8000', '#8000ff'
+];
+
 export const MaskVisualization: React.FC<MaskVisualizationProps> = ({
   masks,
   originalImage,
@@ -45,28 +51,20 @@ export const MaskVisualization: React.FC<MaskVisualizationProps> = ({
   const [comparisonMode, setComparisonMode] = useState<'side-by-side' | 'overlay' | 'slider'>('side-by-side');
   const [selectedMaskId, setSelectedMaskId] = useState<string | null>(null);
 
-  // Default colors for masks
-  const defaultColors = [
-    '#ff0000', '#00ff00', '#0000ff', '#ffff00', 
-    '#ff00ff', '#00ffff', '#ff8000', '#8000ff'
-  ];
-
   // Initialize mask settings when masks change
   useEffect(() => {
-    const newSettings: MaskSettings = {};
-    masks.forEach((mask, index) => {
-      if (!maskSettings[mask.id]) {
-        newSettings[mask.id] = {
+    setMaskSettings((prev) => {
+      const nextSettings: MaskSettings = {};
+      masks.forEach((mask, index) => {
+        nextSettings[mask.id] = prev[mask.id] || {
           visible: true,
           opacity: mask.opacity || 0.5,
-          color: defaultColors[index % defaultColors.length],
+          color: DEFAULT_MASK_COLORS[index % DEFAULT_MASK_COLORS.length],
           selected: false
         };
-      } else {
-        newSettings[mask.id] = maskSettings[mask.id];
-      }
+      });
+      return nextSettings;
     });
-    setMaskSettings(newSettings);
   }, [masks]);
 
   const handleMaskSelect = (maskId: string) => {
@@ -176,7 +174,7 @@ export const MaskVisualization: React.FC<MaskVisualizationProps> = ({
                   <div className="flex items-center gap-2">
                     <div
                       className="w-4 h-4 rounded border"
-                      style={{ backgroundColor: settings?.color || defaultColors[index % defaultColors.length] }}
+                      style={{ backgroundColor: settings?.color || DEFAULT_MASK_COLORS[index % DEFAULT_MASK_COLORS.length] }}
                     />
                     <span className="font-medium">
                       {formatMaskType(mask.type)} Mask {index + 1}
@@ -245,7 +243,7 @@ export const MaskVisualization: React.FC<MaskVisualizationProps> = ({
                         onClick={(e) => e.stopPropagation()}
                       />
                       <div className="flex gap-1">
-                        {defaultColors.map(color => (
+                        {DEFAULT_MASK_COLORS.map(color => (
                           <button
                             key={color}
                             onClick={(e) => {

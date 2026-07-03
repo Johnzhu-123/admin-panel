@@ -152,10 +152,13 @@ export class BuiltInAPIService {
 
   /**
    * Get catalog-aware built-in service configuration
+   *
+   * 🔧 FIX (2026-05-07): 转发可选 preferredCategory 给底层 ConfigManager，
+   *   让脚本生成等带图请求能优先匹配 vision/multimodal 分类。
    */
-  async getBuiltInServiceConfig(serviceId: string) {
+  async getBuiltInServiceConfig(serviceId: string, preferredCategory?: string) {
     await this.ensureInitialized();
-    return this.configManager.getBuiltInServiceConfig(serviceId);
+    return this.configManager.getBuiltInServiceConfig(serviceId, preferredCategory);
   }
 
   /**

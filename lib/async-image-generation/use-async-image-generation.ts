@@ -52,7 +52,7 @@ interface UseAsyncImageGenerationReturn {
  * Configuration
  */
 const POLL_INTERVAL_MS = 2000; // 2 seconds
-const MAX_POLL_ATTEMPTS = 30; // 30 attempts = 60 seconds max
+const MAX_POLL_ATTEMPTS = 300; // 300 attempts = 600 seconds max
 
 /**
  * Custom hook for async image generation

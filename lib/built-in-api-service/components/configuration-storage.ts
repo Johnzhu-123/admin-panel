@@ -211,6 +211,22 @@ export class ConfigurationStorageImpl implements ConfigurationStorage {
       if (dbAvailable) {
         const persistToDb = async () => {
           console.log(`[ConfigStorage] Saving ${users.length} users to database...`);
+          // 🔧 MERGE (2026-07-03 镜像合并，桌面侧 #23 等价修复): upsert 之外补
+          //   "删除已被移出列表的 DB 行"——否则 serverless 冷启会把已删用户拉回。
+          //   与 permission-manager 的逐用户硬删除互为兜底（幂等）。
+          const normalizeIdentifier = (value: string) => value.trim().toLowerCase();
+          const existingUsers = await loadUsersFromDatabase().catch(() => []);
+          const existingByNormalized = new Map<string, string>();
+          for (const existingUser of existingUsers) {
+            existingByNormalized.set(
+              normalizeIdentifier(existingUser.userId),
+              existingUser.userId
+            );
+          }
+          const targetNormalizedIds = new Set(
+            users.map((user) => normalizeIdentifier(user.userId))
+          );
+
           for (const user of users) {
             try {
               await saveUserToDatabase(user);
@@ -220,6 +236,18 @@ export class ConfigurationStorageImpl implements ConfigurationStorage {
               throw userError;
             }
           }
+
+          for (const [normalizedId, originalId] of existingByNormalized.entries()) {
+            if (targetNormalizedIds.has(normalizedId)) continue;
+            try {
+              await deleteUserFromDatabase(originalId);
+              console.log(`[ConfigStorage] Deleted user removed from config: ${originalId}`);
+            } catch (deleteError) {
+              console.error(`[ConfigStorage] Failed to delete user ${originalId}:`, deleteError);
+              throw deleteError;
+            }
+          }
+
           console.log(`✅ Saved ${users.length} authorized users to database`);
         };
 

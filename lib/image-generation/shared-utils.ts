@@ -10,6 +10,7 @@ import {
     StyleReferenceImage,
 } from "@google/genai";
 import { queuedFetch } from "@/lib/request-queue-manager";
+import { normalizeBase64Payload } from "@/lib/image-generation/response-url";
 
 // ==================== Type Definitions ====================
 
@@ -85,6 +86,8 @@ export const isMultimodalModel = (model: string): boolean => {
         /gemini.*2\\.0/i,
         /gemini.*3/i,          // Gemini 3 models
         /gemini.*flash/i,
+        /gemini.*image/i,
+        /gemini.*imagen/i,
         /gemini.*ultra/i,
         /gemini.*preview/i, // Nano Banana Pro compatible models
         /claude/i,
@@ -213,6 +216,226 @@ export const collectImageUrlsFromContent = (content: any, urls: Set<string>): vo
     }
 };
 
+// ==================== Base64 Sanitization & Remote Fetch ====================
+
+/**
+ * 校验下载到的 buffer 是否带可识别的图像 magic bytes。
+ *
+ * gpt-image-2 / DALL·E 的 Azure Blob URL 在限流 / URL 过期 / CORS 拒绝时可能返回：
+ *   - HTTP 200 + `text/html` 错误页（XML/JSON 错误体）
+ *   - HTTP 200 + 空 body
+ *   - 短小的 placeholder 图片
+ * 这些都会被原始 `buffer.toString("base64")` 当作合法 base64 透传到客户端，
+ * 渲染端拼 data URL 后就是「破损缩略图」。这里强制按文件头识别 PNG/JPEG/GIF/WebP/BMP/AVIF，
+ * 不通过的一律视为下载失败。
+ */
+export const isLikelyImageBuffer = (buffer: Buffer): boolean => {
+    if (!buffer || buffer.length < 16) return false;
+
+    // PNG: 89 50 4E 47 0D 0A 1A 0A
+    if (
+        buffer[0] === 0x89 &&
+        buffer[1] === 0x50 &&
+        buffer[2] === 0x4e &&
+        buffer[3] === 0x47 &&
+        buffer[4] === 0x0d &&
+        buffer[5] === 0x0a &&
+        buffer[6] === 0x1a &&
+        buffer[7] === 0x0a
+    ) {
+        return true;
+    }
+    // JPEG: FF D8 FF
+    if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+        return true;
+    }
+    // GIF: "GIF87a" / "GIF89a"
+    if (
+        buffer[0] === 0x47 &&
+        buffer[1] === 0x49 &&
+        buffer[2] === 0x46 &&
+        buffer[3] === 0x38 &&
+        (buffer[4] === 0x37 || buffer[4] === 0x39) &&
+        buffer[5] === 0x61
+    ) {
+        return true;
+    }
+    // WebP: "RIFF" .... "WEBP"
+    if (
+        buffer[0] === 0x52 &&
+        buffer[1] === 0x49 &&
+        buffer[2] === 0x46 &&
+        buffer[3] === 0x46 &&
+        buffer[8] === 0x57 &&
+        buffer[9] === 0x45 &&
+        buffer[10] === 0x42 &&
+        buffer[11] === 0x50
+    ) {
+        return true;
+    }
+    // BMP: "BM"
+    if (buffer[0] === 0x42 && buffer[1] === 0x4d) {
+        return true;
+    }
+    // AVIF / HEIC: bytes 4-7 == "ftyp" + brand at 8-11
+    if (
+        buffer[4] === 0x66 &&
+        buffer[5] === 0x74 &&
+        buffer[6] === 0x79 &&
+        buffer[7] === 0x70
+    ) {
+        return true;
+    }
+    return false;
+};
+
+/**
+ * 校验 base64 图片负载，过滤明显损坏的内容（URL / HTML / 截断负载）。
+ * 返回标准 base64 字符串（去除 URL-safe 字符），不可用时返回空字符串。
+ *
+ * 与 app/api/ai/image/route.ts 和 lib/built-in-api-service/components/api-proxy-layer.ts
+ * 保持同语义 —— 三处必须一致，避免任一通路把 URL 当 base64 透传到渲染端造成破图。
+ */
+export const sanitizeImageBase64Payload = (value: unknown): string => {
+    if (typeof value !== "string") return "";
+    const trimmed = value.trim();
+    if (!trimmed) return "";
+    // 显式 data URL：剥离 schema 头，仅保留 base64 主体
+    if (/^data:image\//i.test(trimmed)) {
+        const base64Part = trimmed.split(",")[1] || "";
+        return sanitizeImageBase64Payload(base64Part);
+    }
+    // 任何 http(s):// / asset:// / blob: / file: 都不是 base64
+    if (/^(https?:|asset:|blob:|file:)/i.test(trimmed)) return "";
+    // base64 字符集校验（允许 URL-safe 与少量空白），随后兜底转成标准 base64
+    if (!/^[A-Za-z0-9+/=\-_\s]+$/.test(trimmed)) return "";
+    const cleaned = normalizeBase64Payload(trimmed);
+    if (cleaned.length < 256) return ""; // 一张可见图至少应有几百字节 base64
+    if (!/^[A-Za-z0-9+/=]+$/.test(cleaned)) return "";
+    // 🔧 NEW: magic-byte 校验，过滤 HTML/JSON 错误体被当成 b64 的情况
+    try {
+        const buf = Buffer.from(cleaned, "base64");
+        if (!isLikelyImageBuffer(buf)) return "";
+    } catch {
+        return "";
+    }
+    return cleaned;
+};
+
+/**
+ * 服务端拉取远端图片 URL 并转换为 base64。
+ *
+ * gpt-image-2 / DALL·E / 各类 Azure Blob 签名 URL 等模型若仅返回 URL，
+ * 渲染端往往因 CORS / URL 过期 / 跨域鉴权失败而显示破损缩略图。
+ * 这里强制服务端落 buffer 转 base64，渲染端只接受真正的 base64 字符串。
+ *
+ * 失败时 throw —— 调用方必须把异常视为「该响应不可用」，禁止回退到原始 URL 字符串。
+ *
+ * 🔧 v2 改进（解决"连续生成多张破图"）：
+ *   1. Content-Type 校验：响应头不是 image/* 直接判失败（拦 HTML 错误页）；
+ *   2. magic-byte 校验：buffer 头不是已知图像格式直接判失败（拦零字节 / 错误体）；
+ *   3. 超时 30s → 60s：连续生成 PPT 时 OpenAI Blob 在限流下会变慢；
+ *   4. 1 次轻量重试：网络抖动 / 5xx 不至于直接砸成「当前页生成失败」。
+ */
+export const fetchRemoteImageAsBase64 = async (url: string, signal?: AbortSignal): Promise<string> => {
+    const FETCH_TIMEOUT_MS = 60000;
+    const MAX_ATTEMPTS = 2;
+    let lastError: unknown = null;
+
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+        const effectiveSignal = signal || AbortSignal.timeout(FETCH_TIMEOUT_MS);
+        try {
+            const response = await queuedFetch(
+                url,
+                {
+                    headers: { "User-Agent": "md2pptWin-image/1.0" },
+                    signal: effectiveSignal,
+                },
+                "high"
+            );
+            if (!response.ok) {
+                lastError = new Error(`Remote image URL responded with ${response.status}`);
+                // 4xx 客户端错误不重试；5xx / 网络错误才重试
+                if (response.status < 500) throw lastError;
+                continue;
+            }
+            const contentType = (response.headers.get("content-type") || "").toLowerCase();
+            if (contentType && !contentType.startsWith("image/")) {
+                throw new Error(
+                    `Remote image URL returned non-image content-type: ${contentType.slice(0, 60)}`
+                );
+            }
+            const buffer = Buffer.from(await response.arrayBuffer());
+            if (!buffer.length) {
+                lastError = new Error("Remote image URL returned empty body");
+                continue;
+            }
+            if (!isLikelyImageBuffer(buffer)) {
+                // 不是合法图像（可能是 HTML/JSON 错误页），尝试下一次但不再退避太多
+                lastError = new Error("Remote image URL returned non-image bytes");
+                continue;
+            }
+            const base64 = buffer.toString("base64");
+            if (base64.length < 256) {
+                lastError = new Error("Remote image URL returned suspiciously short payload");
+                continue;
+            }
+            return base64;
+        } catch (error) {
+            lastError = error;
+            // AbortError / 网络错误 → 下一轮；其他错误（如 4xx throw）让上面的 if 短路掉
+            if (error instanceof Error && /^Remote image URL responded with 4/.test(error.message)) {
+                throw error;
+            }
+        }
+    }
+    throw lastError instanceof Error
+        ? lastError
+        : new Error("Remote image URL fetch failed after retries");
+};
+
+/**
+ * 把上游 image 对象（可能含 b64_json / url / 二者皆有）转换为可信赖的 base64。
+ *
+ * 顺序：
+ *   1. 先校验 b64_json —— 通过 sanitize 过滤截断 / URL 误入 / HTML 错误页等坏数据；
+ *   2. 校验失败但 url 是 data URL —— 拆 base64 主体；
+ *   3. url 是 http(s):// —— 服务端下载并转 base64；
+ *   4. 全部失败 —— throw，调用方必须当成失败处理（不能把 URL 当 imageBase64 透传）。
+ *
+ * 历史 BUG：原代码 `const imageBase64 = image.b64_json || image.url;` 在 b64_json 损坏 /
+ * URL 抓取失败时会把 URL 字符串塞进 imageBase64 字段，渲染端接到 "https://..."
+ * 当作 base64 拼 data URL → 破损缩略图。
+ */
+export const resolveImageToBase64 = async (
+    image: { b64_json?: string; url?: string } | null | undefined,
+    signal?: AbortSignal
+): Promise<string> => {
+    if (!image) {
+        throw new Error("No image data in response");
+    }
+    const sanitized = sanitizeImageBase64Payload(image.b64_json);
+    if (sanitized) return sanitized;
+
+    const directUrl = typeof image.url === "string" ? image.url.trim() : "";
+    if (!directUrl) {
+        throw new Error("Image response had no usable b64_json or url");
+    }
+
+    if (/^data:image\//i.test(directUrl)) {
+        const fromDataUrl = sanitizeImageBase64Payload(directUrl);
+        if (fromDataUrl) return fromDataUrl;
+        throw new Error("Image response data URL was not valid base64");
+    }
+
+    if (/^https?:\/\//i.test(directUrl)) {
+        const fetched = await fetchRemoteImageAsBase64(directUrl, signal);
+        return fetched;
+    }
+
+    throw new Error(`Image response url scheme not supported: ${directUrl.slice(0, 40)}`);
+};
+
 // ==================== Base64 Extraction ====================
 
 /**
@@ -248,22 +471,21 @@ export const extractBase64FromResponse = async (data: any): Promise<string> => {
 
     for (const val of tryFields) {
         if (typeof val === "string" && val.trim() && val.length > 100) {
-            const trimmed = val.trim();
-            // Check for valid base64 characters
-            if (/^[A-Za-z0-9+/=\s\n\r\-_]+$/.test(trimmed)) {
-                const cleanBase64 = trimmed.replace(/[\s\n\r\-_]/g, '');
-                if (cleanBase64.length > 100 && /^[A-Za-z0-9+/=]+$/.test(cleanBase64)) {
-                    console.log("[SharedUtils] Found valid base64 data, length:", cleanBase64.length);
-                    return cleanBase64;
-                }
+            // 🔧 FIX: 统一走 sanitizeImageBase64Payload（含 magic-byte + 长度校验），
+            // 避免 OpenAI 限流期返回的截断 / HTML 错误体被认作合法 base64 → 破损缩略图。
+            const sanitized = sanitizeImageBase64Payload(val);
+            if (sanitized) {
+                console.log("[SharedUtils] Found valid base64 data, length:", sanitized.length);
+                return sanitized;
             }
 
-            // Check for data URL format
+            const trimmed = val.trim();
+            // Check for data URL format (sanitize 已经覆盖，这里保留作为日志入口，避免改动太多)
             if (trimmed.startsWith('data:image/')) {
-                const base64Part = trimmed.split(',')[1];
-                if (base64Part && base64Part.length > 100) {
+                const fromDataUrl = sanitizeImageBase64Payload(trimmed);
+                if (fromDataUrl) {
                     console.log("[SharedUtils] Found data URL, extracting base64");
-                    return base64Part.trim();
+                    return fromDataUrl;
                 }
             }
         }
@@ -294,7 +516,7 @@ export const extractBase64FromResponse = async (data: any): Promise<string> => {
             const base64Part = url.split(',')[1];
             if (base64Part && base64Part.length > 100) {
                 console.log("[SharedUtils] Found data URL in urls set");
-                return base64Part.trim();
+                return normalizeBase64Payload(base64Part);
             }
             continue;
         }
@@ -302,15 +524,11 @@ export const extractBase64FromResponse = async (data: any): Promise<string> => {
         if (url.startsWith("http")) {
             try {
                 console.log("[SharedUtils] Fetching image from URL:", url);
-                const res = await queuedFetch(url, {
-                    signal: AbortSignal.timeout(30000)
-                }, 'low');
-                if (res.ok) {
-                    const buf = Buffer.from(await res.arrayBuffer());
-                    const base64 = buf.toString("base64");
-                    console.log("[SharedUtils] Converted URL to base64, length:", base64.length);
-                    return base64;
-                }
+                // 🔧 FIX: 复用统一的 fetchRemoteImageAsBase64（含 Content-Type + magic-byte
+                // 校验 + 60s 超时 + 1 次重试），避免 OpenAI 限流时返回 HTML 错误页被当成 b64。
+                const base64 = await fetchRemoteImageAsBase64(url);
+                console.log("[SharedUtils] Converted URL to base64, length:", base64.length);
+                return base64;
             } catch (error) {
                 console.log("[SharedUtils] Failed to fetch URL:", url, error);
             }
@@ -361,54 +579,9 @@ export const isContentPolicyError = (error: string): boolean => {
     return policyErrors.some(err => combined.includes(err));
 };
 
-// ==================== Image Magic-Byte Validation ====================
-
-/**
- * 校验 Buffer 是否为已知图像格式的 magic-byte 起始。
- * 与 md2pptWin/lib/image-generation/shared-utils.ts:isLikelyImageBuffer 同语义。
- *
- * 必要性：fetch 远端 URL 返回 200 不代表内容是图片 —— 可能是 HTML 登录页 /
- * JSON 错误体 / 0 字节占位符。Buffer.from(...).toString('base64') 会产出
- * "看起来合法但解码非图片" 的 base64，前端 <img> 渲染必然失败 → 破图。
- */
-export const isLikelyImageBuffer = (buffer: Buffer): boolean => {
-    if (!buffer || buffer.length < 16) return false;
-    // PNG: 89 50 4E 47 0D 0A 1A 0A
-    if (
-        buffer[0] === 0x89 && buffer[1] === 0x50 &&
-        buffer[2] === 0x4e && buffer[3] === 0x47 &&
-        buffer[4] === 0x0d && buffer[5] === 0x0a &&
-        buffer[6] === 0x1a && buffer[7] === 0x0a
-    ) return true;
-    // JPEG: FF D8 FF
-    if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return true;
-    // GIF: "GIF87a" / "GIF89a"
-    if (
-        buffer[0] === 0x47 && buffer[1] === 0x49 &&
-        buffer[2] === 0x46 && buffer[3] === 0x38 &&
-        (buffer[4] === 0x37 || buffer[4] === 0x39) &&
-        buffer[5] === 0x61
-    ) return true;
-    // WebP: "RIFF" .... "WEBP"
-    if (
-        buffer[0] === 0x52 && buffer[1] === 0x49 &&
-        buffer[2] === 0x46 && buffer[3] === 0x46 &&
-        buffer[8] === 0x57 && buffer[9] === 0x45 &&
-        buffer[10] === 0x42 && buffer[11] === 0x50
-    ) return true;
-    // BMP: "BM"
-    if (buffer[0] === 0x42 && buffer[1] === 0x4d) return true;
-    // AVIF / HEIC: bytes 4-7 == "ftyp"
-    if (
-        buffer[4] === 0x66 && buffer[5] === 0x74 &&
-        buffer[6] === 0x79 && buffer[7] === 0x70
-    ) return true;
-    return false;
-};
-
-/**
- * 把 base64 字符串解码后做 magic-byte 校验。空 / 太短 / 非图像格式都返回 false。
- */
+// ==================== 🔧 MERGE (2026-07-03 镜像合并): 云端独有的 coerce 系 API ====================
+// image 路由与 api-proxy-layer 依赖 coerceImageValueToBase64（markdown/data URL/http 统一转 base64，
+// 含 magic-byte 校验与 queuedFetch 低优先级下载）。与桌面系 resolveImageToBase64 并存，勿混用。
 export const isValidImageBase64 = (base64: string): boolean => {
     if (!base64 || typeof base64 !== "string") return false;
     const cleaned = base64.replace(/[\s\n\r]/g, "");
