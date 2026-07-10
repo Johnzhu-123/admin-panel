@@ -67,6 +67,10 @@ runWithPostgres("PostgreSQL quota concurrency", () => {
       const suffix = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
       const userId = `ci-user-${suffix}`;
       const serviceId = `ci-service-${suffix}`;
+      const requestCount = Number(process.env.POSTGRES_TEST_REQUEST_COUNT || 100);
+      if (!Number.isSafeInteger(requestCount) || requestCount < 1 || requestCount > 100) {
+        throw new Error("POSTGRES_TEST_REQUEST_COUNT must be an integer from 1 to 100");
+      }
       const pool =
         process.env.POSTGRES_TEST_USE_POOL === "1"
           ? createPool({ connectionString: process.env.POSTGRES_URL, max: 20 })
@@ -77,21 +81,22 @@ runWithPostgres("PostgreSQL quota concurrency", () => {
           : process.env.POSTGRES_USE_NODE_PG === "1"
             ? createNodePostgresClient()
             : (createClient() as unknown as QuotaQueryClient);
+      const databaseErrors: Array<{ message: string; error: unknown }> = [];
       const service = new PostgresQuotaService({
         createClient: makeClient,
-        logError: () => undefined,
+        logError: (message, error) => databaseErrors.push({ message, error }),
       });
 
       try {
         const results = await Promise.all(
-          Array.from({ length: 100 }, (_, index) =>
+          Array.from({ length: requestCount }, (_, index) =>
             service.acquire({
               userId,
               serviceId,
               reservationId: `ci-reservation-${suffix}-${index}`,
               limits: {
-                dailyRequests: 100,
-                monthlyRequests: 100,
+                dailyRequests: requestCount,
+                monthlyRequests: requestCount,
                 concurrentRequests: 10,
               },
             })
@@ -100,8 +105,10 @@ runWithPostgres("PostgreSQL quota concurrency", () => {
 
         const acquired = results.filter((result) => result.acquired);
         const rejected = results.filter((result) => !result.acquired);
-        expect(acquired).toHaveLength(10);
-        expect(rejected).toHaveLength(90);
+        expect(databaseErrors).toEqual([]);
+        const expectedAcquired = Math.min(10, requestCount);
+        expect(acquired).toHaveLength(expectedAcquired);
+        expect(rejected).toHaveLength(requestCount - expectedAcquired);
         expect(
           rejected.every(
             (result) =>
@@ -124,11 +131,11 @@ runWithPostgres("PostgreSQL quota concurrency", () => {
           expect(counters.rows).toEqual([
             expect.objectContaining({
               period_kind: "day",
-              request_count: "10",
+              request_count: String(expectedAcquired),
             }),
             expect.objectContaining({
               period_kind: "month",
-              request_count: "10",
+              request_count: String(expectedAcquired),
             }),
           ]);
         } finally {

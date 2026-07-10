@@ -114,7 +114,7 @@ export class PostgresQuotaService {
       // Serialize quota decisions for the same user/service without locking unrelated users.
       await client.query(
         "/* quota:lock */ SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-        [`${userId}\u0000${serviceId}`]
+        [JSON.stringify([userId, serviceId])]
       );
       await client.query(
         `/* quota:expire */
