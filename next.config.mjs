@@ -39,6 +39,13 @@ const staticSecurityHeaders = [
   { key: "Cross-Origin-Resource-Policy", value: "same-site" },
 ];
 
+if (process.env.NODE_ENV === "production") {
+  staticSecurityHeaders.push({
+    key: "Strict-Transport-Security",
+    value: "max-age=31536000; includeSubDomains",
+  });
+}
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: false,
