@@ -1,3 +1,5 @@
+/** @jest-environment node */
+
 jest.unmock("@vercel/postgres");
 
 import {
