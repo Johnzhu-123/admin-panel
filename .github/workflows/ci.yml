@@ -11,6 +11,9 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    env:
+      NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: pk_test_Y2xlcmsuZXhhbXBsZS5jb20k
+      CLERK_SECRET_KEY: sk_test_placeholder
     steps:
       - name: Checkout admin-panel
         uses: actions/checkout@v4
@@ -21,7 +24,6 @@ jobs:
         with:
           repository: Johnzhu-123/md2pptWin
           path: md2pptWin
-          token: ${{ secrets.CROSS_REPO_READ_TOKEN }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22.12.0
@@ -47,9 +49,6 @@ jobs:
         run: npm test -- --ci --runInBand --silent
       - name: Production build
         working-directory: admin-panel
-        env:
-          NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY }}
-          CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
         run: npm run build
       - name: Required mirror check
         working-directory: md2pptWin
@@ -59,9 +58,6 @@ jobs:
       - name: HTTP security header smoke
         working-directory: admin-panel
         shell: bash
-        env:
-          NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY }}
-          CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
         run: |
           npm start > /tmp/admin-next.log 2>&1 &
           server_pid=$!
@@ -91,6 +87,7 @@ jobs:
     env:
       POSTGRES_URL: postgresql://postgres:postgres@127.0.0.1:5432/md2ppt_ci
       POSTGRES_URL_NON_POOLING: postgresql://postgres:postgres@127.0.0.1:5432/md2ppt_ci
+      POSTGRES_USE_NODE_PG: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

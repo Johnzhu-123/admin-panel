@@ -4,12 +4,26 @@ import { NextRequest } from "next/server";
 import {
   isPublicClerkPage,
   isPublicInfrastructureRequest,
+  securityContextFor,
 } from "@/middleware";
 
 const request = (path: string, method = "GET") =>
   new NextRequest(`https://admin.example${path}`, { method });
 
 describe("admin middleware public infrastructure policy", () => {
+  const originalTrustProxyHeaders = process.env.ADMIN_TRUST_PROXY_HEADERS;
+  const originalVercel = process.env.VERCEL;
+
+  afterEach(() => {
+    if (originalTrustProxyHeaders === undefined) {
+      delete process.env.ADMIN_TRUST_PROXY_HEADERS;
+    } else {
+      process.env.ADMIN_TRUST_PROXY_HEADERS = originalTrustProxyHeaders;
+    }
+    if (originalVercel === undefined) delete process.env.VERCEL;
+    else process.env.VERCEL = originalVercel;
+  });
+
   it("allows only the exact Clerk webhook method", () => {
     expect(isPublicInfrastructureRequest(request("/api/webhooks/clerk", "POST"))).toBe(true);
     expect(isPublicInfrastructureRequest(request("/api/webhooks/clerk/evil", "POST"))).toBe(false);
@@ -31,5 +45,18 @@ describe("admin middleware public infrastructure policy", () => {
     expect(isPublicClerkPage(request("/sign-in.attacker"))).toBe(false);
     expect(isPublicClerkPage(request("/sign-up-evil"))).toBe(false);
     expect(isPublicClerkPage(request("/private.rsc"))).toBe(false);
+  });
+
+  it("trusts forwarded HTTPS only behind an explicitly trusted proxy", () => {
+    delete process.env.VERCEL;
+    delete process.env.ADMIN_TRUST_PROXY_HEADERS;
+    const proxiedRequest = new NextRequest("http://admin.example/", {
+      headers: { "x-forwarded-proto": "https" },
+    });
+
+    expect(securityContextFor(proxiedRequest).isHttps).toBe(false);
+
+    process.env.ADMIN_TRUST_PROXY_HEADERS = "1";
+    expect(securityContextFor(proxiedRequest).isHttps).toBe(true);
   });
 });

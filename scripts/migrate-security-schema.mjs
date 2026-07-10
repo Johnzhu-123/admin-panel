@@ -1,6 +1,13 @@
 import { createClient } from "@vercel/postgres";
 
-const client = createClient();
+const client = /** @type {any} */ (
+  process.env.POSTGRES_USE_NODE_PG === "1"
+    ? new (await import("pg")).Client({
+        connectionString:
+          process.env.POSTGRES_URL_NON_POOLING || process.env.POSTGRES_URL,
+      })
+    : createClient()
+);
 
 try {
   await client.connect();

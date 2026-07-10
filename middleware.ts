@@ -20,12 +20,21 @@ const isLoopbackUrl = (value: string) => {
   }
 };
 
-const securityContextFor = (req: Pick<NextRequest, "url" | "headers">) => {
+export const securityContextFor = (
+  req: Pick<NextRequest, "url" | "headers">
+) => {
   const mode = getStrictCspMode();
   const nonce = mode === "off" ? undefined : crypto.randomUUID().replace(/-/g, "");
+  const trustForwardedProto =
+    process.env.VERCEL === "1" || process.env.ADMIN_TRUST_PROXY_HEADERS === "1";
+  const forwardedProto = req.headers
+    .get("x-forwarded-proto")
+    ?.split(",", 1)[0]
+    ?.trim()
+    .toLowerCase();
   const isHttps =
     new URL(req.url).protocol === "https:" ||
-    (process.env.VERCEL === "1" && req.headers.get("x-forwarded-proto") === "https");
+    (trustForwardedProto && forwardedProto === "https");
   return {
     isProduction: process.env.NODE_ENV === "production",
     isHttps,

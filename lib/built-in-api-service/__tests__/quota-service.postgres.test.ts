@@ -6,6 +6,7 @@ import {
   type VercelPool,
   type VercelPoolClient,
 } from "@vercel/postgres";
+import { Client } from "pg";
 
 import {
   PostgresQuotaService,
@@ -35,6 +36,28 @@ function createPoolBackedClient(pool: VercelPool): QuotaQueryClient {
   };
 }
 
+function createNodePostgresClient(): QuotaQueryClient {
+  const client = new Client({
+    connectionString:
+      process.env.POSTGRES_URL_NON_POOLING || process.env.POSTGRES_URL,
+  });
+  return {
+    async connect() {
+      await client.connect();
+    },
+    async query<Row = Record<string, unknown>>(text: string, values?: unknown[]) {
+      const result = await client.query(text, values);
+      return {
+        rows: result.rows as Row[],
+        rowCount: result.rowCount,
+      };
+    },
+    async end() {
+      await client.end();
+    },
+  };
+}
+
 runWithPostgres("PostgreSQL quota concurrency", () => {
   test(
     "serializes 100 concurrent reservations and enforces the active limit",
@@ -49,7 +72,9 @@ runWithPostgres("PostgreSQL quota concurrency", () => {
       const makeClient = (): QuotaQueryClient =>
         pool
           ? createPoolBackedClient(pool)
-          : (createClient() as unknown as QuotaQueryClient);
+          : process.env.POSTGRES_USE_NODE_PG === "1"
+            ? createNodePostgresClient()
+            : (createClient() as unknown as QuotaQueryClient);
       const service = new PostgresQuotaService({
         createClient: makeClient,
         logError: () => undefined,
