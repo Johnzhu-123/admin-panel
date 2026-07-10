@@ -26,6 +26,17 @@ jest.mock("@/lib/built-in-api-service/apply-cloud-config", () => ({
   })),
 }));
 
+jest.mock("@/lib/auth/service-principal", () => ({
+  requireClaimedServicePrincipal: jest.fn(async () => ({
+    userId: "user_verified",
+    email: "verified@example.com",
+    source: "clerk-bearer",
+  })),
+  ServicePrincipalError: class ServicePrincipalError extends Error {
+    status = 401;
+  },
+}));
+
 jest.mock("@/lib/api-compatibility/integration", () => ({
   enhanceOpenAICompatibility: jest.fn(async (config: any) => config),
 }));

@@ -21,7 +21,10 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { currentUser } from "@clerk/nextjs/server";
+import {
+  requireServicePrincipal,
+  ServicePrincipalError,
+} from "@/lib/auth/service-principal";
 import { sql } from "@vercel/postgres";
 import { randomUUID } from "crypto";
 import { noStoreHeaders } from "@/lib/ai";
@@ -30,10 +33,38 @@ import {
   BUILT_IN_SERVICE_CATEGORIES,
   type BuiltInServiceCategory,
 } from "@/lib/built-in-api-service/db";
+import { quotaService } from "@/lib/built-in-api-service/quota-service";
+import { attachQuotaReleaseToResponse } from "@/lib/built-in-api-service/legacy-quota";
+import { fetchPublicHttpUrl } from "@/lib/network/public-url";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
+
+const MAX_PROXY_REQUEST_BYTES = 25 * 1024 * 1024;
+const STRIPPED_REQUEST_HEADERS = new Set([
+  "authorization",
+  "cookie",
+  "host",
+  "content-length",
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+  "forwarded",
+  "via",
+  "x-forwarded-for",
+  "x-forwarded-host",
+  "x-forwarded-proto",
+  "x-real-ip",
+  "x-md2ppt-user-id",
+  "x-md2ppt-user-email",
+  "x-md2ppt-user-name",
+]);
 
 const isCategory = (value: string): value is BuiltInServiceCategory =>
   (BUILT_IN_SERVICE_CATEGORIES as readonly string[]).includes(value);
@@ -49,13 +80,14 @@ interface AuthorizationView {
   allowedServices: string[];
   dailyRequests: number;
   monthlyRequests: number;
+  concurrentRequests: number;
 }
 
 async function loadAuthorization(userId: string, email?: string): Promise<AuthorizationView | null> {
   try {
     const { rows } = await sql`
       SELECT user_id, email, status, can_use_built_in_services, allowed_services,
-             daily_requests, monthly_requests
+             daily_requests, monthly_requests, concurrent_requests
       FROM authorized_users
       WHERE user_id = ${userId} OR email = ${email || ""}
       LIMIT 1
@@ -70,10 +102,11 @@ async function loadAuthorization(userId: string, email?: string): Promise<Author
       allowedServices: Array.isArray(row.allowed_services) ? row.allowed_services : [],
       dailyRequests: row.daily_requests ?? 0,
       monthlyRequests: row.monthly_requests ?? 0,
+      concurrentRequests: row.concurrent_requests ?? 0,
     };
   } catch (error) {
     console.error("[proxy] loadAuthorization 失败:", error);
-    return null;
+    throw error;
   }
 }
 
@@ -93,27 +126,6 @@ async function recordUsage(params: {
     `;
   } catch (error) {
     console.error("[proxy] recordUsage 失败:", error);
-  }
-}
-
-async function checkDailyQuota(userId: string, dailyLimit: number): Promise<boolean> {
-  if (!dailyLimit || dailyLimit <= 0) return true;
-  try {
-    // 🔧 FIX (2026-06-11 BUG-D6): "今日"按 Asia/Shanghai 计算（与 db.ts 用量统计
-    //   口径一致——旧 CURRENT_DATE 用 UTC，北京时间 8 点前后配额窗口错位 8 小时），
-    //   且只统计 success = true 的请求：上游失败不应吃掉用户配额。
-    const { rows } = await sql`
-      SELECT COUNT(*)::int AS used
-      FROM api_usage_records
-      WHERE user_id = ${userId}
-        AND success = true
-        AND (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Shanghai')::date
-            = (NOW() AT TIME ZONE 'Asia/Shanghai')::date
-    `;
-    const used = rows[0]?.used ?? 0;
-    return used < dailyLimit;
-  } catch {
-    return true;
   }
 }
 
@@ -145,6 +157,9 @@ async function handleProxy(
   const params = await context.params;
   const requestId = randomUUID();
   const startedAt = Date.now();
+  let activeReservationId: string | null = null;
+  let usageUserId = "unknown";
+  let usageServiceId = `built-in-${params?.category || "unknown"}`;
 
   try {
     const category = params.category;
@@ -156,17 +171,16 @@ async function handleProxy(
       return json(400, { error: "Missing target subpath" });
     }
 
-    const user = await currentUser();
-    if (!user) {
-      return json(401, { error: "未登录" });
-    }
-    const userId = user.id;
-    const email =
-      user.primaryEmailAddress?.emailAddress ||
-      user.emailAddresses?.[0]?.emailAddress ||
-      "";
+    const principal = await requireServicePrincipal(req);
+    const userId = principal.userId;
+    const email = principal.email || "";
 
-    const authorization = await loadAuthorization(userId, email);
+    let authorization: AuthorizationView | null;
+    try {
+      authorization = await loadAuthorization(userId, email);
+    } catch {
+      return json(503, { error: "授权服务暂不可用" });
+    }
     if (!authorization) {
       return json(403, { error: "用户未被授权使用内置服务" });
     }
@@ -183,11 +197,6 @@ async function handleProxy(
     ) {
       return json(403, { error: `账号未授权 ${category} 服务` });
     }
-    const quotaOk = await checkDailyQuota(authorization.userId, authorization.dailyRequests);
-    if (!quotaOk) {
-      return json(429, { error: "今日配额已用尽" });
-    }
-
     const catalogEntry = await getInternalServiceConfig(category, req.nextUrl.searchParams.get("subtask") || undefined);
     if (!catalogEntry) {
       return json(503, { error: `${category} 服务未配置` });
@@ -200,34 +209,75 @@ async function handleProxy(
       return json(503, { error: `${category}/${subtask.id} 服务未配置（baseUrl/apiKey 缺失）` });
     }
 
+    let requestBody: ArrayBuffer | undefined;
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      const declaredLength = Number(req.headers.get("content-length") || 0);
+      if (Number.isFinite(declaredLength) && declaredLength > MAX_PROXY_REQUEST_BYTES) {
+        return json(413, { error: "代理请求体超过 25 MiB 上限" });
+      }
+      requestBody = await req.arrayBuffer();
+      if (requestBody.byteLength > MAX_PROXY_REQUEST_BYTES) {
+        return json(413, { error: "代理请求体超过 25 MiB 上限" });
+      }
+    }
+
+    usageUserId = authorization.userId;
+    usageServiceId = `built-in-${category}-${subtask.id}`;
+    const quota = await quotaService.acquire({
+      userId: authorization.userId,
+      serviceId: usageServiceId,
+      limits: {
+        dailyRequests: authorization.dailyRequests,
+        monthlyRequests: authorization.monthlyRequests,
+        concurrentRequests: authorization.concurrentRequests,
+      },
+      reservationTtlMs: 10 * 60 * 1000,
+    });
+    if (quota.acquired === false) {
+      return quota.reason === "database_error"
+        ? json(503, { error: "配额服务暂不可用" })
+        : json(429, { error: "请求配额已用尽" });
+    }
+    activeReservationId = quota.reservationId;
+
     const upstreamUrl = buildUpstreamUrl(subtask.baseUrl, subpath);
-    const incomingHeaders = new Headers(req.headers);
-    incomingHeaders.delete("authorization");
-    incomingHeaders.delete("cookie");
-    incomingHeaders.delete("host");
-    incomingHeaders.delete("content-length");
+    const incomingHeaders = new Headers();
+    req.headers.forEach((value, key) => {
+      if (!STRIPPED_REQUEST_HEADERS.has(key.toLowerCase())) {
+        incomingHeaders.set(key, value);
+      }
+    });
     incomingHeaders.set("Authorization", `Bearer ${subtask.apiKey}`);
 
     const init: RequestInit = {
       method: req.method,
       headers: incomingHeaders,
-      // 🔧 FIX (2026-06-11 BUG-C10): 上游 fetch 无超时会一直挂到 Render 平台杀连接，
-      //   显式 120s 上限，超时走 catch 返回 500 并记失败。
       signal: AbortSignal.timeout(120_000),
+      body: requestBody,
     };
-    if (req.method !== "GET" && req.method !== "HEAD") {
-      init.body = req.body as unknown as BodyInit;
-      // @ts-expect-error duplex required for streaming bodies under Node fetch
-      init.duplex = "half";
+    const allowPrivateNetwork = process.env.MD2PPT_ALLOW_PRIVATE_API_PROXY === "1";
+    let upstreamResp: Response;
+    try {
+      upstreamResp = await fetchPublicHttpUrl(upstreamUrl, init, {
+        description: `${category}/${subtask.id} upstream`,
+        allowHttp: allowPrivateNetwork,
+        allowPrivateNetwork,
+        maxRedirects: 0,
+      });
+    } catch (error) {
+      const released = await quotaService.release(activeReservationId);
+      activeReservationId = null;
+      if (!released.released) {
+        return json(503, { error: "配额服务暂不可用" });
+      }
+      throw error;
     }
-
-    const upstreamResp = await fetch(upstreamUrl, init);
     const responseTime = Date.now() - startedAt;
 
     void recordUsage({
       requestId,
       userId: authorization.userId,
-      serviceId: `built-in-${category}-${subtask.id}`,
+      serviceId: usageServiceId,
       success: upstreamResp.ok,
       responseTime,
       error: upstreamResp.ok ? undefined : `HTTP ${upstreamResp.status}`,
@@ -244,22 +294,36 @@ async function handleProxy(
     respHeaders.set("x-builtin-subtask", subtask.id);
     respHeaders.set("x-builtin-model-default", subtask.model || "");
 
-    return new Response(upstreamResp.body, {
+    const response = new Response(upstreamResp.body, {
       status: upstreamResp.status,
       headers: respHeaders,
     });
+    if (!activeReservationId) return response;
+    const reservationId = activeReservationId;
+    activeReservationId = null;
+    return await attachQuotaReleaseToResponse(response, reservationId, "proxy");
   } catch (error) {
+    if (activeReservationId) {
+      const released = await quotaService.release(activeReservationId);
+      activeReservationId = null;
+      if (!released.released) {
+        return json(503, { error: "配额服务暂不可用" });
+      }
+    }
+    if (error instanceof ServicePrincipalError) {
+      return json(error.status, { error: error.message });
+    }
     const responseTime = Date.now() - startedAt;
     const message = error instanceof Error ? error.message : "代理请求失败";
     void recordUsage({
       requestId,
-      userId: "unknown",
-      serviceId: `built-in-${params?.category || "unknown"}`,
+      userId: usageUserId,
+      serviceId: usageServiceId,
       success: false,
       responseTime,
       error: message,
     });
-    return json(500, { error: message });
+    return json(502, { error: message });
   }
 }
 

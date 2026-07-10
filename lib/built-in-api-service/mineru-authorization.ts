@@ -1,4 +1,6 @@
-export type MinerUIdentitySource = "clerk" | "desktop-proxy";
+import type { ServicePrincipal } from "@/lib/auth/service-principal";
+
+export type MinerUIdentitySource = "clerk-bearer";
 
 export interface MinerURequestIdentity {
   userId: string;
@@ -14,16 +16,7 @@ export interface MinerUAuthorizationRecord {
   allowedServices: string[];
   dailyRequests: number;
   monthlyRequests: number;
-}
-
-interface ClerkEmailLike {
-  emailAddress?: string | null;
-}
-
-interface ClerkUserLike {
-  id?: string | null;
-  primaryEmailAddress?: ClerkEmailLike | null;
-  emailAddresses?: ClerkEmailLike[] | null;
+  concurrentRequests: number;
 }
 
 const clean = (value?: string | null) => (value || "").trim();
@@ -32,43 +25,62 @@ export function normalizeMinerUIdentifier(value?: string | null): string {
   return clean(value).toLowerCase();
 }
 
-export function getMinerUIdentityFromClerkUser(
-  user: ClerkUserLike | null | undefined
-): MinerURequestIdentity | null {
-  if (!user) return null;
-  const userId = clean(user.id);
-  const email =
-    clean(user.primaryEmailAddress?.emailAddress) ||
-    clean(user.emailAddresses?.[0]?.emailAddress);
-  if (!userId && !email) return null;
+export function getMinerUIdentityFromServicePrincipal(
+  principal: ServicePrincipal
+): MinerURequestIdentity {
+  const userId = clean(principal.userId);
+  const email = clean(principal.email) || userId;
   return {
-    userId: userId || email,
-    email: email || userId,
-    source: "clerk",
+    userId,
+    email,
+    source: "clerk-bearer",
   };
 }
 
-export function getMinerUIdentityFromRequestHeaders(
-  headers: Headers
-): MinerURequestIdentity | null {
-  const userId = clean(headers.get("x-md2ppt-user-id"));
-  const email = clean(headers.get("x-md2ppt-user-email"));
-  if (!userId && !email) return null;
-  return {
-    userId: userId || email,
-    email: email || userId,
-    source: "desktop-proxy",
-  };
+export function normalizeMinerUCloudBaseUrl(raw: string): string | null {
+  try {
+    const url = new URL(raw.trim());
+    if (
+      url.protocol !== "https:" ||
+      url.hostname.toLowerCase() !== "mineru.net" ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash ||
+      (url.pathname !== "/" && url.pathname !== "")
+    ) {
+      return null;
+    }
+    return url.origin;
+  } catch {
+    return null;
+  }
 }
 
-export function resolveMinerURequestIdentity(
-  clerkUser: ClerkUserLike | null | undefined,
-  headers: Headers
-): MinerURequestIdentity | null {
-  return (
-    getMinerUIdentityFromClerkUser(clerkUser) ||
-    getMinerUIdentityFromRequestHeaders(headers)
-  );
+const SAFE_TASK_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+const RESULTS_PREFIX = "/api/v4/extract-results/batch/";
+
+export type MinerUOperation =
+  | { method: "POST"; path: "/api/v4/file-urls/batch" }
+  | { method: "GET"; path: string };
+
+export function resolveAllowedMinerUOperation(
+  method: string,
+  targetPath: string
+): MinerUOperation | null {
+  const normalizedMethod = method.trim().toUpperCase();
+  if (
+    normalizedMethod === "POST" &&
+    targetPath === "/api/v4/file-urls/batch"
+  ) {
+    return { method: "POST", path: "/api/v4/file-urls/batch" };
+  }
+  if (normalizedMethod !== "GET" || !targetPath.startsWith(RESULTS_PREFIX)) {
+    return null;
+  }
+  const taskId = targetPath.slice(RESULTS_PREFIX.length);
+  if (!SAFE_TASK_ID.test(taskId)) return null;
+  return { method: "GET", path: `${RESULTS_PREFIX}${taskId}` };
 }
 
 export function isMinerUServiceAllowed(allowedServices: string[] | null | undefined): boolean {
@@ -141,6 +153,10 @@ export function parseMinerUAuthorizedUsersFromEnv(
           monthlyRequests: toNumber(
             quota.monthlyRequests ?? record.monthly_requests,
             15000
+          ),
+          concurrentRequests: toNumber(
+            quota.concurrentRequests ?? record.concurrent_requests,
+            3
           ),
         };
       })

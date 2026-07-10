@@ -17,6 +17,15 @@ import { recordFailureLog } from "@/lib/diagnostics";
 import { executeOpenAiChatWithCompatRetries } from "@/lib/network/openai-chat-attempt";
 import type { InlineImage } from "@/lib/ai";
 import type { BuiltInServiceCategory } from "@/lib/built-in-api-service/db";
+import {
+  requireClaimedServicePrincipal,
+  ServicePrincipalError,
+} from "@/lib/auth/service-principal";
+import {
+  BuiltInQuotaError,
+  runWithBuiltInQuota,
+} from "@/lib/built-in-api-service/legacy-quota";
+import { fetchPublicHttpUrl } from "@/lib/network/public-url";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -112,7 +121,11 @@ export async function POST(req: Request) {
           : "gemini";
     let apiKey = (body.apiKey || "").trim();
     const useBuiltInService = body.useBuiltInService === true;
-    const userId = (body.userId || "").trim();
+    let userId = (body.userId || "").trim();
+    if (useBuiltInService) {
+      const principal = await requireClaimedServicePrincipal(req, userId);
+      userId = principal.resolvedUserId || userId || principal.email || principal.userId;
+    }
     const prompt = (body.prompt || "").trim();
     const images = Array.isArray(body.images)
       ? (body.images as InlineImage[])
@@ -228,6 +241,22 @@ export async function POST(req: Request) {
         ...buildOpenAiHeaders(apiKey, true, openAiAuthHeader),
       },
       model: images.length ? visionModel : model,
+      request: builtInConfig
+        ? (url, init) =>
+            runWithBuiltInQuota({
+              userId,
+              serviceId: builtInConfig.id,
+              dispatch: () =>
+                fetchPublicHttpUrl(url, init, {
+                  description: "Built-in summary endpoint",
+                  allowHttp:
+                    process.env.MD2PPT_ALLOW_PRIVATE_API_PROXY === "1",
+                  allowPrivateNetwork:
+                    process.env.MD2PPT_ALLOW_PRIVATE_API_PROXY === "1",
+                  maxRedirects: 0,
+                }),
+            })
+        : undefined,
       temperature: 0.6,
       maxOutputTokens: Number(body.maxTokens) > 0 ? Number(body.maxTokens) : undefined,
       messages: [
@@ -272,6 +301,18 @@ export async function POST(req: Request) {
     const text = result.text;
     return NextResponse.json({ text }, { headers: noStoreHeaders() });
   } catch (error) {
+    if (error instanceof BuiltInQuotaError) {
+      return NextResponse.json(
+        { error: error.message },
+        { status: error.status, headers: noStoreHeaders() }
+      );
+    }
+    if (error instanceof ServicePrincipalError) {
+      return NextResponse.json(
+        { error: error.message },
+        { status: error.status, headers: noStoreHeaders() }
+      );
+    }
     const message =
       error instanceof Error ? error.message : "Failed to generate summary.";
     const errorCause =

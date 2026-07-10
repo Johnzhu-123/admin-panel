@@ -18,7 +18,6 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { currentUser } from "@clerk/nextjs/server";
 import { sql } from "@vercel/postgres";
 import { randomUUID } from "crypto";
 import { noStoreHeaders } from "@/lib/ai";
@@ -26,9 +25,18 @@ import {
   getMinerUAuthorizationFromEnv,
   isMinerUServiceAllowed,
   MinerUAuthorizationRecord,
-  resolveMinerURequestIdentity,
+  getMinerUIdentityFromServicePrincipal,
+  normalizeMinerUCloudBaseUrl,
+  resolveAllowedMinerUOperation,
 } from "@/lib/built-in-api-service/mineru-authorization";
 import { getMinerURuntimeSettings } from "@/lib/built-in-api-service/mineru-settings";
+import { quotaService } from "@/lib/built-in-api-service/quota-service";
+import { attachQuotaReleaseToResponse } from "@/lib/built-in-api-service/legacy-quota";
+import { fetchPublicHttpUrl } from "@/lib/network/public-url";
+import {
+  requireServicePrincipal,
+  ServicePrincipalError,
+} from "@/lib/auth/service-principal";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -58,7 +66,7 @@ async function loadAuthorization(userId: string, email?: string): Promise<MinerU
   try {
     const { rows } = await sql`
       SELECT user_id, email, status, can_use_built_in_services, allowed_services,
-             daily_requests, monthly_requests
+             daily_requests, monthly_requests, concurrent_requests
       FROM authorized_users
       WHERE LOWER(user_id) = LOWER(${userId}) OR LOWER(email) = LOWER(${email || ""})
       LIMIT 1
@@ -73,11 +81,12 @@ async function loadAuthorization(userId: string, email?: string): Promise<MinerU
       allowedServices: Array.isArray(row.allowed_services) ? row.allowed_services : [],
       dailyRequests: row.daily_requests ?? 0,
       monthlyRequests: row.monthly_requests ?? 0,
+      concurrentRequests: row.concurrent_requests ?? 0,
     };
   } catch (error) {
     console.error("[mineru/proxy] loadAuthorization 失败:", error);
+    throw error;
   }
-  return getMinerUAuthorizationFromEnv(userId, email);
 }
 
 async function recordUsage(params: {
@@ -98,36 +107,17 @@ async function recordUsage(params: {
   }
 }
 
-async function checkDailyQuota(userId: string, dailyLimit: number): Promise<boolean> {
-  if (!dailyLimit || dailyLimit <= 0) return true;
-  try {
-    const { rows } = await sql`
-      SELECT COUNT(*)::int AS used
-      FROM api_usage_records
-      WHERE user_id = ${userId}
-        AND service_id = ${"built-in-mineru"}
-        AND created_at >= CURRENT_DATE
-    `;
-    const used = rows[0]?.used ?? 0;
-    return used < dailyLimit;
-  } catch {
-    return true;
-  }
-}
-
 const stripTrailingSlash = (s: string) => s.replace(/\/+$/, "");
 
-async function forward(req: NextRequest): Promise<NextResponse> {
+async function forward(req: NextRequest): Promise<Response> {
   const requestId = randomUUID();
   const startedAt = Date.now();
 
-  // 1. 校验 target path
+  // 1. 校验精确 method/path 操作白名单
   const targetPath = req.headers.get("x-mineru-target-path") || "";
-  if (!targetPath || !targetPath.startsWith("/")) {
-    return json(400, {
-      code: -1,
-      msg: 'Missing or invalid header "x-mineru-target-path" (must start with "/")',
-    });
+  const operation = resolveAllowedMinerUOperation(req.method, targetPath);
+  if (!operation) {
+    return json(405, { code: -1, msg: "MinerU operation is not allowed" });
   }
 
   // 2. 读取 admin-panel 可维护的 MinerU 运行时配置
@@ -146,23 +136,30 @@ async function forward(req: NextRequest): Promise<NextResponse> {
     });
   }
 
-  // 3. Clerk 鉴权
-  let user: Awaited<ReturnType<typeof currentUser>> | null = null;
-  try {
-    user = await currentUser();
-  } catch (err) {
-    console.warn(
-      "[mineru/proxy] Clerk 校验失败，尝试使用桌面端转发身份:",
-      err instanceof Error ? err.message : String(err)
-    );
+  const baseUrl = normalizeMinerUCloudBaseUrl(settings.baseUrl || "");
+  if (!baseUrl) {
+    return json(503, { code: -1, msg: "MinerU BaseURL 必须是 https://mineru.net" });
   }
-  const identity = resolveMinerURequestIdentity(user, req.headers);
-  if (!identity) {
-    return json(401, { code: -1, msg: "未登录" });
+
+  // 3. Clerk Bearer service principal 鉴权
+  let identity;
+  try {
+    identity = getMinerUIdentityFromServicePrincipal(
+      await requireServicePrincipal(req)
+    );
+  } catch (error) {
+    const message =
+      error instanceof ServicePrincipalError ? error.message : "身份验证失败";
+    return json(401, { code: -1, msg: message });
   }
 
   // 4. 授权校验
-  const authorization = await loadAuthorization(identity.userId, identity.email);
+  let authorization: MinerUAuthorizationRecord | null;
+  try {
+    authorization = await loadAuthorization(identity.userId, identity.email);
+  } catch {
+    return json(503, { code: -1, msg: "授权服务暂不可用" });
+  }
   if (!authorization) {
     return json(403, { code: -1, msg: "用户未被加入授权名单" });
   }
@@ -176,22 +173,25 @@ async function forward(req: NextRequest): Promise<NextResponse> {
     return json(403, { code: -1, msg: "账号未被授权使用 MinerU 服务" });
   }
 
-  // 5. 配额校验
-  const quotaOk = await checkDailyQuota(authorization.userId, authorization.dailyRequests);
-  if (!quotaOk) {
-    void recordUsage({
-      requestId,
-      userId: authorization.userId,
-      success: false,
-      responseTime: Date.now() - startedAt,
-      error: "QUOTA_EXCEEDED",
-    });
-    return json(429, { code: -1, msg: "今日配额已用尽" });
+  // 5. 在任何上游 dispatch 之前原子计数并预留并发槽位。
+  const quota = await quotaService.acquire({
+    userId: authorization.userId,
+    serviceId: "built-in-mineru",
+    limits: {
+      dailyRequests: authorization.dailyRequests,
+      monthlyRequests: authorization.monthlyRequests,
+      concurrentRequests: authorization.concurrentRequests,
+    },
+  });
+  if (quota.acquired === false) {
+    if (quota.reason === "database_error") {
+      return json(503, { code: -1, msg: "配额服务暂不可用" });
+    }
+    return json(429, { code: -1, msg: "请求配额已用尽" });
   }
 
   // 6. 构造上游 URL
-  const baseUrl = stripTrailingSlash(settings.baseUrl || "https://mineru.net");
-  const upstreamUrl = `${baseUrl}${targetPath}`;
+  const upstreamUrl = `${stripTrailingSlash(baseUrl)}${operation.path}`;
 
   // 7. 构造转发 header：注入 Authorization，剥不应外传的 header
   const fwdHeaders = new Headers();
@@ -216,24 +216,33 @@ async function forward(req: NextRequest): Promise<NextResponse> {
   // 9. 转发
   let upstream: Response;
   try {
-    upstream = await fetch(upstreamUrl, {
+    upstream = await fetchPublicHttpUrl(upstreamUrl, {
       method,
       headers: fwdHeaders,
       body,
-      redirect: "follow",
+      redirect: "manual",
+    }, {
+      description: "MinerU upstream",
+      allowHttp: false,
+      allowPrivateNetwork: false,
+      maxRedirects: 0,
     });
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    const released = await quotaService.release(quota.reservationId);
+    if (!released.released) {
+      return json(503, { code: -1, msg: "配额服务暂不可用" });
+    }
+    const dispatchError = err instanceof Error ? err.message : String(err);
     void recordUsage({
       requestId,
       userId: authorization.userId,
       success: false,
       responseTime: Date.now() - startedAt,
-      error: `fetch_failed: ${message}`,
+      error: `fetch_failed: ${dispatchError}`,
     });
     return json(502, {
       code: -1,
-      msg: `mineru.net 转发失败: ${message}`,
+      msg: `mineru.net 转发失败: ${dispatchError}`,
     });
   }
 
@@ -256,11 +265,11 @@ async function forward(req: NextRequest): Promise<NextResponse> {
   });
   resHeaders.set("x-builtin-request-id", requestId);
 
-  return new NextResponse(upstream.body, {
+  return await attachQuotaReleaseToResponse(new NextResponse(upstream.body, {
     status: upstream.status,
     statusText: upstream.statusText,
     headers: resHeaders,
-  });
+  }), quota.reservationId, "mineru/proxy");
 }
 
 export async function GET(req: NextRequest) {
@@ -268,16 +277,4 @@ export async function GET(req: NextRequest) {
 }
 export async function POST(req: NextRequest) {
   return forward(req);
-}
-export async function PUT(req: NextRequest) {
-  return forward(req);
-}
-export async function DELETE(req: NextRequest) {
-  return forward(req);
-}
-export async function PATCH(req: NextRequest) {
-  return forward(req);
-}
-export async function OPTIONS() {
-  return new NextResponse(null, { status: 200 });
 }

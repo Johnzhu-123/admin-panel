@@ -1,37 +1,46 @@
 import {
-  getMinerUIdentityFromClerkUser,
-  getMinerUIdentityFromRequestHeaders,
+  getMinerUIdentityFromServicePrincipal,
   findMinerUAuthorizationRecord,
   isMinerUServiceAllowed,
+  normalizeMinerUCloudBaseUrl,
   parseMinerUAuthorizedUsersFromEnv,
+  resolveAllowedMinerUOperation,
 } from "../mineru-authorization";
 
 describe("MinerU authorization helpers", () => {
-  it("extracts the same desktop identity from forwarded headers that local Clerk resolved", () => {
-    const headers = new Headers({
-      "x-md2ppt-user-id": "user_123",
-      "x-md2ppt-user-email": "owner@example.com",
-    });
-
-    expect(getMinerUIdentityFromRequestHeaders(headers)).toEqual({
+  it("derives identity only from a verified Clerk service principal", () => {
+    expect(getMinerUIdentityFromServicePrincipal({
       userId: "user_123",
       email: "owner@example.com",
-      source: "desktop-proxy",
+      source: "clerk-bearer",
+    })).toEqual({
+      userId: "user_123",
+      email: "owner@example.com",
+      source: "clerk-bearer",
     });
   });
 
-  it("uses Clerk email and id when the admin-panel request has a remote Clerk session", () => {
-    expect(
-      getMinerUIdentityFromClerkUser({
-        id: "user_abc",
-        primaryEmailAddress: { emailAddress: "me@example.com" },
-        emailAddresses: [{ emailAddress: "fallback@example.com" }],
-      })
-    ).toEqual({
-      userId: "user_abc",
-      email: "me@example.com",
-      source: "clerk",
+  it("enforces the exact MinerU origin and operation allowlist", () => {
+    expect(normalizeMinerUCloudBaseUrl("https://mineru.net")).toBe("https://mineru.net");
+    expect(normalizeMinerUCloudBaseUrl("http://mineru.net")).toBeNull();
+    expect(normalizeMinerUCloudBaseUrl("https://evil.example")).toBeNull();
+    expect(resolveAllowedMinerUOperation("POST", "/api/v4/file-urls/batch")).toEqual({
+      method: "POST",
+      path: "/api/v4/file-urls/batch",
     });
+    expect(resolveAllowedMinerUOperation("GET", "/api/v4/extract-results/batch/task_01-A")).toEqual({
+      method: "GET",
+      path: "/api/v4/extract-results/batch/task_01-A",
+    });
+    for (const unsafe of [
+      "/api/v4/extract-results/batch/../admin",
+      "/api/v4/extract-results/batch/a%2Fb",
+      "/api/v4/extract-results/batch/.hidden",
+      "/api/v4/other",
+    ]) {
+      expect(resolveAllowedMinerUOperation("GET", unsafe)).toBeNull();
+    }
+    expect(resolveAllowedMinerUOperation("DELETE", "/api/v4/file-urls/batch")).toBeNull();
   });
 
   it("treats historical built-in service permission as enough for MinerU", () => {

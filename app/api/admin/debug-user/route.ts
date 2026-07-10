@@ -6,49 +6,36 @@ import { requireAdminSession } from "@/app/api/admin/_auth";
 
 import { NextResponse } from 'next/server';
 import { sql } from '@vercel/postgres';
-import { getBuiltInAPIService } from '@/lib/built-in-api-service';
 
 export async function GET(req: Request) {
   const unauthorized = await requireAdminSession();
   if (unauthorized) return unauthorized;
   try {
     const url = new URL(req.url);
-    const userId = url.searchParams.get('userId') || 'zhuzhu1528875@gmail.com';
+    const userId = url.searchParams.get('userId')?.trim();
+    if (!userId) {
+      return NextResponse.json({ error: 'userId is required' }, { status: 400 });
+    }
 
     console.log(`[Debug] Checking authorization for user: ${userId}`);
 
     // 1. Check database directly
     console.log('[Debug] Step 1: Checking database...');
     const { rows } = await sql`
-      SELECT * FROM authorized_users WHERE user_id = ${userId}
+      SELECT user_id, email, name, status, can_use_built_in_services,
+             allowed_services, daily_requests, monthly_requests
+      FROM authorized_users
+      WHERE user_id = ${userId}
     `;
 
     const dbUser = rows[0];
     console.log('[Debug] Database user:', JSON.stringify(dbUser, null, 2));
 
-    // 2. Check through service
-    console.log('[Debug] Step 2: Checking through service...');
-    const builtInService = getBuiltInAPIService();
-    await builtInService.initialize();
-
-    const isAuthorized = await builtInService.checkUserAuthorization(userId);
-    console.log('[Debug] Service authorization result:', isAuthorized);
-
-    const allUsers = await builtInService.getAllAuthorizedUsers();
-    console.log('[Debug] Total users in service:', allUsers.length);
-    
-    const serviceUser = allUsers.find(u => u.userId === userId);
-    console.log('[Debug] Service user:', JSON.stringify(serviceUser, null, 2));
-
-    // 3. Get available services
-    console.log('[Debug] Step 3: Getting available services...');
-    const services = await builtInService.getAvailableServices(userId);
-    console.log('[Debug] Available services:', services.length);
-
-    // 4. Get current status
-    console.log('[Debug] Step 4: Getting current status...');
-    const status = await builtInService.getCurrentServiceStatus(userId);
-    console.log('[Debug] Current status:', JSON.stringify(status, null, 2));
+    const isAuthorized = Boolean(
+      dbUser &&
+      dbUser.status === 'active' &&
+      dbUser.can_use_built_in_services === true
+    );
 
     return NextResponse.json({
       userId,
@@ -65,18 +52,12 @@ export async function GET(req: Request) {
           monthly_requests: dbUser.monthly_requests,
         } : null
       },
-      service: {
-        isAuthorized,
-        totalUsers: allUsers.length,
-        user: serviceUser,
-        availableServices: services.length,
-        currentStatus: status
-      },
       diagnosis: {
         databaseUserExists: !!dbUser,
-        serviceUserExists: !!serviceUser,
         isAuthorized,
-        hasServices: services.length > 0,
+        hasConfiguredServices: Array.isArray(dbUser?.allowed_services)
+          ? dbUser.allowed_services.length > 0
+          : false,
         issues: []
       }
     });
@@ -84,8 +65,7 @@ export async function GET(req: Request) {
   } catch (error) {
     console.error('[Debug] Error:', error);
     return NextResponse.json({
-      error: error instanceof Error ? error.message : 'Unknown error',
-      stack: error instanceof Error ? error.stack : undefined
+      error: 'User diagnostic failed'
     }, { status: 500 });
   }
 }

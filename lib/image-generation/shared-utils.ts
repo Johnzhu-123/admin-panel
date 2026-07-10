@@ -9,8 +9,8 @@ import {
     RawReferenceImage,
     StyleReferenceImage,
 } from "@google/genai";
-import { queuedFetch } from "@/lib/request-queue-manager";
 import { normalizeBase64Payload } from "@/lib/image-generation/response-url";
+import { fetchPublicHttpUrl } from "@/lib/network/public-url";
 
 // ==================== Type Definitions ====================
 
@@ -345,13 +345,18 @@ export const fetchRemoteImageAsBase64 = async (url: string, signal?: AbortSignal
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
         const effectiveSignal = signal || AbortSignal.timeout(FETCH_TIMEOUT_MS);
         try {
-            const response = await queuedFetch(
+            const response = await fetchPublicHttpUrl(
                 url,
                 {
                     headers: { "User-Agent": "md2pptWin-image/1.0" },
                     signal: effectiveSignal,
                 },
-                "high"
+                {
+                    description: "Remote generated image URL",
+                    allowHttp: false,
+                    allowPrivateNetwork: false,
+                    maxRedirects: 3,
+                }
             );
             if (!response.ok) {
                 lastError = new Error(`Remote image URL responded with ${response.status}`);
@@ -656,10 +661,15 @@ export const coerceImageValueToBase64 = async (
     // http(s) URL → 下载并 base64 化
     if (/^https?:\/\//i.test(extracted)) {
         try {
-            const res = await queuedFetch(
+            const res = await fetchPublicHttpUrl(
                 extracted,
                 { signal: AbortSignal.timeout(timeoutMs) },
-                "low"
+                {
+                    description: "Generated image download URL",
+                    allowHttp: false,
+                    allowPrivateNetwork: false,
+                    maxRedirects: 3,
+                }
             );
             if (!res.ok) {
                 console.warn(

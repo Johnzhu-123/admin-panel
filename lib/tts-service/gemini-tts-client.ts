@@ -59,11 +59,18 @@ export class GeminiTTSClient {
   private apiKey: string;
   private baseUrl: string;
   private model: string;
+  private request: (input: string, init: RequestInit) => Promise<Response>;
 
-  constructor(apiKey: string, baseUrl?: string, model?: string) {
+  constructor(
+    apiKey: string,
+    baseUrl?: string,
+    model?: string,
+    request: (input: string, init: RequestInit) => Promise<Response> = fetch
+  ) {
     this.apiKey = apiKey;
     this.baseUrl = (baseUrl || "https://generativelanguage.googleapis.com").replace(/\/+$/, "");
     this.model = model?.trim() || "gemini-2.5-flash-preview-tts";
+    this.request = request;
   }
 
   async checkStatus(): Promise<TTSServiceStatus> {
@@ -86,11 +93,14 @@ export class GeminiTTSClient {
     const voiceName =
       request.geminiVoiceName || request.voice || "Charon";
 
-    const url = `${this.baseUrl}/v1beta/models/${this.model}:generateContent?key=${this.apiKey}`;
+    const url = `${this.baseUrl}/v1beta/models/${this.model}:generateContent`;
 
-    const res = await fetch(url, {
+    const res = await this.request(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": this.apiKey,
+      },
       body: JSON.stringify({
         contents: [
           {

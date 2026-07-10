@@ -21,6 +21,10 @@ import {
   serverReadErrorMessage,
 } from "@/lib/network/server-fetch-with-retry";
 import {
+  requireClaimedServicePrincipal,
+  ServicePrincipalError,
+} from "@/lib/auth/service-principal";
+import {
   describeOpenAiCompatibleEmptyReason,
   extractOpenAiCompatibleError,
   extractOpenAiCompatibleText,
@@ -40,6 +44,14 @@ import {
   type OpenAiCompatibleTokenLimitParam,
 } from "@/lib/built-in-api-service/analyze-request";
 import type { BuiltInServiceCategory } from "@/lib/built-in-api-service/db";
+import {
+  BuiltInQuotaError,
+  runWithBuiltInQuota,
+} from "@/lib/built-in-api-service/legacy-quota";
+import {
+  fetchPublicHttpUrl,
+  shouldAllowPrivateNetworkAccess,
+} from "@/lib/network/public-url";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -291,6 +303,7 @@ const runOpenAiCompatibleAnalyzeRequest = async (options: {
   images: InlineImage[];
   maxOutputTokens: number;
   outputMode: AnalyzeOutputMode;
+  request: (url: string, init: RequestInit) => Promise<Response>;
 }) => {
   const normalizedBaseUrl = normalizeOpenAiBaseUrl(options.baseUrl);
   const openAiAuthHeader = normalizeOpenAiAuthHeader(options.authHeader);
@@ -382,6 +395,7 @@ const runOpenAiCompatibleAnalyzeRequest = async (options: {
         retries: 2,
         retryDelayMs: 2500,
         timeoutMs: ANALYZE_REQUEST_TIMEOUT_MS,
+        request: options.request,
       }
     );
 
@@ -459,6 +473,7 @@ const runOpenAiCompatibleAnalyzeRequest = async (options: {
       try {
         return await runAttempt(candidateModel, false, tokenLimitParam);
       } catch (firstError) {
+        if (firstError instanceof BuiltInQuotaError) throw firstError;
         firstErrorMessage = formatAsciiCodecCompatMessage(
           firstError instanceof Error ? firstError.message : String(firstError || "")
         );
@@ -479,6 +494,7 @@ const runOpenAiCompatibleAnalyzeRequest = async (options: {
         try {
           return await runAttempt(candidateModel, true, tokenLimitParam);
         } catch (retryError) {
+          if (retryError instanceof BuiltInQuotaError) throw retryError;
           const retryErrorMessage = formatAsciiCodecCompatMessage(
             retryError instanceof Error ? retryError.message : String(retryError || "")
           );
@@ -516,6 +532,7 @@ const streamOpenAiCompatibleAnalyzeRequest = async (options: {
   prompt: string;
   maxOutputTokens: number;
   outputMode: AnalyzeOutputMode;
+  request: (url: string, init: RequestInit) => Promise<Response>;
 }): Promise<Response> => {
   const normalizedBaseUrl = normalizeOpenAiBaseUrl(options.baseUrl);
   const openAiAuthHeader = normalizeOpenAiAuthHeader(options.authHeader);
@@ -578,9 +595,11 @@ const streamOpenAiCompatibleAnalyzeRequest = async (options: {
         retries: 1,
         retryDelayMs: 0,
         timeoutMs: ANALYZE_REQUEST_TIMEOUT_MS,
+        request: options.request,
       }
     );
   } catch (fetchError) {
+    if (fetchError instanceof BuiltInQuotaError) throw fetchError;
     const fetchMessage =
       fetchError instanceof Error
         ? fetchError.message
@@ -650,6 +669,7 @@ const streamOpenAiCompatibleAnalyzeRequest = async (options: {
 export async function POST(req: Request) {
   try {
     let body = await req.json();
+    let builtInQuota: { userId: string; serviceId: string } | null = null;
 
     const hasImages = Array.isArray(body?.images) && body.images.length > 0;
 
@@ -657,18 +677,31 @@ export async function POST(req: Request) {
     // 素材中心综合分析是 text-only：桌面端会传 builtInCategory="text"。
     // 旧代码硬编码 multimodal，会把 text 模型和 multimodal baseUrl/apiKey 拼错。
     if (body?.useBuiltInService === true) {
+      const claimedUserId = typeof body?.userId === "string" ? body.userId : "";
+      const principal = await requireClaimedServicePrincipal(req, claimedUserId);
+      body = {
+        ...body,
+        userId:
+          principal.resolvedUserId || claimedUserId || principal.email || principal.userId,
+      };
       const resolvedCategory = resolveBuiltInAnalyzeCategory({
         builtInCategory: body?.builtInCategory,
         forceTextOnly: body?.forceTextOnly === true,
         analysisMode: body?.analysisMode,
         hasImages,
       });
-      const { body: enriched, applied } = await injectBuiltInCategoryConfig(
+      const { body: enriched, applied, config } = await injectBuiltInCategoryConfig(
         body as Record<string, unknown>,
         resolvedCategory as BuiltInServiceCategory
       );
       if (applied) {
         body = enriched;
+        builtInQuota = config
+          ? {
+              userId: String(body.userId || ""),
+              serviceId: `built-in-${resolvedCategory}-${config.subtaskId}`,
+            }
+          : null;
       } else {
         return NextResponse.json(
           { error: `${resolvedCategory} 服务未在管理后台启用或配置` },
@@ -676,6 +709,20 @@ export async function POST(req: Request) {
         );
       }
     }
+
+    const requestUpstream = (url: string, init: RequestInit) => {
+      const allowPrivateNetwork = shouldAllowPrivateNetworkAccess();
+      const dispatch = () =>
+        fetchPublicHttpUrl(url, init, {
+          description: "Analyze materials upstream",
+          allowHttp: allowPrivateNetwork,
+          allowPrivateNetwork,
+          maxRedirects: 0,
+        });
+      return builtInQuota
+        ? runWithBuiltInQuota({ ...builtInQuota, dispatch })
+        : dispatch();
+    };
 
     let provider =
       body.provider === "openai"
@@ -744,6 +791,7 @@ export async function POST(req: Request) {
         prompt: promptForTextChannel,
         maxOutputTokens: requestedMaxOutputTokens,
         outputMode: analysisOutputMode,
+        request: requestUpstream,
       });
     }
 
@@ -816,6 +864,7 @@ export async function POST(req: Request) {
             retries: 3,
             retryDelayMs: 2500,
             timeoutMs: ANALYZE_REQUEST_TIMEOUT_MS,
+            request: requestUpstream,
           }
         );
 
@@ -848,6 +897,7 @@ export async function POST(req: Request) {
               retries: 3,
               retryDelayMs: 2500,
               timeoutMs: ANALYZE_REQUEST_TIMEOUT_MS,
+              request: requestUpstream,
             }
           );
         }
@@ -865,6 +915,7 @@ export async function POST(req: Request) {
 
         return NextResponse.json({ text }, { headers: noStoreHeaders() });
       } catch (geminiError) {
+        if (geminiError instanceof BuiltInQuotaError) throw geminiError;
         recordFailureLog({
           provider,
           operation: "gemini.generateContent.rest (analyze-materials)",
@@ -910,6 +961,7 @@ export async function POST(req: Request) {
             images,
             maxOutputTokens: requestedMaxOutputTokens,
             outputMode: analysisOutputMode,
+            request: requestUpstream,
           });
           return NextResponse.json({ text }, { headers: noStoreHeaders() });
         } catch (openAiCompatError) {
@@ -943,7 +995,9 @@ export async function POST(req: Request) {
       images,
       maxOutputTokens: requestedMaxOutputTokens,
       outputMode: analysisOutputMode,
+      request: requestUpstream,
     }).catch(async (openAiError) => {
+      if (openAiError instanceof BuiltInQuotaError) throw openAiError;
       const fallbackModel = (
         images.length
           ? body.openAiVisionModel || body.openAiTextModel || body.model
@@ -1010,6 +1064,7 @@ export async function POST(req: Request) {
             retries: 3,
             retryDelayMs: 2500,
             timeoutMs: ANALYZE_REQUEST_TIMEOUT_MS,
+            request: requestUpstream,
           }
         );
 
@@ -1041,6 +1096,7 @@ export async function POST(req: Request) {
               retries: 3,
               retryDelayMs: 2500,
               timeoutMs: ANALYZE_REQUEST_TIMEOUT_MS,
+              request: requestUpstream,
             }
           );
         }
@@ -1094,6 +1150,18 @@ export async function POST(req: Request) {
 
     return NextResponse.json({ text }, { headers: noStoreHeaders() });
   } catch (error) {
+    if (error instanceof BuiltInQuotaError) {
+      return NextResponse.json(
+        { error: error.message },
+        { status: error.status, headers: noStoreHeaders() }
+      );
+    }
+    if (error instanceof ServicePrincipalError) {
+      return NextResponse.json(
+        { error: error.message },
+        { status: error.status, headers: noStoreHeaders() }
+      );
+    }
     const message = formatAsciiCodecCompatMessage(
       error instanceof Error ? error.message : "Failed to analyze materials."
     );

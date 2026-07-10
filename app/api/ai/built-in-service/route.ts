@@ -13,14 +13,15 @@ import {
   getSubtaskPresets,
   getUserServiceUsageStats,
 } from "@/lib/built-in-api-service/db";
+import { requireAdminSession } from "@/app/api/admin/_auth";
+import {
+  requireServicePrincipal,
+  ServicePrincipal,
+  ServicePrincipalError,
+} from "@/lib/auth/service-principal";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-const normalizeRemoteBase = (base?: string) =>
-  (base || "").trim().replace(/\/+$/, "");
-
-const BUILT_IN_PROXY_HEADER = "x-built-in-service-server-url";
 
 const normalizeIdentifier = (value?: string) => (value || "").trim().toLowerCase();
 
@@ -50,65 +51,57 @@ const shouldRefreshCache = (url: URL) => {
   return value === "1" || value === "true" || value === "yes";
 };
 
-const getRemoteServiceBase = (req: Request) => {
-  const fromHeader = normalizeRemoteBase(req.headers.get(BUILT_IN_PROXY_HEADER) || "");
-  if (fromHeader && process.env.ELECTRON_DESKTOP === "1") {
-    return fromHeader;
-  }
-  const raw =
-    process.env.BUILT_IN_SERVICE_SERVER_URL ||
-    process.env.NEXT_PUBLIC_BUILT_IN_SERVICE_SERVER_URL ||
-    "";
-  const normalized = normalizeRemoteBase(raw);
-  if (!normalized) return "";
-  if (process.env.ELECTRON_DESKTOP !== "1") return "";
-  return normalized;
+const GET_ADMIN_ACTIONS = new Set([
+  "system-stats",
+  "export-usage",
+  "service-health",
+  "error-recovery-stats",
+  "health",
+]);
+const POST_ADMIN_ACTIONS = new Set([
+  "add-user",
+  "remove-user",
+  "recover-from-error",
+  "reset-error-recovery",
+]);
+
+const principalMatchesClaim = (principal: ServicePrincipal, claimed?: string | null) => {
+  if (!claimed) return true;
+  const normalized = normalizeIdentifier(claimed);
+  return (
+    normalized === normalizeIdentifier(principal.userId) ||
+    Boolean(principal.email && normalized === normalizeIdentifier(principal.email))
+  );
 };
 
-const proxyToRemote = async (req: Request) => {
-  const remoteBase = getRemoteServiceBase(req);
-  if (!remoteBase) return null;
-
-  const incoming = new URL(req.url);
-  const targetUrl = `${remoteBase}${incoming.pathname}${incoming.search}`;
-  const method = req.method || "GET";
-  const bodyText = method === "GET" || method === "HEAD" ? undefined : await req.text();
-
-  const response = await fetch(targetUrl, {
-    method,
-    headers: {
-      "Content-Type": "application/json",
-      ...(req.headers.get(BUILT_IN_PROXY_HEADER)
-        ? { [BUILT_IN_PROXY_HEADER]: req.headers.get(BUILT_IN_PROXY_HEADER) || "" }
-        : {}),
-    },
-    body: bodyText,
-    cache: "no-store",
-  });
-
-  const text = await response.text();
-  try {
-    const data = text ? JSON.parse(text) : {};
-    return NextResponse.json(data, {
-      status: response.status,
-      headers: noStoreHeaders(),
-    });
-  } catch {
-    return new NextResponse(text, {
-      status: response.status,
-      headers: noStoreHeaders(),
-    });
+const principalErrorResponse = (error: unknown) => {
+  if (error instanceof ServicePrincipalError) {
+    return NextResponse.json(
+      { error: error.message },
+      { status: error.status, headers: noStoreHeaders() }
+    );
   }
+  return null;
 };
 
 export async function GET(req: Request) {
-  const proxied = await proxyToRemote(req);
-  if (proxied) return proxied;
-
   try {
+    const principal = await requireServicePrincipal(req);
     const url = new URL(req.url);
     const action = url.searchParams.get('action');
-    const userId = url.searchParams.get('userId');
+    const claimedUserId = url.searchParams.get('userId');
+    if (!principalMatchesClaim(principal, claimedUserId)) {
+      return NextResponse.json(
+        { error: "Claimed user does not match the authenticated principal" },
+        { status: 403, headers: noStoreHeaders() }
+      );
+    }
+    const userId = principal.userId;
+
+    if (action && GET_ADMIN_ACTIONS.has(action)) {
+      const unauthorized = await requireAdminSession();
+      if (unauthorized) return unauthorized;
+    }
 
     if (action === 'runtime-settings') {
       const runtimeSettings = await getBuiltInRuntimeSettings();
@@ -127,13 +120,6 @@ export async function GET(req: Request) {
           },
         },
         { headers: noStoreHeaders() }
-      );
-    }
-
-    if (!userId) {
-      return NextResponse.json(
-        { error: "Missing userId parameter" },
-        { status: 400, headers: noStoreHeaders() }
       );
     }
 
@@ -350,6 +336,8 @@ export async function GET(req: Request) {
         );
     }
   } catch (error) {
+    const authError = principalErrorResponse(error);
+    if (authError) return authError;
     console.error('Built-in service GET error:', error);
     return NextResponse.json(
       { 
@@ -362,18 +350,25 @@ export async function GET(req: Request) {
 }
 
 export async function POST(req: Request) {
-  const proxied = await proxyToRemote(req);
-  if (proxied) return proxied;
-
   try {
+    const principal = await requireServicePrincipal(req);
     const body = await req.json();
-    const { userId, action, serviceId, customConfig } = body;
-
-    if (!userId) {
+    const { userId: claimedUserId, action, serviceId, customConfig } = body;
+    const isAdminAction = POST_ADMIN_ACTIONS.has(action);
+    if (!isAdminAction && !principalMatchesClaim(principal, claimedUserId)) {
       return NextResponse.json(
-        { error: "Missing userId" },
-        { status: 400, headers: noStoreHeaders() }
+        { error: "Claimed user does not match the authenticated principal" },
+        { status: 403, headers: noStoreHeaders() }
       );
+    }
+    const userId =
+      typeof claimedUserId === "string" && isAdminAction
+        ? claimedUserId
+        : principal.userId;
+
+    if (isAdminAction) {
+      const unauthorized = await requireAdminSession();
+      if (unauthorized) return unauthorized;
     }
 
     const builtInService = getBuiltInAPIService();
@@ -463,6 +458,8 @@ export async function POST(req: Request) {
         );
     }
   } catch (error) {
+    const authError = principalErrorResponse(error);
+    if (authError) return authError;
     console.error('Built-in service POST error:', error);
     return NextResponse.json(
       { 

@@ -13,6 +13,8 @@ export type ServerFetchWithRetryOptions = {
   retryOnStatuses?: number[];
   retryOnError?: (error: unknown) => boolean;
   retryOnResponse?: (response: Response) => boolean;
+  /** Optional security/observability boundary invoked for every physical attempt. */
+  request?: (input: string, init: RequestInit) => Promise<Response>;
 };
 
 // 注：520-527、530 这类 Cloudflare 网关错误**不**加入默认重试集合（与 fetch-with-retry.ts 同步）。
@@ -44,9 +46,10 @@ const getElectronFetch = (): typeof fetch | null => {
       net?: { fetch?: typeof fetch };
       session?: { defaultSession?: { fetch?: typeof fetch } };
     };
-    const sessionFetch = electron.session?.defaultSession?.fetch;
+    const defaultSession = electron.session?.defaultSession;
+    const sessionFetch = defaultSession?.fetch;
     if (typeof sessionFetch === "function") {
-      return sessionFetch.bind(electron.session.defaultSession);
+      return sessionFetch.bind(defaultSession);
     }
     const netFetch = electron.net?.fetch;
     if (typeof netFetch === "function") {
@@ -162,7 +165,9 @@ export async function serverFetchWithRetry(
     retryOnResponse,
   } = options;
 
-  const fetchCandidates = getServerFetchCandidates();
+  const fetchCandidates = options.request
+    ? [{ name: "custom-request", fetchImpl: options.request as typeof fetch }]
+    : getServerFetchCandidates();
   let lastError: unknown = null;
 
   for (let attempt = 0; attempt < retries; attempt += 1) {

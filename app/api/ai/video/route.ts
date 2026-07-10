@@ -1,11 +1,16 @@
 import { NextResponse } from "next/server";
 import { noStoreHeaders } from "@/lib/ai";
-import { assertPublicHttpUrl } from "@/lib/network/public-url";
-import {
-  serverFetchWithRetry,
-  serverReadErrorMessage,
-} from "@/lib/network/server-fetch-with-retry";
+import { fetchPublicHttpUrl } from "@/lib/network/public-url";
+import { serverReadErrorMessage } from "@/lib/network/server-fetch-with-retry";
 import { injectBuiltInCategoryConfig } from "@/lib/built-in-api-service/apply-cloud-config";
+import {
+  requireClaimedServicePrincipal,
+  ServicePrincipalError,
+} from "@/lib/auth/service-principal";
+import {
+  BuiltInQuotaError,
+  runWithBuiltInQuota,
+} from "@/lib/built-in-api-service/legacy-quota";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -13,7 +18,6 @@ export const maxDuration = 900;
 
 const MAX_VIDEO_UPSTREAM_BODY_CHARS = 8_000_000;
 
-const BUILT_IN_PROXY_HEADER = "x-built-in-service-server-url";
 const normalizeRemoteBase = (base?: string) =>
   (base || "").trim().replace(/\/+$/, "");
 
@@ -57,17 +61,6 @@ const buildBuiltInVideoEndpoint = (baseUrl: string, endpointPath?: string) => {
     }
   }
   return `${normalized}/chat/completions`;
-};
-
-const shouldReplaceBuiltInVideoEndpoint = (endpointUrl: string) => {
-  if (!endpointUrl.trim()) return true;
-  try {
-    const parsed = new URL(endpointUrl);
-    const path = parsed.pathname.replace(/\/+$/, "");
-    return /\/(?:video\/generations|videos|generate)$/i.test(path);
-  } catch {
-    return /\/(?:video\/generations|videos|generate)\/?$/i.test(endpointUrl);
-  }
 };
 
 const isChatCompletionsEndpoint = (endpointUrl: string) => {
@@ -138,19 +131,6 @@ const normalizeVideoPayloadForChatCompletions = (
   };
 };
 
-const getRemoteBuiltInBase = (req: Request) => {
-  const fromHeader = normalizeRemoteBase(req.headers.get(BUILT_IN_PROXY_HEADER) || "");
-  if (fromHeader && process.env.ELECTRON_DESKTOP === "1") return fromHeader;
-  const raw =
-    process.env.BUILT_IN_SERVICE_SERVER_URL ||
-    process.env.NEXT_PUBLIC_BUILT_IN_SERVICE_SERVER_URL ||
-    "";
-  const normalized = normalizeRemoteBase(raw);
-  if (!normalized) return "";
-  if (process.env.ELECTRON_DESKTOP !== "1") return "";
-  return normalized;
-};
-
 type VideoProxyRequest = {
   endpointUrl?: string;
   apiKey?: string;
@@ -187,12 +167,27 @@ async function recordBuiltInVideoUsage(
 export async function POST(request: Request) {
   const startedAt = Date.now();
   let bodyForUsage: VideoProxyRequest | null = null;
+  let builtInQuota: { userId: string; serviceId: string } | null = null;
   try {
     let body = (await request.json()) as VideoProxyRequest;
     bodyForUsage = body;
 
     // admin-panel 端：useBuiltInService=true 时从 catalog 注入 endpointUrl/apiKey
     if (body?.useBuiltInService === true) {
+      try {
+        const principal = await requireClaimedServicePrincipal(request, body.userId);
+        body.userId =
+          principal.resolvedUserId || body.userId || principal.email || principal.userId;
+        bodyForUsage = body;
+      } catch (error) {
+        const status = error instanceof ServicePrincipalError ? error.status : 401;
+        const message =
+          error instanceof ServicePrincipalError ? error.message : "身份验证失败";
+        return NextResponse.json(
+          { error: message },
+          { status, headers: noStoreHeaders() }
+        );
+      }
       const { body: enriched, applied, config } = await injectBuiltInCategoryConfig(
         body as unknown as Record<string, unknown>,
         "video",
@@ -214,22 +209,25 @@ export async function POST(request: Request) {
         ) {
           merged.payload = { ...merged.payload, model: config.model };
         }
-        const currentEndpoint =
-          typeof merged.endpointUrl === "string" ? merged.endpointUrl.trim() : "";
-        const replacedEndpoint =
-          !!config.endpointPath || shouldReplaceBuiltInVideoEndpoint(currentEndpoint);
-        if (replacedEndpoint) {
-          merged.endpointUrl = buildBuiltInVideoEndpoint(config.baseUrl, config.endpointPath);
-        }
+        // The catalog endpoint and key are one security capability. Never retain a
+        // caller-supplied endpoint while injecting the server-owned key.
+        merged.endpointUrl = buildBuiltInVideoEndpoint(config.baseUrl, config.endpointPath);
         if (isChatCompletionsEndpoint(merged.endpointUrl || "")) {
           merged.payload = normalizeVideoPayloadForChatCompletions(
             merged.payload || null,
             config.model
           ) || merged.payload;
         }
-        if (!merged.apiKey) merged.apiKey = config.apiKey;
+        merged.apiKey = config.apiKey;
+        if (merged.payload) {
+          merged.payload = { ...merged.payload, model: config.model };
+        }
         body = merged;
         bodyForUsage = body;
+        builtInQuota = {
+          userId: String(body.userId || ""),
+          serviceId: `built-in-video-${config.subtaskId}`,
+        };
       } else {
         await recordBuiltInVideoUsage(bodyForUsage, false, startedAt, "视频服务未在管理后台启用或配置");
         return NextResponse.json(
@@ -278,28 +276,6 @@ export async function POST(request: Request) {
     const allowPrivateNetwork =
       process.env.MD2PPT_ALLOW_PRIVATE_API_PROXY === "1";
 
-    let safeEndpointUrl: URL;
-    try {
-      safeEndpointUrl = await assertPublicHttpUrl(endpointUrl, {
-        description: "视频接口地址",
-        allowPrivateNetwork,
-      });
-    } catch (error) {
-      await recordBuiltInVideoUsage(
-        bodyForUsage,
-        false,
-        startedAt,
-        error instanceof Error ? error.message : "缺少有效的视频接口地址。"
-      );
-      return NextResponse.json(
-        {
-          error:
-            error instanceof Error ? error.message : "缺少有效的视频接口地址。",
-        },
-        { status: 400, headers: noStoreHeaders() }
-      );
-    }
-
     const headers: Record<string, string> = {
       Accept: "application/json, text/event-stream;q=0.9, */*;q=0.8",
     };
@@ -310,22 +286,58 @@ export async function POST(request: Request) {
       headers.Authorization = `Bearer ${apiKey}`;
     }
 
-    const upstream = await serverFetchWithRetry(
-      safeEndpointUrl.toString(),
-      {
-        method,
-        headers,
-        body: upstreamBody,
-        cache: "no-store",
-        redirect: "error",
-      },
-      {
-        retries: method === "GET" ? 2 : 1,
-        retryDelayMs: 2500,
-        timeoutMs: 30 * 60 * 1000,
-        retryOnStatuses: method === "GET" ? undefined : [],
+    let upstream: Response;
+    try {
+      const attempts = method === "GET" ? 3 : 1;
+      let lastError: unknown;
+      let response: Response | null = null;
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
+        try {
+          const dispatch = () =>
+            fetchPublicHttpUrl(
+              endpointUrl,
+              {
+                method,
+                headers,
+                body: upstreamBody,
+                cache: "no-store",
+                signal: AbortSignal.timeout(30 * 60 * 1000),
+              },
+              {
+                description: "视频接口地址",
+                allowHttp: allowPrivateNetwork,
+                allowPrivateNetwork,
+                maxRedirects: 0,
+              }
+            );
+          response = builtInQuota
+            ? await runWithBuiltInQuota({ ...builtInQuota, dispatch })
+            : await dispatch();
+          if (method !== "GET" || response.status < 500 || attempt === attempts - 1) {
+            break;
+          }
+          await response.body?.cancel().catch(() => undefined);
+          response = null;
+        } catch (error) {
+          lastError = error;
+          if (attempt === attempts - 1) throw error;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 2500));
       }
-    );
+      if (!response) throw lastError || new Error("视频上游请求失败");
+      upstream = response;
+    } catch (error) {
+      await recordBuiltInVideoUsage(
+        bodyForUsage,
+        false,
+        startedAt,
+        error instanceof Error ? error.message : "视频上游请求失败"
+      );
+      return NextResponse.json(
+        { error: error instanceof Error ? error.message : "视频上游请求失败" },
+        { status: 502, headers: noStoreHeaders() }
+      );
+    }
 
     if (!upstream.ok) {
       const detail = await serverReadErrorMessage(upstream);
@@ -352,6 +364,18 @@ export async function POST(request: Request) {
       },
     });
   } catch (error) {
+    if (error instanceof BuiltInQuotaError) {
+      await recordBuiltInVideoUsage(
+        bodyForUsage,
+        false,
+        startedAt,
+        error.message
+      );
+      return NextResponse.json(
+        { error: error.message },
+        { status: error.status, headers: noStoreHeaders() }
+      );
+    }
     await recordBuiltInVideoUsage(
       bodyForUsage,
       false,

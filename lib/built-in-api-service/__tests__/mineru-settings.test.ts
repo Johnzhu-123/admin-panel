@@ -1,10 +1,26 @@
 import {
   DEFAULT_MINERU_RUNTIME_SETTINGS,
   mergeMinerURuntimeSettings,
+  saveMinerURuntimeSettings,
   sanitizeMinerURuntimeSettings,
 } from "../mineru-settings";
+import { setSystemSetting } from "../db";
+
+jest.mock("../db", () => ({
+  getSystemSetting: jest.fn().mockResolvedValue(null),
+  initializeSystemSettingsTable: jest.fn().mockResolvedValue(undefined),
+  setSystemSetting: jest.fn(),
+}));
+
+const mockSetSystemSetting = setSystemSetting as jest.MockedFunction<
+  typeof setSystemSetting
+>;
 
 describe("MinerU runtime settings", () => {
+  beforeEach(() => {
+    mockSetSystemSetting.mockReset();
+  });
+
   it("normalizes admin-managed MinerU token, endpoint, and defaults", () => {
     const merged = mergeMinerURuntimeSettings(DEFAULT_MINERU_RUNTIME_SETTINGS, {
       enabled: true,
@@ -59,5 +75,27 @@ describe("MinerU runtime settings", () => {
     expect(sanitized.apiToken).toBeUndefined();
     expect(sanitized.apiTokenConfigured).toBe(true);
     expect(sanitized.apiTokenMask).toMatch(/^mine\*+oken$/);
+  });
+
+  it("does not persist a plaintext token in production without encryption", async () => {
+    const previousNodeEnv = process.env.NODE_ENV;
+    const previousKey = process.env.BUILT_IN_ENCRYPTION_KEY;
+    const previousKeyId = process.env.BUILT_IN_ENCRYPTION_KEY_ID;
+    (process.env as Record<string, string | undefined>).NODE_ENV = "production";
+    delete process.env.BUILT_IN_ENCRYPTION_KEY;
+    delete process.env.BUILT_IN_ENCRYPTION_KEY_ID;
+
+    try {
+      await expect(
+        saveMinerURuntimeSettings({ apiToken: "must-not-be-plaintext" })
+      ).rejects.toThrow(/encryption key/i);
+      expect(mockSetSystemSetting).not.toHaveBeenCalled();
+    } finally {
+      (process.env as Record<string, string | undefined>).NODE_ENV = previousNodeEnv;
+      if (previousKey === undefined) delete process.env.BUILT_IN_ENCRYPTION_KEY;
+      else process.env.BUILT_IN_ENCRYPTION_KEY = previousKey;
+      if (previousKeyId === undefined) delete process.env.BUILT_IN_ENCRYPTION_KEY_ID;
+      else process.env.BUILT_IN_ENCRYPTION_KEY_ID = previousKeyId;
+    }
   });
 });

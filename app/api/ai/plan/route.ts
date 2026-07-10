@@ -16,6 +16,15 @@ import { recordFailureLog } from "@/lib/diagnostics";
 import { enhanceOpenAICompatibility } from "@/lib/api-compatibility/integration";
 // 🔧 FIX (2026-06-11 S-2/BUG-D1): reasoning 模型防护执行器（三件套 + 兼容回退）
 import { executeOpenAiChatWithCompatRetries } from "@/lib/network/openai-chat-attempt";
+import {
+  requireClaimedServicePrincipal,
+  ServicePrincipalError,
+} from "@/lib/auth/service-principal";
+import {
+  BuiltInQuotaError,
+  runWithBuiltInQuota,
+} from "@/lib/built-in-api-service/legacy-quota";
+import { fetchPublicHttpUrl } from "@/lib/network/public-url";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -73,7 +82,11 @@ export async function POST(req: Request) {
           : "gemini";
     let apiKey = (body.apiKey || "").trim();
     const useBuiltInService = body.useBuiltInService === true;
-    const userId = (body.userId || "").trim();
+    let userId = (body.userId || "").trim();
+    if (useBuiltInService) {
+      const principal = await requireClaimedServicePrincipal(req, userId);
+      userId = principal.resolvedUserId || userId || principal.email || principal.userId;
+    }
     const prompt = (body.prompt || "").trim();
 
     // Debug logging（🔧 FIX 2026-06-11 BUG-D7: 仅 DEBUG_AI_ROUTES=1 时输出）
@@ -169,6 +182,22 @@ export async function POST(req: Request) {
         ...buildOpenAiHeaders(apiKey, true, openAiAuthHeader),
       },
       model,
+      request: builtInConfig
+        ? (url, init) =>
+            runWithBuiltInQuota({
+              userId,
+              serviceId: builtInConfig.id,
+              dispatch: () =>
+                fetchPublicHttpUrl(url, init, {
+                  description: "Built-in plan endpoint",
+                  allowHttp:
+                    process.env.MD2PPT_ALLOW_PRIVATE_API_PROXY === "1",
+                  allowPrivateNetwork:
+                    process.env.MD2PPT_ALLOW_PRIVATE_API_PROXY === "1",
+                  maxRedirects: 0,
+                }),
+            })
+        : undefined,
       temperature: 0.6,
       maxOutputTokens: Number(body.maxTokens) > 0 ? Number(body.maxTokens) : undefined,
       messages: [
@@ -277,6 +306,18 @@ export async function POST(req: Request) {
       { headers: noStoreHeaders() }
     );
   } catch (error) {
+    if (error instanceof BuiltInQuotaError) {
+      return NextResponse.json(
+        { error: error.message },
+        { status: error.status, headers: noStoreHeaders() }
+      );
+    }
+    if (error instanceof ServicePrincipalError) {
+      return NextResponse.json(
+        { error: error.message },
+        { status: error.status, headers: noStoreHeaders() }
+      );
+    }
     const message =
       error instanceof Error ? error.message : "Failed to generate plan.";
     const errorCause =

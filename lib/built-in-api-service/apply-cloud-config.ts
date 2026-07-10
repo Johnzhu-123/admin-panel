@@ -88,7 +88,8 @@ export async function resolveBuiltInCategoryConfig(
 
 /**
  * 注入 catalog 配置到请求 body：
- * - 若 body 已显式提供 apiKey 且非空，则保留用户配置（仅当 force=true 时覆盖）
+ * - 内置模式的 BaseURL/API key 必须始终成对来自 catalog，禁止把服务器密钥
+ *   与调用方提供的公网地址组合，否则会形成凭据外泄。
  * - 若 body.useBuiltInService 不为 true，直接返回 body
  * - baseUrl/model 同上策略
  */
@@ -101,26 +102,17 @@ export function applyBuiltInConfigToBody<T extends Record<string, unknown>>(
   if (body?.useBuiltInService !== true) return body;
 
   const next: Record<string, unknown> = { ...body };
-  const force = options.force === true;
-
   for (const key of RESOLVED_BASE_URL_KEYS) {
-    const current = typeof next[key] === "string" ? (next[key] as string).trim() : "";
-    if (force || !current) {
-      next[key] = config.baseUrl;
-    }
+    next[key] = config.baseUrl;
   }
-
-  const currentApiKey = typeof next.apiKey === "string" ? (next.apiKey as string).trim() : "";
-  if (force || !currentApiKey) {
-    next.apiKey = config.apiKey;
-  }
+  next.apiKey = config.apiKey;
 
   if (config.model) {
     const currentModel = typeof next.model === "string" ? (next.model as string).trim() : "";
     // 🔧 FIX (2026-06-11 BUG-D2): modelFallback=true 表示 body 里用户请求的模型
     //   未通过允许列表校验，必须用回退后的 config.model 覆盖，否则无效模型会被
     //   原样发往上游。
-    if (force || !currentModel || config.modelFallback === true) {
+    if (!currentModel || config.modelFallback === true || options.force === true) {
       next.model = config.model;
     }
   }

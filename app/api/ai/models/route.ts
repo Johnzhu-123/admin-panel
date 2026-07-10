@@ -14,6 +14,15 @@ import {
   rewriteUpstreamError,
   makeUpstreamTimeout,
 } from "@/lib/built-in-api-service/catalog-resolver";
+import {
+  requireClaimedServicePrincipal,
+  ServicePrincipalError,
+} from "@/lib/auth/service-principal";
+import {
+  BuiltInQuotaError,
+  runWithBuiltInQuota,
+} from "@/lib/built-in-api-service/legacy-quota";
+import { fetchPublicHttpUrl } from "@/lib/network/public-url";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -295,7 +304,11 @@ export async function POST(req: Request) {
           : "gemini";
     let apiKey = (body.apiKey || "").trim();
     const useBuiltInService = body.useBuiltInService === true;
-    const userId = (body.userId || "").trim();
+    let userId = (body.userId || "").trim();
+    if (useBuiltInService) {
+      const principal = await requireClaimedServicePrincipal(req, userId);
+      userId = principal.resolvedUserId || userId || principal.email || principal.userId;
+    }
 
     const builtInConfig =
       useBuiltInService && userId ? await resolveBuiltInModelConfig(userId) : null;
@@ -322,13 +335,22 @@ export async function POST(req: Request) {
       // 🔧 FIX (2026-06-11 BUG-C9): apiKey 不再放进 URL query（?key=...），改走
       //   x-goog-api-key header，避免 key 泄漏到失败日志/代理访问日志。
       const url = `${baseUrl}/${apiVersion}/models`;
-      const res = await fetch(url, {
-        method: "GET",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": apiKey,
+      const res = await fetchPublicHttpUrl(
+        url,
+        {
+          method: "GET",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": apiKey,
+          },
         },
-      });
+        {
+          description: "Gemini models endpoint",
+          allowHttp: false,
+          allowPrivateNetwork: false,
+          maxRedirects: 0,
+        }
+      );
 
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
@@ -360,11 +382,29 @@ export async function POST(req: Request) {
     const upstreamTimeout = makeUpstreamTimeout(15000);
     let res: Response;
     try {
-      res = await fetch(`${baseUrl}/models`, {
-        method: "GET",
-        headers: buildOpenAiHeaders(apiKey, false, openAiAuthHeader),
-        signal: upstreamTimeout.signal,
-      });
+      const dispatch = () =>
+        fetchPublicHttpUrl(
+          `${baseUrl}/models`,
+          {
+            method: "GET",
+            headers: buildOpenAiHeaders(apiKey, false, openAiAuthHeader),
+            signal: upstreamTimeout.signal,
+          },
+          {
+            description: "OpenAI-compatible models endpoint",
+            allowHttp: process.env.MD2PPT_ALLOW_PRIVATE_API_PROXY === "1",
+            allowPrivateNetwork:
+              process.env.MD2PPT_ALLOW_PRIVATE_API_PROXY === "1",
+            maxRedirects: 0,
+          }
+        );
+      res = builtInConfig
+        ? await runWithBuiltInQuota({
+            userId,
+            serviceId: builtInConfig.id,
+            dispatch,
+          })
+        : await dispatch();
     } catch (fetchError: any) {
       upstreamTimeout.cancel();
       const isAbort = fetchError?.name === "AbortError";
@@ -424,6 +464,18 @@ export async function POST(req: Request) {
     const result = classifyOpenAiModels(models);
     return NextResponse.json(result, { headers: noStoreHeaders() });
   } catch (error) {
+    if (error instanceof BuiltInQuotaError) {
+      return NextResponse.json(
+        { error: error.message },
+        { status: error.status, headers: noStoreHeaders() }
+      );
+    }
+    if (error instanceof ServicePrincipalError) {
+      return NextResponse.json(
+        { error: error.message },
+        { status: error.status, headers: noStoreHeaders() }
+      );
+    }
     const message =
       error instanceof Error ? error.message : "Failed to load models.";
     return NextResponse.json(

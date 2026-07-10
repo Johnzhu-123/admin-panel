@@ -35,7 +35,7 @@ export function TermsOfServiceModal({ open, onAccept, onDecline }: TermsOfServic
         <DialogHeader>
           <DialogTitle className="text-2xl font-bold">用户协议与隐私政策确认</DialogTitle>
           <p className="text-sm text-muted-foreground mt-2">
-            请先阅读以下内容，滚动到底后勾选同意，方可继续注册。
+            请先阅读以下内容，滚动到底后勾选同意，方可继续使用服务。
           </p>
         </DialogHeader>
 
@@ -116,4 +116,3 @@ export function TermsOfServiceModal({ open, onAccept, onDecline }: TermsOfServic
     </Dialog>
   );
 }
-

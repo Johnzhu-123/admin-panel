@@ -22,6 +22,7 @@ import {
   sanitizeMinerURuntimeSettings,
   saveMinerURuntimeSettings,
 } from "@/lib/built-in-api-service/mineru-settings";
+import { fetchPublicHttpUrl } from "@/lib/network/public-url";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -293,10 +294,19 @@ export async function POST(req: Request) {
 
       let baseUrl = "";
       let apiKey = "";
-      let source: "input" | "stored" | "mixed" = "input";
+      let source: "input" | "stored" = "input";
       const stored = await getInternalServiceConfig(category, subtaskId);
       if (explicitBaseUrl) {
         baseUrl = explicitBaseUrl;
+        if (!explicitApiKey || apiKeyIsMasked) {
+          return NextResponse.json(
+            {
+              ok: false,
+              error: "测试自定义 BaseURL 时必须同时提供对应的完整 API Key，禁止向候选地址发送已存密钥。",
+            },
+            { status: 400, headers: noStoreHeaders() }
+          );
+        }
       } else if (stored?.subtask?.baseUrl) {
         baseUrl = stored.subtask.baseUrl;
         source = "stored";
@@ -305,7 +315,6 @@ export async function POST(req: Request) {
         apiKey = explicitApiKey;
       } else if (stored?.subtask?.apiKey) {
         apiKey = stored.subtask.apiKey;
-        source = source === "stored" ? "stored" : "mixed";
       }
 
       if (!baseUrl) {
@@ -314,9 +323,9 @@ export async function POST(req: Request) {
           { status: 400, headers: noStoreHeaders() }
         );
       }
-      if (!/^https?:\/\//i.test(baseUrl)) {
+      if (!/^https:\/\//i.test(baseUrl)) {
         return NextResponse.json(
-          { ok: false, error: "BaseURL 必须以 http:// 或 https:// 开头" },
+          { ok: false, error: "BaseURL 必须使用 https://" },
           { status: 400, headers: noStoreHeaders() }
         );
       }
@@ -333,17 +342,26 @@ export async function POST(req: Request) {
 
       const upstream = makeUpstreamTimeout(15000);
       try {
-        const res = await fetch(modelsUrl, {
-          method: "GET",
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            Accept: "application/json",
+        const res = await fetchPublicHttpUrl(
+          modelsUrl,
+          {
+            method: "GET",
+            headers: {
+              Authorization: `Bearer ${apiKey}`,
+              Accept: "application/json",
+            },
+            signal: upstream.signal,
           },
-          signal: upstream.signal,
-        });
-        upstream.cancel();
+          {
+            allowHttp: false,
+            allowPrivateNetwork: false,
+            description: "Subtask BaseURL",
+            maxRedirects: 3,
+          }
+        );
 
         const text = await res.text().catch(() => "");
+        upstream.cancel();
         let parsed: unknown = null;
         try {
           parsed = text ? JSON.parse(text) : null;
@@ -371,23 +389,32 @@ export async function POST(req: Request) {
               : `${baseUrl.replace(/\/+$/, "")}/v1/chat/completions`;
             const chatUpstream = makeUpstreamTimeout(15000);
             try {
-              const chatRes = await fetch(chatUrl, {
-                method: "POST",
-                headers: {
-                  Authorization: `Bearer ${apiKey}`,
-                  "Content-Type": "application/json",
-                  Accept: "application/json",
+              const chatRes = await fetchPublicHttpUrl(
+                chatUrl,
+                {
+                  method: "POST",
+                  headers: {
+                    Authorization: `Bearer ${apiKey}`,
+                    "Content-Type": "application/json",
+                    Accept: "application/json",
+                  },
+                  body: JSON.stringify({
+                    model: "__probe__",
+                    messages: [{ role: "user", content: "ping" }],
+                    max_tokens: 1,
+                    stream: false,
+                  }),
+                  signal: chatUpstream.signal,
                 },
-                body: JSON.stringify({
-                  model: "__probe__",
-                  messages: [{ role: "user", content: "ping" }],
-                  max_tokens: 1,
-                  stream: false,
-                }),
-                signal: chatUpstream.signal,
-              });
-              chatUpstream.cancel();
+                {
+                  allowHttp: false,
+                  allowPrivateNetwork: false,
+                  description: "Subtask BaseURL",
+                  maxRedirects: 0,
+                }
+              );
               const chatText = await chatRes.text().catch(() => "");
+              chatUpstream.cancel();
 
               if (![401, 403].includes(chatRes.status)) {
                 // auth 通过，但取不到模型列表，提示用户手填 model

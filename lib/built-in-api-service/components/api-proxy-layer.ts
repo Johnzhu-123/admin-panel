@@ -29,7 +29,7 @@ import { getPerformanceMonitor } from './performance-monitor';
 import { getAuditLogger, logAPIRequest, logServiceAccess, logSecurityEvent } from './audit-logger';
 import { getPerformanceOptimizer } from './performance-optimizer';
 import { getSecurityEnhancer } from './security-enhancer';
-import { queuedFetch } from '../../request-queue-manager'; // 🔧 NEW: 导入请求队列管理器
+import { fetchPublicHttpUrl } from '../../network/public-url';
 
 export class APIProxyLayerImpl implements APIProxyLayer {
   private activeRequests = new Map<string, AbortController>();
@@ -593,7 +593,11 @@ export class APIProxyLayerImpl implements APIProxyLayer {
 
     // Special providers go through legacy compat path
     if (this.isLegacyCompatProvider(baseUrlRaw, serviceConfig.provider)) {
-      return this.proxyViaCompatibilityChain_LEGACY(request, serviceConfig, signal);
+      throw new BuiltInServiceError(
+        BuiltInServiceErrorCodes.INVALID_CONFIG,
+        "Built-in legacy image compatibility providers are disabled until they support pinned egress and per-dispatch quota accounting.",
+        { upstream: { reason: "legacy_compat_security_gate", serviceId: request.serviceId } }
+      );
     }
 
     // FAST PATH: direct OpenAI-compatible fetch
@@ -659,15 +663,25 @@ export class APIProxyLayerImpl implements APIProxyLayer {
 
     let response: Response;
     try {
-      response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json'
+      const allowPrivateNetwork = process.env.MD2PPT_ALLOW_PRIVATE_API_PROXY === '1';
+      response = await fetchPublicHttpUrl(
+        url,
+        {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${apiKey}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(requestBody),
+          signal
         },
-        body: JSON.stringify(requestBody),
-        signal
-      });
+        {
+          description: 'Built-in image upstream',
+          allowHttp: allowPrivateNetwork,
+          allowPrivateNetwork,
+          maxRedirects: 0,
+        }
+      );
     } catch (fetchErr) {
       const e = fetchErr as any;
       const cause = e?.cause;

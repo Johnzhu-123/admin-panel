@@ -5,58 +5,21 @@ import { requireAdminSession } from "@/app/api/admin/_auth";
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { initializeDatabase, importUsersFromEnv, isDatabaseAvailable, getDatabaseStats } from '@/lib/built-in-api-service/db';
+import { sql } from '@vercel/postgres';
+import { isDatabaseAvailable } from '@/lib/built-in-api-service/db';
 
 export async function POST(request: NextRequest) {
+  void request;
   const unauthorized = await requireAdminSession();
   if (unauthorized) return unauthorized;
-  try {
-    // Check admin authentication
-    const adminPassword = request.headers.get('x-admin-password');
-    if (adminPassword !== process.env.ADMIN_PASSWORD) {
-      return NextResponse.json(
-        { error: 'Unauthorized' },
-        { status: 401 }
-      );
-    }
-
-    // Check if database is available
-    const dbAvailable = await isDatabaseAvailable();
-    if (!dbAvailable) {
-      return NextResponse.json(
-        {
-          error: 'Database not available',
-          message: 'Please configure Vercel Postgres in your project settings'
-        },
-        { status: 503 }
-      );
-    }
-
-    // Initialize database tables
-    await initializeDatabase();
-
-    // Import users from environment variable
-    const importedCount = await importUsersFromEnv();
-
-    // Get database statistics
-    const stats = await getDatabaseStats();
-
-    return NextResponse.json({
-      success: true,
-      message: 'Database initialized successfully',
-      imported: importedCount,
-      stats
-    });
-  } catch (error) {
-    console.error('Database initialization error:', error);
-    return NextResponse.json(
-      {
-        error: 'Database initialization failed',
-        message: error instanceof Error ? error.message : 'Unknown error'
-      },
-      { status: 500 }
-    );
-  }
+  return NextResponse.json(
+    {
+      success: false,
+      error: 'Database DDL is not available over HTTP',
+      action: 'Run the approved database migration scripts from a trusted deployment shell.',
+    },
+    { status: 410 }
+  );
 }
 
 export async function GET() {
@@ -80,56 +43,41 @@ export async function GET() {
       }, { status: 503 });
     }
 
-    // Check if tables exist by trying to query
     try {
-      const stats = await getDatabaseStats();
-      
-      // If tables exist, return current status
+      const { rows } = await sql<{
+        total_users: number;
+        active_users: number;
+        suspended_users: number;
+      }>`
+        SELECT
+          COUNT(*)::int AS total_users,
+          COUNT(*) FILTER (WHERE status = 'active')::int AS active_users,
+          COUNT(*) FILTER (WHERE status = 'suspended')::int AS suspended_users
+        FROM authorized_users
+      `;
+      const row = rows[0];
       return NextResponse.json({
         success: true,
-        message: 'Database already initialized',
-        stats,
-        note: 'Database is ready to use'
+        message: 'Database is reachable',
+        stats: {
+          totalUsers: row?.total_users || 0,
+          activeUsers: row?.active_users || 0,
+          suspendedUsers: row?.suspended_users || 0,
+        },
+        readOnly: true,
       });
-    } catch (error) {
-      // Tables don't exist, proceed with initialization
-      console.log('Tables not found, initializing...');
+    } catch {
+      return NextResponse.json({
+        success: false,
+        error: 'Database schema is not ready',
+        readOnly: true,
+      }, { status: 503 });
     }
-
-    // Initialize database tables (no auth required for first-time setup)
-    console.log('Initializing database tables...');
-    await initializeDatabase();
-
-    // Import users from environment variable
-    console.log('Importing users from environment...');
-    const importedCount = await importUsersFromEnv();
-
-    // Get database statistics
-    const stats = await getDatabaseStats();
-
-    return NextResponse.json({
-      success: true,
-      message: 'Database initialized successfully',
-      details: {
-        tablesCreated: true,
-        usersImported: importedCount,
-        timestamp: new Date().toISOString()
-      },
-      stats,
-      nextSteps: [
-        'Database is now ready',
-        'You can access the admin panel at /admin',
-        `${importedCount} user(s) imported from environment variable`,
-        'You can now add more users via the admin panel'
-      ]
-    });
   } catch (error) {
     console.error('Database initialization error:', error);
     return NextResponse.json(
       {
-        error: 'Database initialization failed',
-        message: error instanceof Error ? error.message : 'Unknown error',
-        details: error instanceof Error ? error.stack : undefined
+        error: 'Database status check failed',
       },
       { status: 500 }
     );

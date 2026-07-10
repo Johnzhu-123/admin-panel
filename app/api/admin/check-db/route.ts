@@ -21,9 +21,9 @@ export async function GET() {
     // 2. Check if table exists
     console.log('[CheckDB] Checking if authorized_users table exists...');
     const { rows: tableCheck } = await sql`
-      SELECT table_name 
-      FROM information_schema.tables 
-      WHERE table_schema = 'public' 
+      SELECT table_name
+      FROM information_schema.tables
+      WHERE table_schema = 'public'
       AND table_name = 'authorized_users'
     `;
     const tableExists = tableCheck.length > 0;
@@ -38,7 +38,7 @@ export async function GET() {
       console.log('[CheckDB] Getting table structure...');
       const { rows: columns } = await sql`
         SELECT column_name, data_type, is_nullable
-        FROM information_schema.columns 
+        FROM information_schema.columns
         WHERE table_name = 'authorized_users'
         ORDER BY ordinal_position
       `;
@@ -58,7 +58,7 @@ export async function GET() {
         console.log('[CheckDB] Getting sample user data...');
         const { rows: users } = await sql`
           SELECT user_id, email, name, status, can_use_built_in_services, allowed_services
-          FROM authorized_users 
+          FROM authorized_users
           LIMIT 5
         `;
         userData = users;
@@ -82,8 +82,7 @@ export async function GET() {
     console.error('[CheckDB] Error:', error);
     return NextResponse.json({
       success: false,
-      error: error instanceof Error ? error.message : 'Unknown error',
-      stack: error instanceof Error ? error.stack : undefined
+      error: 'Database status check failed'
     }, { status: 500 });
   }
 }

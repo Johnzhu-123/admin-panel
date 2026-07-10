@@ -1,0 +1,21 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "strict": true,
+    "incremental": false,
+    "noEmit": true
+  },
+  "include": [
+    "next-env.d.ts",
+    "lib/admin/rate-limit-store.ts",
+    "lib/admin/session-store.ts",
+    "lib/auth/service-principal.ts",
+    "lib/built-in-api-service/encryption.ts",
+    "lib/built-in-api-service/mineru-authorization.ts",
+    "lib/built-in-api-service/quota-service.ts",
+    "lib/network/pinned-http.ts",
+    "lib/network/public-url.ts",
+    "lib/security/http-security-headers.ts"
+  ],
+  "exclude": ["node_modules", "**/__tests__/**"]
+}

@@ -5,22 +5,102 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout admin-panel
+        uses: actions/checkout@v4
+        with:
+          path: admin-panel
+      - name: Checkout required md2pptWin peer
+        uses: actions/checkout@v4
+        with:
+          repository: Johnzhu-123/md2pptWin
+          path: md2pptWin
+          token: ${{ secrets.CROSS_REPO_READ_TOKEN }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.12.0
+          cache: npm
+          cache-dependency-path: admin-panel/package-lock.json
+      - name: Require peer checkout
+        run: test -f md2pptWin/package.json
+      - name: Install dependencies
+        working-directory: admin-panel
+        run: npm ci
+      - name: Typecheck application and security boundaries
+        working-directory: admin-panel
+        run: |
+          npm run typecheck
+          npx tsc -p tsconfig.security.json
+          npx tsc -p tsconfig.tests.json
+          npx tsc -p tsconfig.scripts.json
+      - name: Tracked import completeness
+        working-directory: admin-panel
+        run: node ./scripts/check-tracked-imports.cjs
+      - name: Unit tests
+        working-directory: admin-panel
+        run: npm test -- --ci --runInBand --silent
+      - name: Production build
+        working-directory: admin-panel
+        env:
+          NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY }}
+          CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
+        run: npm run build
+      - name: Required mirror check
+        working-directory: md2pptWin
+        env:
+          ADMIN_PANEL_DIR: ${{ github.workspace }}/admin-panel
+        run: node ./scripts/check-mirrored-libs.cjs --strict
+      - name: HTTP security header smoke
+        working-directory: admin-panel
+        shell: bash
+        env:
+          NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY }}
+          CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
+        run: |
+          npm start > /tmp/admin-next.log 2>&1 &
+          server_pid=$!
+          trap 'kill $server_pid || true; cat /tmp/admin-next.log' EXIT
+          for attempt in {1..60}; do curl --fail --silent http://127.0.0.1:3000/ >/dev/null && break; sleep 1; done
+          node ./scripts/http-security-smoke.cjs http://127.0.0.1:3000/
+      - name: Dependency audit
+        working-directory: admin-panel
+        run: npm audit --audit-level=high
+
+  postgres-security:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: md2ppt_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d md2ppt_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      POSTGRES_URL: postgresql://postgres:postgres@127.0.0.1:5432/md2ppt_ci
+      POSTGRES_URL_NON_POOLING: postgresql://postgres:postgres@127.0.0.1:5432/md2ppt_ci
+    steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22.12.0
           cache: npm
-      - name: Install dependencies
-        run: npm ci
-      - name: Typecheck
-        run: npx tsc --noEmit
-      - name: Unit tests
-        run: npx jest --ci --silent
-      - name: Production build
-        env:
-          NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY }}
-        run: npm run build
+      - run: npm ci
+      - name: Apply additive security migration twice
+        run: |
+          node scripts/migrate-security-schema.mjs
+          node scripts/migrate-security-schema.mjs
+      - name: PostgreSQL quota concurrency
+        run: npm test -- --ci --runInBand lib/built-in-api-service/__tests__/quota-service.postgres.test.ts

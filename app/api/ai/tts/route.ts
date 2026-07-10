@@ -6,28 +6,20 @@ import {
 } from "@/lib/ai";
 import type { TTSRequest, TTSResponse } from "@/lib/tts-service/types";
 import { injectBuiltInCategoryConfig } from "@/lib/built-in-api-service/apply-cloud-config";
+import {
+  requireClaimedServicePrincipal,
+  ServicePrincipalError,
+} from "@/lib/auth/service-principal";
+import {
+  BuiltInQuotaError,
+  runWithBuiltInQuota,
+} from "@/lib/built-in-api-service/legacy-quota";
+import { fetchPublicHttpUrl } from "@/lib/network/public-url";
 
 export const maxDuration = 900;
 const DEFAULT_INDEXTTS2_SERVICE_URL = "http://127.0.0.1:7860";
 const DEFAULT_OPENAI_TTS_MODEL = "tts-1";
 const DEFAULT_OPENAI_TTS_VOICE = "alloy";
-
-const BUILT_IN_PROXY_HEADER = "x-built-in-service-server-url";
-const normalizeRemoteBase = (base?: string) =>
-  (base || "").trim().replace(/\/+$/, "");
-
-const getRemoteBuiltInBase = (req: Request) => {
-  const fromHeader = normalizeRemoteBase(req.headers.get(BUILT_IN_PROXY_HEADER) || "");
-  if (fromHeader && process.env.ELECTRON_DESKTOP === "1") return fromHeader;
-  const raw =
-    process.env.BUILT_IN_SERVICE_SERVER_URL ||
-    process.env.NEXT_PUBLIC_BUILT_IN_SERVICE_SERVER_URL ||
-    "";
-  const normalized = normalizeRemoteBase(raw);
-  if (!normalized) return "";
-  if (process.env.ELECTRON_DESKTOP !== "1") return "";
-  return normalized;
-};
 
 const resolveIndextts2ServiceUrl = (serviceUrl?: string) => {
   const explicitUrl =
@@ -117,10 +109,11 @@ async function synthesizeWithOpenAiCompatibleTts(
     apiKey: string;
     baseUrl: string;
     authHeader?: string;
+    request?: (url: string, init: RequestInit) => Promise<Response>;
   }
 ): Promise<TTSResponse> {
   const endpointUrl = resolveOpenAiSpeechEndpoint(options.baseUrl);
-  const res = await fetch(endpointUrl, {
+  const init: RequestInit = {
     method: "POST",
     headers: {
       ...buildOpenAiHeaders(
@@ -136,7 +129,16 @@ async function synthesizeWithOpenAiCompatibleTts(
       speed: request.speed,
     }),
     signal: AbortSignal.timeout(300000),
-  });
+  };
+  const res = options.request
+    ? await options.request(endpointUrl, init)
+    : await fetchPublicHttpUrl(endpointUrl, init, {
+        description: "OpenAI-compatible TTS endpoint",
+        allowHttp: process.env.MD2PPT_ALLOW_PRIVATE_API_PROXY === "1",
+        allowPrivateNetwork:
+          process.env.MD2PPT_ALLOW_PRIVATE_API_PROXY === "1",
+        maxRedirects: 0,
+      });
 
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
@@ -151,13 +153,22 @@ async function synthesizeWithOpenAiCompatibleTts(
 export async function POST(request: NextRequest) {
   const startedAt = Date.now();
   let bodyForUsage: Record<string, unknown> = {};
+  let builtInQuota: { userId: string; serviceId: string } | null = null;
   try {
     let body = await request.json();
     bodyForUsage = body as Record<string, unknown>;
 
     // admin-panel 端：useBuiltInService=true 时从 catalog 注入 baseUrl/apiKey/model
     if (body?.useBuiltInService === true) {
-      const { body: enriched, applied } = await injectBuiltInCategoryConfig(
+      const claimedUserId = typeof body?.userId === "string" ? body.userId : "";
+      const principal = await requireClaimedServicePrincipal(request, claimedUserId);
+      body = {
+        ...body,
+        userId:
+          principal.resolvedUserId || claimedUserId || principal.email || principal.userId,
+      };
+      bodyForUsage = body as Record<string, unknown>;
+      const { body: enriched, applied, config } = await injectBuiltInCategoryConfig(
         body as Record<string, unknown>,
         "tts",
         {
@@ -168,7 +179,19 @@ export async function POST(request: NextRequest) {
       );
       if (applied) {
         body = enriched;
+        if (config) {
+          // IndexTTS uses serviceUrl while the catalog stores one canonical baseUrl.
+          // Bind both fields so a caller cannot combine a server-owned credential
+          // with a caller-controlled destination.
+          body = { ...body, serviceUrl: config.baseUrl };
+        }
         bodyForUsage = body as Record<string, unknown>;
+        builtInQuota = config
+          ? {
+              userId: String(body.userId || ""),
+              serviceId: `built-in-tts-${config.subtaskId}`,
+            }
+          : null;
       } else {
         await recordBuiltInTtsUsage(bodyForUsage, false, startedAt, "TTS 服务未在管理后台启用或配置");
         return NextResponse.json(
@@ -262,7 +285,25 @@ export async function POST(request: NextRequest) {
       const key = apiKey || process.env.GEMINI_API_KEY || "";
       const geminiBaseUrl =
         resolveCloudBaseUrl(baseUrl) || process.env.GEMINI_BASE_URL || undefined;
-      const client = new GeminiTTSClient(key, geminiBaseUrl, model);
+      const client = new GeminiTTSClient(
+        key,
+        geminiBaseUrl,
+        model,
+        builtInQuota
+          ? (url, init) =>
+              runWithBuiltInQuota({
+                ...builtInQuota,
+                dispatch: () =>
+                  fetchPublicHttpUrl(url, init, {
+                    description: "Built-in Gemini TTS endpoint",
+                    allowHttp: process.env.MD2PPT_ALLOW_PRIVATE_API_PROXY === "1",
+                    allowPrivateNetwork:
+                      process.env.MD2PPT_ALLOW_PRIVATE_API_PROXY === "1",
+                    maxRedirects: 0,
+                  }),
+              })
+          : fetch
+      );
       const result = await client.synthesize(ttsRequest);
       console.log("[TTS API] success", {
         provider: "gemini",
@@ -302,6 +343,21 @@ export async function POST(request: NextRequest) {
         apiKey: apiKey.trim(),
         baseUrl: resolvedBaseUrl,
         authHeader: openAiAuthHeader,
+        request: builtInQuota
+          ? (url, init) =>
+              runWithBuiltInQuota({
+                ...builtInQuota,
+                dispatch: () =>
+                  fetchPublicHttpUrl(url, init, {
+                    description: "Built-in TTS endpoint",
+                    allowHttp:
+                      process.env.MD2PPT_ALLOW_PRIVATE_API_PROXY === "1",
+                    allowPrivateNetwork:
+                      process.env.MD2PPT_ALLOW_PRIVATE_API_PROXY === "1",
+                    maxRedirects: 0,
+                  }),
+              })
+          : undefined,
       });
       console.log("[TTS API] success", {
         provider: "openai",
@@ -317,7 +373,23 @@ export async function POST(request: NextRequest) {
       "@/lib/tts-service/index-tts-client"
     );
     const resolvedUrl = resolveIndextts2ServiceUrl(serviceUrl);
-    const client = new IndexTTSClient(resolvedUrl);
+    const client = new IndexTTSClient(
+      resolvedUrl,
+      builtInQuota
+        ? (url, init) =>
+            runWithBuiltInQuota({
+              ...builtInQuota,
+              dispatch: () =>
+                fetchPublicHttpUrl(url, init, {
+                  description: "Built-in IndexTTS endpoint",
+                  allowHttp: process.env.MD2PPT_ALLOW_PRIVATE_API_PROXY === "1",
+                  allowPrivateNetwork:
+                    process.env.MD2PPT_ALLOW_PRIVATE_API_PROXY === "1",
+                  maxRedirects: 0,
+                }),
+            })
+        : fetch
+    );
     const result = await client.synthesize(ttsRequest);
     console.log("[TTS API] success", {
       provider: "indextts2",
@@ -329,6 +401,18 @@ export async function POST(request: NextRequest) {
     await recordBuiltInTtsUsage(bodyForUsage, true, startedAt);
     return NextResponse.json(result);
   } catch (err) {
+    if (err instanceof BuiltInQuotaError) {
+      return NextResponse.json(
+        { error: err.message },
+        { status: err.status }
+      );
+    }
+    if (err instanceof ServicePrincipalError) {
+      return NextResponse.json(
+        { error: err.message },
+        { status: err.status }
+      );
+    }
     const message =
       err instanceof Error ? err.message : "TTS 合成失败";
     const isTimeout = message.includes("timeout") || message.includes("aborted");

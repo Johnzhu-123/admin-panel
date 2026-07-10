@@ -79,11 +79,16 @@ export class IndexTTSClient {
   private static gradio5UploadCache = new Map<string, CachedValue<Gradio5FileData>>();
   private static gradio3UploadCache = new Map<string, CachedValue<string>>();
   private baseUrl: string;
+  private request: (input: string, init: RequestInit) => Promise<Response>;
   private detectedEndpoint: EndpointCandidate | null = null;
   private gradio5GenSingleParameters: Gradio5ParameterDescriptor[] | null = null;
 
-  constructor(baseUrl: string) {
+  constructor(
+    baseUrl: string,
+    request: (input: string, init: RequestInit) => Promise<Response> = fetch
+  ) {
     this.baseUrl = baseUrl.replace(/\/+$/, "");
+    this.request = request;
   }
 
   private getCacheKey(suffix: string) {
@@ -950,7 +955,7 @@ export class IndexTTSClient {
     context: string
   ): Promise<Response> {
     try {
-      return await fetch(input, {
+      return await this.request(input, {
         ...init,
         signal: AbortSignal.timeout(timeoutMs),
       });

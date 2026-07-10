@@ -1,5 +1,10 @@
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
+import {
+  requestPinnedHttpTarget,
+  type PinnedAddress,
+  type ResolvedHttpTarget,
+} from "@/lib/network/pinned-http";
 
 type PublicHttpUrlOptions = {
   allowHttp?: boolean;
@@ -9,9 +14,10 @@ type PublicHttpUrlOptions = {
 
 type FetchPublicHttpUrlOptions = PublicHttpUrlOptions & {
   maxRedirects?: number;
+  dnsTimeoutMs?: number;
+  lookupFn?: typeof lookup;
 };
 
-const HOST_VALIDATION_TTL_MS = 60_000;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const EXPLICITLY_BLOCKED_HOSTNAMES = new Set([
   "metadata.google.internal",
@@ -19,11 +25,6 @@ const EXPLICITLY_BLOCKED_HOSTNAMES = new Set([
   "metadata.aliyun.internal",
   "instance-data",
 ]);
-
-const hostValidationCache = new Map<
-  string,
-  { expiresAt: number; errorMessage?: string }
->();
 
 /**
  * 🔧 FIX (2026-06-11 BUG-B11/AS6): 私网封禁误杀桌面场景的统一判定。
@@ -240,50 +241,72 @@ function isBlockedHostname(hostname: string) {
   return EXPLICITLY_BLOCKED_HOSTNAMES.has(normalized);
 }
 
-async function assertHostnameIsPublic(hostname: string, description: string) {
+async function resolveHostname(
+  hostname: string,
+  description: string,
+  allowPrivateNetwork: boolean,
+  signal?: AbortSignal | null,
+  dnsTimeoutMs = 5_000,
+  lookupFn: typeof lookup = lookup
+): Promise<PinnedAddress[]> {
   const normalized = normalizeHostname(hostname);
-  if (isBlockedHostname(normalized)) {
+  if (!allowPrivateNetwork && isBlockedHostname(normalized)) {
     throw new Error(`${description} 指向受保护的内网或元数据主机。`);
   }
-
-  const cached = hostValidationCache.get(normalized);
-  const now = Date.now();
-  if (cached && cached.expiresAt > now) {
-    if (cached.errorMessage) {
-      throw new Error(cached.errorMessage);
+  if (isIP(normalized)) {
+    if (!allowPrivateNetwork && isBlockedIpAddress(normalized)) {
+      throw new Error(`${description} 指向受保护的内网或本机地址。`);
     }
-    return;
+    return [{ address: normalized, family: isIP(normalized) as 4 | 6 }];
   }
 
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  let abortHandler: (() => void) | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(
+      () => reject(new DOMException(`${description} DNS 解析超时。`, "TimeoutError")),
+      Math.max(1, dnsTimeoutMs)
+    );
+    if (signal) {
+      abortHandler = () => reject(signal.reason || new DOMException("Aborted", "AbortError"));
+      signal.addEventListener("abort", abortHandler, { once: true });
+    }
+  });
   try {
-    const records = await lookup(normalized, { all: true, verbatim: true });
-    if (!records.length) {
-      throw new Error(`${description} 未解析到可用地址。`);
+    const records = await Promise.race([
+      lookupFn(normalized, { all: true, verbatim: true }),
+      timeout,
+    ]);
+    if (!records.length) throw new Error(`${description} 未解析到可用地址。`);
+    const addresses = records.map((record) => ({
+      address: record.address,
+      family: record.family as 4 | 6,
+    }));
+    if (
+      !allowPrivateNetwork &&
+      addresses.some((record) => isBlockedIpAddress(record.address))
+    ) {
+      throw new Error(`${description} 解析到了内网、回环或保留地址。`);
     }
-
-    for (const record of records) {
-      if (isBlockedIpAddress(record.address)) {
-        throw new Error(`${description} 解析到了内网、回环或保留地址。`);
-      }
-    }
-
-    hostValidationCache.set(normalized, { expiresAt: now + HOST_VALIDATION_TTL_MS });
-  } catch (error) {
-    const errorMessage =
-      error instanceof Error ? error.message : `${description} 校验失败。`;
-    hostValidationCache.set(normalized, {
-      expiresAt: now + HOST_VALIDATION_TTL_MS,
-      errorMessage,
-    });
-    throw new Error(errorMessage);
+    return addresses;
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+    if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
   }
 }
 
-export async function assertPublicHttpUrl(
+export async function resolvePublicHttpTarget(
   value: string | URL,
-  options: PublicHttpUrlOptions = {}
-) {
-  const { allowHttp = true, allowPrivateNetwork = false, description = "目标地址" } = options;
+  options: FetchPublicHttpUrlOptions = {},
+  signal?: AbortSignal | null,
+  lookupFn: typeof lookup = lookup
+): Promise<ResolvedHttpTarget> {
+  const {
+    allowHttp = true,
+    allowPrivateNetwork = false,
+    description = "目标地址",
+    dnsTimeoutMs = 5_000,
+  } = options;
 
   let parsedUrl: URL;
   try {
@@ -294,7 +317,11 @@ export async function assertPublicHttpUrl(
 
   const protocol = parsedUrl.protocol.toLowerCase();
   if (protocol !== "https:" && !(allowHttp && protocol === "http:")) {
-    throw new Error(`${description} 必须使用 http:// 或 https://。`);
+    throw new Error(
+      allowHttp
+        ? `${description} 必须使用 http:// 或 https://。`
+        : `${description} 必须使用 https://。`
+    );
   }
 
   if (parsedUrl.username || parsedUrl.password) {
@@ -306,17 +333,22 @@ export async function assertPublicHttpUrl(
     throw new Error(`${description} 缺少主机名。`);
   }
 
-  if (!allowPrivateNetwork) {
-    if (isIP(hostname)) {
-      if (isBlockedIpAddress(hostname)) {
-        throw new Error(`${description} 指向受保护的内网或本机地址。`);
-      }
-    } else {
-      await assertHostnameIsPublic(hostname, description);
-    }
-  }
+  const addresses = await resolveHostname(
+    hostname,
+    description,
+    allowPrivateNetwork,
+    signal,
+    dnsTimeoutMs,
+    lookupFn
+  );
+  return { url: parsedUrl, addresses };
+}
 
-  return parsedUrl;
+export async function assertPublicHttpUrl(
+  value: string | URL,
+  options: PublicHttpUrlOptions = {}
+) {
+  return (await resolvePublicHttpTarget(value, options)).url;
 }
 
 export async function fetchPublicHttpUrl(
@@ -326,20 +358,24 @@ export async function fetchPublicHttpUrl(
 ) {
   const method = (init.method || "GET").toUpperCase();
   const maxRedirects = Math.max(0, options.maxRedirects ?? 5);
-  let currentUrl = await assertPublicHttpUrl(value, options);
-
-  if (method !== "GET" && method !== "HEAD") {
-    return fetch(currentUrl.toString(), { ...init, redirect: "error" });
-  }
+  let currentValue: string | URL = value;
 
   for (let redirectCount = 0; redirectCount <= maxRedirects; redirectCount += 1) {
-    const response = await fetch(currentUrl.toString(), {
-      ...init,
-      redirect: "manual",
-    });
+    const target = await resolvePublicHttpTarget(
+      currentValue,
+      options,
+      init.signal,
+      options.lookupFn || lookup
+    );
+    const response = await requestPinnedHttpTarget(target, init);
 
     if (!REDIRECT_STATUSES.has(response.status)) {
       return response;
+    }
+
+    if (method !== "GET" && method !== "HEAD") {
+      await response.body?.cancel().catch(() => undefined);
+      throw new Error(`${options.description || "目标地址"} 不允许非幂等请求重定向。`);
     }
 
     const location = response.headers.get("location");
@@ -351,7 +387,8 @@ export async function fetchPublicHttpUrl(
       throw new Error(`${options.description || "目标地址"} 重定向次数过多。`);
     }
 
-    currentUrl = await assertPublicHttpUrl(new URL(location, currentUrl), options);
+    await response.body?.cancel().catch(() => undefined);
+    currentValue = new URL(location, target.url);
   }
 
   throw new Error(`${options.description || "目标地址"} 重定向次数过多。`);

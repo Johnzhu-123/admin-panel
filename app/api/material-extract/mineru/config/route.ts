@@ -18,16 +18,20 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { currentUser } from "@clerk/nextjs/server";
 import { sql } from "@vercel/postgres";
 import { noStoreHeaders } from "@/lib/ai";
 import {
   getMinerUAuthorizationFromEnv,
   isMinerUServiceAllowed,
   MinerUAuthorizationRecord,
-  resolveMinerURequestIdentity,
+  getMinerUIdentityFromServicePrincipal,
+  normalizeMinerUCloudBaseUrl,
 } from "@/lib/built-in-api-service/mineru-authorization";
 import { getMinerURuntimeSettings } from "@/lib/built-in-api-service/mineru-settings";
+import {
+  requireServicePrincipal,
+  ServicePrincipalError,
+} from "@/lib/auth/service-principal";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -40,7 +44,7 @@ async function loadAuthorization(userId: string, email?: string): Promise<MinerU
   try {
     const { rows } = await sql`
       SELECT user_id, email, status, can_use_built_in_services, allowed_services,
-             daily_requests, monthly_requests
+             daily_requests, monthly_requests, concurrent_requests
       FROM authorized_users
       WHERE LOWER(user_id) = LOWER(${userId}) OR LOWER(email) = LOWER(${email || ""})
       LIMIT 1
@@ -55,6 +59,7 @@ async function loadAuthorization(userId: string, email?: string): Promise<MinerU
       allowedServices: Array.isArray(row.allowed_services) ? row.allowed_services : [],
       dailyRequests: row.daily_requests ?? 0,
       monthlyRequests: row.monthly_requests ?? 0,
+      concurrentRequests: row.concurrent_requests ?? 0,
     };
   } catch (error) {
     console.error("[mineru/config] loadAuthorization 失败:", error);
@@ -65,7 +70,15 @@ async function loadAuthorization(userId: string, email?: string): Promise<MinerU
 export async function GET(req: NextRequest) {
   const settings = await getMinerURuntimeSettings();
   const defaultOptions = settings.defaultOptions;
-  const baseUrl = settings.baseUrl;
+  const baseUrl = normalizeMinerUCloudBaseUrl(settings.baseUrl || "");
+
+  if (!baseUrl) {
+    return json(503, {
+      authorized: false,
+      reason: "MinerU BaseURL 必须是 https://mineru.net",
+      defaultOptions,
+    });
+  }
 
   if (!settings.enabled) {
     return json(200, {
@@ -85,24 +98,15 @@ export async function GET(req: NextRequest) {
     });
   }
 
-  let user: Awaited<ReturnType<typeof currentUser>> | null = null;
+  let identity;
   try {
-    user = await currentUser();
-  } catch (err) {
-    console.warn(
-      "[mineru/config] Clerk 校验失败，尝试使用桌面端转发身份:",
-      err instanceof Error ? err.message : String(err)
+    identity = getMinerUIdentityFromServicePrincipal(
+      await requireServicePrincipal(req)
     );
-  }
-
-  const identity = resolveMinerURequestIdentity(user, req.headers);
-  if (!identity) {
-    return json(200, {
-      authorized: false,
-      reason: "未登录",
-      baseUrl,
-      defaultOptions,
-    });
+  } catch (error) {
+    const reason =
+      error instanceof ServicePrincipalError ? error.message : "身份验证失败";
+    return json(401, { authorized: false, reason, baseUrl, defaultOptions });
   }
 
   const authorization = await loadAuthorization(identity.userId, identity.email);
@@ -147,6 +151,7 @@ export async function GET(req: NextRequest) {
     quotaLimits: {
       dailyRequests: authorization.dailyRequests,
       monthlyRequests: authorization.monthlyRequests,
+      concurrentRequests: authorization.concurrentRequests,
     },
   });
 }

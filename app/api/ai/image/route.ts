@@ -25,7 +25,7 @@ import {
 } from "@/lib/ai";
 import { recordFailureLog } from "@/lib/diagnostics";
 import { coerceImageValueToBase64 } from "@/lib/image-generation/shared-utils";
-import { resolveBuiltInWithCatalog, rewriteUpstreamError } from "@/lib/built-in-api-service/catalog-resolver";
+import { rewriteUpstreamError } from "@/lib/built-in-api-service/catalog-resolver";
 import {
   generateImageWithCompatibility,
   handleCompatibilityError,
@@ -33,6 +33,14 @@ import {
   convertLegacyParameters
 } from "@/lib/api-compatibility/integration";
 import { queuedFetch } from "@/lib/request-queue-manager";
+import {
+  requireClaimedServicePrincipal,
+  ServicePrincipalError,
+} from "@/lib/auth/service-principal";
+import {
+  BuiltInQuotaError,
+  runWithBuiltInQuota,
+} from "@/lib/built-in-api-service/legacy-quota";
 // Enhanced image editing imports
 import {
   EditRequest,
@@ -82,20 +90,6 @@ async function recordBuiltInUsageIfNeeded(
   }
 }
 
-const normalizeRemoteBase = (base?: string) =>
-  (base || "").trim().replace(/\/+$/, "");
-
-const getRemoteBuiltInBase = () => {
-  const raw =
-    process.env.BUILT_IN_SERVICE_SERVER_URL ||
-    process.env.NEXT_PUBLIC_BUILT_IN_SERVICE_SERVER_URL ||
-    "";
-  const normalized = normalizeRemoteBase(raw);
-  if (!normalized) return "";
-  if (process.env.ELECTRON_DESKTOP !== "1") return "";
-  return normalized;
-};
-
 
 // -------- Utilities --------
 const toInlinePart = (img: InlineImage) => ({
@@ -124,11 +118,6 @@ const shouldUseGeminiPreviewModel = (model: string) =>
 
 const shouldUseGeminiAlpha = (model: string) =>
   /preview|exp|experimental|alpha/i.test(model);
-
-// 🔧 FIX (2026-06-11 BUG-D2): 把用户请求的图像模型透传给 catalog 解析器，
-//   命中 subtask.model/models[] 时不再被默认模型覆盖。
-const resolveBuiltInImageConfig = (userId: string, requestedModel?: string) =>
-  resolveBuiltInWithCatalog(userId, "image", requestedModel);
 
 const describeGeminiStyle = async (
   ai: GoogleGenAI,
@@ -924,30 +913,11 @@ export async function POST(req: Request) {
     initializeCompatibilitySystem();
 
     const body = await req.json();
-
-    const remoteBuiltInBase = getRemoteBuiltInBase();
-    if (body?.useBuiltInService && remoteBuiltInBase) {
-      const targetUrl = `${remoteBuiltInBase}/api/ai/image`;
-      const response = await fetch(targetUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        cache: 'no-store'
-      });
-
-      const textBody = await response.text();
-      try {
-        const data = textBody ? JSON.parse(textBody) : {};
-        return NextResponse.json(data, {
-          status: response.status,
-          headers: noStoreHeaders(),
-        });
-      } catch {
-        return new NextResponse(textBody, {
-          status: response.status,
-          headers: noStoreHeaders(),
-        });
-      }
+    if (body?.useBuiltInService === true) {
+      const claimedUserId = typeof body?.userId === "string" ? body.userId : "";
+      const principal = await requireClaimedServicePrincipal(req, claimedUserId);
+      body.userId =
+        principal.resolvedUserId || claimedUserId || principal.email || principal.userId;
     }
 
     // ========== ASYNC MODE DETECTION ==========
@@ -955,7 +925,10 @@ export async function POST(req: Request) {
     // and explicitly requested by the client payload.
     const envValue = process.env.ENABLE_ASYNC_IMAGE_GENERATION;
     const requestAsync = body.useAsyncImageGeneration === true;
-    const isAsyncEnabled = (envValue === 'true' || envValue === '1') && requestAsync;
+    const isAsyncEnabled =
+      (envValue === 'true' || envValue === '1') &&
+      requestAsync &&
+      body.useBuiltInService !== true;
 
     console.log('[AsyncImageGen] Environment check:', {
       envValue,
@@ -1265,7 +1238,12 @@ Important: The mask indicates where to make changes. All other areas should rema
             };
 
             // Proxy through built-in service
-            const builtInResponse = await builtInService.proxyImageGeneration(proxyRequest);
+            const builtInResponse = await runWithBuiltInQuota({
+              userId,
+              serviceId: `built-in-image-${serviceStatus.currentService.id}`,
+              reservationTtlMs: 10 * 60 * 1000,
+              dispatch: () => builtInService.proxyImageGeneration(proxyRequest),
+            });
 
             if (builtInResponse && builtInResponse.imageBase64) {
 
@@ -1305,6 +1283,15 @@ Important: The mask indicates where to make changes. All other areas should rema
           }
         }
       } catch (error) {
+        if (error instanceof BuiltInQuotaError) {
+          return NextResponse.json(
+            {
+              error: error.message,
+              source: "built-in-service",
+            },
+            { status: error.status, headers: noStoreHeaders() }
+          );
+        }
         // 🔧 FIX (2026-05 #6 关键根因): 之前这里 `// Continue with existing logic
         // as fallback` 会静默吞掉所有内置服务的错误（包括 magic-byte 校验失败、
         // 上游 502/HTML 错误页等），导致前 5 次修复加的诊断信息从来没出现在 Render
@@ -1365,7 +1352,16 @@ Important: The mask indicates where to make changes. All other areas should rema
             { status: httpStatus, headers: noStoreHeaders() }
           );
         }
-        // 否则继续 fallback 到既有路径（用用户自带 apiKey）
+        // 否则继续 fallback 到既有路径（只允许使用用户自带 apiKey）
+      }
+      if (!(body.apiKey && String(body.apiKey).trim())) {
+        return NextResponse.json(
+          {
+            error: "内置图像服务当前不可用，已安全阻止旧版 catalog 凭据 fallback。",
+            source: "built-in-service",
+          },
+          { status: 503, headers: noStoreHeaders() }
+        );
       }
     }
 
@@ -1387,19 +1383,6 @@ Important: The mask indicates where to make changes. All other areas should rema
       : [];
     const inputImage = body.inputImage as InlineImage | undefined;
     const maskImage = body.maskImage as InlineImage | undefined;
-
-    let builtInFallbackConfig: Awaited<ReturnType<typeof resolveBuiltInImageConfig>> = null;
-    if (!apiKey && useBuiltInService && userId) {
-      // 🔧 FIX (2026-06-11 BUG-D2): 透传用户所选图像模型（按本路由实际 body 字段）
-      builtInFallbackConfig = await resolveBuiltInImageConfig(
-        userId,
-        String(body.openAiImageModel || body.geminiImageModel || body.model || "").trim()
-      );
-      if (builtInFallbackConfig) {
-        apiKey = builtInFallbackConfig.apiKey;
-        provider = "openai";
-      }
-    }
 
     if (!apiKey || !prompt) {
       return NextResponse.json(
@@ -1556,9 +1539,9 @@ Important: The mask indicates where to make changes. All other areas should rema
     // Enhanced OpenAI-compatible processing with compatibility system
     if (provider === "openai") {
       const openAiBaseUrl =
-        builtInFallbackConfig?.baseUrl || body.openAiBaseUrl || "https://api.openai.com/v1";
+        body.openAiBaseUrl || "https://api.openai.com/v1";
       const openAiImageModel =
-        (body.openAiImageModel || builtInFallbackConfig?.model || "").trim() ||
+        (body.openAiImageModel || "").trim() ||
         defaultOpenAiImageModel;
       try {
         // Use the enhanced compatibility system for OpenAI providers
@@ -1635,7 +1618,7 @@ Important: The mask indicates where to make changes. All other areas should rema
     // Original OpenAI-compatible logic (fallback)
     // Normalize base URL strictly to OpenAI format
     const baseUrl = normalizeOpenAiBaseUrl(
-      builtInFallbackConfig?.baseUrl || body.openAiBaseUrl
+      body.openAiBaseUrl
     );
     const openAiAuthHeader = normalizeOpenAiAuthHeader(body.openAiAuthHeader);
     const openAiImageEndpointPath =
@@ -1645,13 +1628,13 @@ Important: The mask indicates where to make changes. All other areas should rema
       body.openAiImageResponseFormat || defaultOpenAiImageResponseFormat
     );
     const imageModel =
-      (body.openAiImageModel || builtInFallbackConfig?.model || "").trim() ||
+      (body.openAiImageModel || "").trim() ||
       defaultOpenAiImageModel;
     const textModel =
-      (body.openAiTextModel || builtInFallbackConfig?.model || "").trim() ||
+      (body.openAiTextModel || "").trim() ||
       defaultOpenAiTextModel;
     const visionModel =
-      (body.openAiVisionModel || builtInFallbackConfig?.model || "").trim() ||
+      (body.openAiVisionModel || "").trim() ||
       textModel ||
       defaultOpenAiVisionModel;
     const chatModel = visionModel || textModel || imageModel;
@@ -2173,6 +2156,13 @@ Please generate the image now and return it in one of the supported formats abov
     if (controller && !controller.signal.aborted) {
       controller.abort();
       controller = null;
+    }
+
+    if (error instanceof ServicePrincipalError) {
+      return NextResponse.json(
+        { error: error.message },
+        { status: error.status, headers: noStoreHeaders() }
+      );
     }
 
     const message =

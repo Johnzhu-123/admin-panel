@@ -18,7 +18,10 @@ import {
   extractOpenAiCompatibleText,
   parseOpenAiCompatibleResponseText,
 } from "@/lib/openai-compatible-response";
-import { serverFetchWithRetry } from "@/lib/network/server-fetch-with-retry";
+import {
+  fetchPublicHttpUrl,
+  shouldAllowPrivateNetworkAccess,
+} from "@/lib/network/public-url";
 
 export type OpenAiChatMessage = { role: string; content: unknown };
 
@@ -54,6 +57,8 @@ export interface OpenAiChatAttemptInput {
     status: number | null;
     detailPreview: string;
   }) => void;
+  /** Optional dispatch wrapper, used to reserve quota for each upstream attempt. */
+  request?: (url: string, init: RequestInit) => Promise<Response>;
 }
 
 export interface OpenAiChatAttemptResult {
@@ -99,15 +104,21 @@ const runSingleAttempt = async (
   if (input.enhance) {
     config = await input.enhance(config);
   }
-  const res = await serverFetchWithRetry(
-    config.url,
-    {
-      method: config.method,
-      headers: config.headers,
-      body: JSON.stringify(config.body),
-    },
-    { retries: 1, retryDelayMs: 2000, timeoutMs: input.timeoutMs ?? 90_000 }
-  );
+  const init: RequestInit = {
+    method: config.method,
+    headers: config.headers,
+    body: JSON.stringify(config.body),
+    signal: AbortSignal.timeout(input.timeoutMs ?? 90_000),
+  };
+  const allowPrivateNetwork = shouldAllowPrivateNetworkAccess();
+  const res = input.request
+    ? await input.request(config.url, init)
+    : await fetchPublicHttpUrl(config.url, init, {
+        description: "OpenAI-compatible chat endpoint",
+        allowHttp: allowPrivateNetwork,
+        allowPrivateNetwork,
+        maxRedirects: 0,
+      });
   const rawText = await res.text().catch(() => "");
   input.onAttempt?.({
     operation: attempt.operation,
