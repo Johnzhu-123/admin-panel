@@ -213,6 +213,7 @@ export async function consumeAdminLoginAttempt(
       )::integer AS retry_after_seconds
     FROM attempts
     CROSS JOIN parameters
+    GROUP BY parameters.now_at
   `;
 
   const row = rows[0];
