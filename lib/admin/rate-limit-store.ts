@@ -208,7 +208,7 @@ export async function consumeAdminLoginAttempt(
               ELSE attempts.attempt_count > parameters.global_limit
             END
           ) - parameters.now_at
-        )),
+        ))),
         0
       )::integer AS retry_after_seconds
     FROM attempts
